@@ -5,7 +5,8 @@ knowledge_core/retriever.py
 Embeds incoming error message → searches Qdrant → returns RetrievalResult.
 """
 
-from google import genai
+#from google import genai
+from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 
 from core.models import RetrievalResult
@@ -13,14 +14,8 @@ from core.config import Config
 
 
 def retrieve(error_message: str, client: QdrantClient, config: Config) -> RetrievalResult:
-    genai_client = genai.Client(api_key=config.gemini_api_key)
-
-    result = genai_client.models.embed_content(
-        model=config.embedding_model,
-        contents=error_message,
-    )
-
-    query_vector = result.embeddings[0].values
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    query_vector = model.encode(error_message).tolist()
 
     hits = client.query_points(
         collection_name=config.collection_name,

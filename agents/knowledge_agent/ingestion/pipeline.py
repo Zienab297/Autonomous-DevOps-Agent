@@ -33,7 +33,7 @@ def run_pipeline():
     chunks = chunk_entries(parsed)
 
     print("\n[4/5] Embedding...")
-    embedded = embed_chunks(chunks, config)
+    embedded = embed_chunks(chunks)
 
     print("\n[5/5] Storing in Qdrant...")
     build_vector_store(embedded, config)
