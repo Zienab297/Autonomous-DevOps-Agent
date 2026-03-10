@@ -1,6 +1,4 @@
 .env
-cli/__pycache__/config.cpython-311.pyc
-cli/controllers/__pycache__/chat_controller.cpython-311.pyc
-cli/models/__pycache__/ai_model.cpython-311.pyc
-cli/models/__pycache__/conversation.cpython-311.pyc
-cli/views/__pycache__/cli_view.cpython-311.pyc
+**/__pycache__/
+*.pyc
+*.pyo
