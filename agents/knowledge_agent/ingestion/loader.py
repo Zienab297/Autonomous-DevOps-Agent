@@ -15,7 +15,7 @@ def load_knowledge_base(json_path: str) -> list[dict]:
 
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-
+    # enteries store 
     entries = data.get("entries", [])
     print(f"[Loader] Loaded {len(entries)} entries from {json_path}")
     return entries

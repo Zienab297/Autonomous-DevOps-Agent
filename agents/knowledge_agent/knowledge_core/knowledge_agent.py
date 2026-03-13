@@ -1,5 +1,6 @@
+from setup_path import *
 """
-agent/knowledge_agent.py
+knowledge_core/knowledge_agent.py
 ------------------------
 Main entry point for the Knowledge Agent layer.
 
@@ -7,7 +8,7 @@ Flow:
     error_message
         │
         ▼
-    retriever  ──found──▶  AgentResponse (source=knowledge_base)
+    retriever  ──found──▶  Ollama formats KB answer ▶  AgentResponse (source=knowledge_base)
         │
       not found
         │
@@ -19,11 +20,12 @@ Flow:
 """
 
 import re
+import ollama
 from qdrant_client import QdrantClient
 
-from core  import AgentResponse, RAGResult, RAGSource, ErrorCategory
-from core.config  import Config
-from knowledge_core.retriever     import retrieve
+from core import AgentResponse, RAGResult, RAGSource, ErrorCategory
+from core.config import Config
+from knowledge_core.retriever import retrieve
 from knowledge_core.research_agent import generate_solution
 
 
@@ -37,10 +39,6 @@ class KnowledgeAgent:
         )
 
     def run(self, error_message: str) -> AgentResponse:
-        """
-        Main method — call this with the raw error string.
-        Returns AgentResponse ready for the Self-Healing Agent.
-        """
         print(f"\n[KnowledgeAgent] Processing: {error_message[:100]}...")
 
         # ── try knowledge base first ─────────────────────────────────────
@@ -50,20 +48,22 @@ class KnowledgeAgent:
             print(f"[KnowledgeAgent] ✓ Found in knowledge base "
                   f"(score={retrieval.score})")
             entry = retrieval.entry
+
+            # ── format KB answer with Ollama ─────────────────────────────
+            formatted_prompt = self._format_with_llm(error_message, entry)
+
             return AgentResponse(
                 source=RAGSource.KNOWLEDGE_BASE,
                 confidence=retrieval.score,
-                healing_prompt=entry.get("healing_prompt", ""),
-                suggested_commands=self._extract_commands(
-                    entry.get("healing_prompt", "")
-                ),
+                healing_prompt=formatted_prompt,
+                suggested_commands=self._extract_commands(formatted_prompt),
                 category=ErrorCategory(entry.get("category", "Unknown")),
                 action_needed=True,
                 rag_result=RAGResult(
                     entry_id=entry.get("id", ""),
                     category=ErrorCategory(entry.get("category", "Unknown")),
                     confidence=retrieval.score,
-                    healing_prompt=entry.get("healing_prompt", ""),
+                    healing_prompt=formatted_prompt,
                     root_cause=entry.get("root_cause", ""),
                     error_pattern=entry.get("error_pattern", ""),
                 ),
@@ -83,12 +83,31 @@ class KnowledgeAgent:
             action_needed=True,
         )
 
+    def _format_with_llm(self, error_message: str, entry: dict) -> str:
+        prompt = f"""You are a senior DevOps engineer.
+
+The following error occurred:
+{error_message}
+
+Here is the known solution from our knowledge base:
+Root cause: {entry.get('root_cause', '')}
+Healing guide: {entry.get('healing_prompt', '')}
+
+Rewrite this as a clear, friendly, step-by-step explanation that:
+1. Explains what went wrong in simple terms
+2. Gives exact steps to fix it
+3. Includes the relevant commands
+"""
+
+        print(f"[KnowledgeAgent] Formatting KB answer with Ollama...")
+        response = ollama.chat(
+            model=self.config.generation_model,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response["message"]["content"]
+
     @staticmethod
     def _extract_commands(healing_prompt: str) -> list[str]:
-        """
-        Pull out shell commands from the healing prompt.
-        Looks for lines inside ```bash blocks or starting with known prefixes.
-        """
         commands = []
 
         # extract from ```bash ... ``` blocks
@@ -99,7 +118,7 @@ class KnowledgeAgent:
                 if line and not line.startswith("#"):
                     commands.append(line)
 
-        # fallback: lines starting with kubectl / docker / helm
+        # fallback: lines starting with kubectl / docker / helm / git
         if not commands:
             for line in healing_prompt.splitlines():
                 line = line.strip()

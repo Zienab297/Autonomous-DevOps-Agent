@@ -1,3 +1,4 @@
+from setup_path import *
 """
 tools/web_search_tool.py
 ------------------------
@@ -6,7 +7,7 @@ Uses DuckDuckGo (free, no API key needed).
 """
 
 from dataclasses import dataclass
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 
 @dataclass
@@ -17,10 +18,6 @@ class SearchResult:
 
 
 def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
-    """
-    Search the web for DevOps error fixes.
-    Returns list of SearchResult(title, snippet, url).
-    """
     results = []
 
     with DDGS() as ddgs:
@@ -36,9 +33,6 @@ def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
 
 
 def format_results_for_prompt(results: list[SearchResult]) -> str:
-    """
-    Format search results into a string to inject into the LLM prompt.
-    """
     if not results:
         return "No web results found."
 

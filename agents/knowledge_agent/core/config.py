@@ -26,7 +26,7 @@ class Config:
     # Gemini
     gemini_api_key: str
     embedding_model: str = "all-MiniLM-L6-v2"
-    generation_model: str = "gemini-1.5-flash"
+    generation_model: str = "llama3.2:3b"
 
     # Qdrant
     qdrant_host: str      = "localhost"
@@ -34,7 +34,7 @@ class Config:
     collection_name: str  = "devops_knowledge"
 
     # Retrieval
-    similarity_threshold: float = 0.70
+    similarity_threshold: float = 0.77
     top_k: int                  = 1
 
     # Ingestion
@@ -59,5 +59,5 @@ def load_config() -> Config:
         gemini_api_key=api_key,
         qdrant_host=os.getenv("QDRANT_HOST", "localhost"),
         qdrant_port=int(os.getenv("QDRANT_PORT", "6333")),
-        similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.70")),
+        similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.77")),
     )

@@ -26,24 +26,30 @@ from core.config  import load_config
 from core.models  import RAGSource
 
 from ingestion.pipeline      import run_pipeline
-from knowledge_core.knowledge_agent import KnowledgeAgent  # ← الصح
+from knowledge_core.knowledge_agent import KnowledgeAgent
 
 
 # ── test cases ────────────────────────────────────────────────────────────────
 
 TEST_CASES = [
     {
-        "name"    : "Case 1 — Docker COPY error (should match KB)",
+    "name"    : "Case 1 — Terraform state lock (should use LLM fallback)",
+    "error"   : "Error locking state: Error acquiring the state lock: ConditionalCheckFailedException: The conditional request failed",
+    "expect"  : RAGSource.LLM_GENERATED,
+   },
+  
+    {
+        "name"    : "Case 2 — Docker COPY error (should match KB)",
         "error"   : "COPY failed: file not found in build context or excluded by .dockerignore: stat app/config.yaml: file does not exist",
         "expect"  : RAGSource.KNOWLEDGE_BASE,
     },
     {
-        "name"    : "Case 2 — Kubernetes CrashLoopBackOff (should match KB)",
+        "name"    : "Case 3 — Kubernetes CrashLoopBackOff (should match KB)",
         "error"   : "Back-off restarting failed container: my-app-xyz has status CrashLoopBackOff restarts=8",
         "expect"  : RAGSource.KNOWLEDGE_BASE,
     },
     {
-        "name"    : "Case 3 — Hardcoded secret detected (should match KB)",
+        "name"    : "Case 4 — Hardcoded secret detected (should match KB)",
         "error"   : "Hardcoded secret detected in code / secret scanning alert",
         "expect"  : RAGSource.KNOWLEDGE_BASE,
     },
@@ -62,11 +68,15 @@ def print_response(response):
     print(f"  action     : {response.action_needed}")
     if response.suggested_commands:
         print(f"  commands   :")
-        for cmd in response.suggested_commands[:3]:   # show first 3
+        for cmd in response.suggested_commands[:3]:
             print(f"    $ {cmd}")
     print()
     print("  healing_prompt (first 300 chars):")
     print("  " + response.healing_prompt[:300].replace("\n", "\n  "))
+    print()
+    print("  ── Ollama formatted response ──────────────────────────")
+    print("  " + response.healing_prompt.replace("\n", "\n  "))
+    print("  ───────────────────────────────────────────────────────")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

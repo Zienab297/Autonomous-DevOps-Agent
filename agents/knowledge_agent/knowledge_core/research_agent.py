@@ -1,43 +1,67 @@
+from setup_path import *
 """
-agent/llm_generator.py
------------------------
+knowledge_core/research_agent.py
+---------------------------------
 Called when Qdrant score < threshold.
-Uses web_search_tool to get context → builds prompt → calls Gemini.
+Step 1: Ollama improves the search query
+Step 2: Web search using that query
+Step 3: Ollama generates solution with references
 Returns GeneratedSolution.
 """
 
-from google import genai
-
+import ollama
 from core.models import GeneratedSolution, RAGSource
 from core.config import Config
 from tools.web_search_tool import web_search, format_results_for_prompt
 
 
-def generate_solution(error_message: str, config: Config) -> GeneratedSolution:
-    client = genai.Client(api_key=config.gemini_api_key)
+def _generate_search_query(error_message: str, config: Config) -> str:
+    """Step 1 — Ollama improves the search query from the raw error."""
+    prompt = f"""You are a senior DevOps engineer.
+Given this error, generate a short, precise web search query to find the fix.
+Return ONLY the search query, nothing else.
 
-    # ── step 1: web search ───────────────────────────────────────────────
-    print(f"[LLMGenerator] Searching web for: {error_message[:80]}...")
-    search_results = web_search(
-        query=f"fix devops error: {error_message}",
-        max_results=5,
+ERROR:
+{error_message}
+"""
+    response = ollama.chat(
+        model=config.generation_model,
+        messages=[{"role": "user", "content": prompt}]
     )
+    query = response["message"]["content"].strip()
+    print(f"[LLMGenerator] Generated search query: {query}")
+    return query
+
+
+def generate_solution(error_message: str, config: Config) -> GeneratedSolution:
+
+    # ── step 1: Ollama improves search query ─────────────────────────────
+    search_query = _generate_search_query(error_message, config)
+
+    # ── step 2: web search using improved query ───────────────────────────
+    print(f"[LLMGenerator] Searching web...")
+    search_results = web_search(query=search_query, max_results=5)
     web_context = format_results_for_prompt(search_results)
 
-    # ── step 2: build prompt ─────────────────────────────────────────────
+    # ── step 3: build references list ────────────────────────────────────
+    references = "\n".join(
+        [f"[{i+1}] {r.url}" for i, r in enumerate(search_results)]
+    )
+
+    # ── step 4: build prompt ──────────────────────────────────────────────
     prompt = f"""You are a senior DevOps engineer and AI healing agent.
 
 A system has encountered the following error:
 {error_message}
 
-Here are relevant web search results that may help:
+Here are relevant web search results:
 {web_context}
 
 Your task:
 1. Identify the root cause of this error
 2. Provide a step-by-step healing prompt that an automated agent can follow
 3. Include specific commands to fix the issue
-4. Be concrete and actionable
+4. Mention which source(s) helped you find the solution
 
 Respond in this exact format:
 
@@ -50,19 +74,22 @@ HEALING STEPS:
 COMMANDS:
 <shell/kubectl/docker commands, one per line>
 
+REFERENCES:
+{references}
+
 CONFIDENCE:
 <a number between 0.0 and 1.0 indicating how confident you are>
 """
 
-    # ── step 3: call Gemini ──────────────────────────────────────────────
-    print(f"[LLMGenerator] Calling Gemini {config.generation_model}...")
-    response = client.models.generate_content(
+    # ── step 5: call Ollama ───────────────────────────────────────────────
+    print(f"[LLMGenerator] Calling Ollama {config.generation_model}...")
+    response = ollama.chat(
         model=config.generation_model,
-        contents=prompt,
+        messages=[{"role": "user", "content": prompt}]
     )
-    response_text = response.text
+    response_text = response["message"]["content"]
 
-    # ── step 4: extract confidence ───────────────────────────────────────
+    # ── step 6: extract confidence ────────────────────────────────────────
     confidence = 0.70
     for line in response_text.splitlines():
         if line.strip().startswith("CONFIDENCE:"):
@@ -71,7 +98,7 @@ CONFIDENCE:
             except ValueError:
                 pass
 
-    # ── step 5: extract commands ─────────────────────────────────────────
+    # ── step 7: extract commands ──────────────────────────────────────────
     commands = []
     in_commands = False
     for line in response_text.splitlines():
@@ -79,7 +106,7 @@ CONFIDENCE:
             in_commands = True
             continue
         if in_commands:
-            if line.strip().startswith("CONFIDENCE:"):
+            if line.strip().startswith(("REFERENCES:", "CONFIDENCE:")):
                 break
             if line.strip():
                 commands.append(line.strip())
