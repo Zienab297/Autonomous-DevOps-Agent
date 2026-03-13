@@ -1,256 +1,339 @@
 """
-EventBus - Core Communication Layer
-====================================
-Responsible for delivering Events between Agents
-instead of Agents communicating directly with each other.
+Orchestrator - Workflow Director
+==================================
+The Orchestrator is the brain of the system.
+
+It:
+    1. Holds the AgentRegistry  -> knows which Agents exist
+    2. Listens to the EventBus  -> reacts to every Agent's output
+    3. Manages IncidentContexts -> one context per active incident
+    4. Decides the next step    -> drives the workflow forward
+
+Workflow it controls:
+    INCIDENT_CREATED
+         ↓
+    INVESTIGATION_STARTED  (tells KnowledgeAgent to work)
+         ↓
+    INVESTIGATION_COMPLETE
+         ↓
+    REMEDIATION_STARTED    (tells SelfHealingAgent to work)
+         ↓
+    REMEDIATION_COMPLETE -> resolve
+    REMEDIATION_FAILED   -> retry or escalate
+         ↓
+    ALERT_SENT             (tells AlertingAgent to notify)
 """
 
-import asyncio
 import logging
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Dict, List, Optional
+
+from .agent_registry import AgentRegistry, AgentStatus
+from .context import IncidentContext
+from .event_bus import Event, EventBus, EventType
+from .models import IncidentStatus, RemediationAction, Solution
+from .state_manager import StateManager
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# Event Types - All possible Events in the system
-# ============================================================
-
-class EventType(str, Enum):
-    # Monitoring Events
-    ANOMALY_DETECTED    = "monitoring.anomaly_detected"
-    INCIDENT_CREATED    = "monitoring.incident_created"
-    METRICS_COLLECTED   = "monitoring.metrics_collected"
-
-    # Investigation Events
-    INVESTIGATION_STARTED   = "knowledge.investigation_started"
-    INVESTIGATION_COMPLETE  = "knowledge.investigation_complete"
-
-    # Remediation Events
-    REMEDIATION_STARTED     = "healing.remediation_started"
-    REMEDIATION_COMPLETE    = "healing.remediation_complete"
-    REMEDIATION_FAILED      = "healing.remediation_failed"
-
-    # CI/CD Events
-    DEPLOYMENT_STARTED      = "cicd.deployment_started"
-    DEPLOYMENT_COMPLETE     = "cicd.deployment_complete"
-    ROLLBACK_TRIGGERED      = "cicd.rollback_triggered"
-
-    # Alerting Events
-    ALERT_SENT              = "alerting.alert_sent"
-    REPORT_SENT             = "alerting.report_sent"
-
-    # System Events
-    AGENT_REGISTERED        = "system.agent_registered"
-    AGENT_STOPPED           = "system.agent_stopped"
+# Required agents that must be running before the system can operate
+REQUIRED_AGENTS = [
+    "monitoring_agent",
+    "knowledge_agent",
+    "self_healing_agent",
+    "alerting_agent",
+]
 
 
-# ============================================================
-# Event Model - The structure of an Event passed between Agents
-# ============================================================
-
-@dataclass
-class Event:
+class Orchestrator:
     """
-    An Event is the message that travels between Agents.
+    Drives the full incident workflow from detection to resolution.
 
     Example:
-        Event(
-            type=EventType.INCIDENT_CREATED,
-            source="monitoring_agent",
-            data={"service": "auth-api", "error_rate": 0.45}
-        )
-    """
-    type: EventType
-    source: str                                              # Which agent sent this Event
-    data: Dict[str, Any] = field(default_factory=dict)      # Payload
-    incident_id: Optional[str] = None                       # Linked incident (if any)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+        bus      = EventBus()
+        state    = StateManager()
+        registry = AgentRegistry()
 
-    def __str__(self):
-        return (
-            f"Event(id={self.event_id[:8]}, "
-            f"type={self.type}, "
-            f"source={self.source})"
+        orchestrator = Orchestrator(
+            event_bus=bus,
+            state_manager=state,
+            agent_registry=registry,
+            auto_remediate=True,
+            max_retries=3
         )
 
-
-# ============================================================
-# EventBus - The heart of the system
-# ============================================================
-
-class EventBus:
-    """
-    The EventBus acts as the communication broker between all Agents.
-
-    How it works:
-        - An Agent publishes an Event  ->  publish()
-        - An Agent listens for Events  ->  subscribe()
-        - EventBus delivers the Event to all registered subscribers
-
-    Example:
-        bus = EventBus()
-
-        # Agent registers to listen
-        bus.subscribe(EventType.INCIDENT_CREATED, my_handler)
-
-        # Another Agent publishes
-        await bus.publish(Event(
-            type=EventType.INCIDENT_CREATED,
-            source="monitoring_agent",
-            data={"service": "auth-api"}
-        ))
+        orchestrator.start()
     """
 
-    def __init__(self):
-        # Maps each EventType -> list of handlers subscribed to it
-        self._subscribers: Dict[EventType, List[Callable]] = {}
+    def __init__(
+        self,
+        event_bus: EventBus,
+        state_manager: StateManager,
+        agent_registry: AgentRegistry,
+        auto_remediate: bool = True,
+        max_retries: int = 3,
+    ):
+        self.bus = event_bus
+        self.state = state_manager
+        self.registry = agent_registry
+        self.auto_remediate = auto_remediate
+        self.max_retries = max_retries
 
-        # Full log of all Events that have been published
-        self._history: List[Event] = []
+        # incident_id -> IncidentContext
+        # One context object per active incident
+        self._contexts: Dict[str, IncidentContext] = {}
 
-        # Async queue for deferred Event delivery
-        self._queue: asyncio.Queue = asyncio.Queue()
+        # incident_id -> retry count
+        self._retry_counts: Dict[str, int] = {}
 
-        self._running = False
-        logger.info("EventBus initialized")
+        logger.info("Orchestrator initialized")
 
     # --------------------------------------------------------
-    # Subscribe - Register a handler for a specific Event type
+    # Startup
     # --------------------------------------------------------
 
-    def subscribe(self, event_type: EventType, handler: Callable) -> None:
+    def start(self) -> None:
         """
-        Register a handler to be called when the given EventType is published.
+        Subscribe to all workflow Events on the EventBus.
+        Must be called once before the system starts.
+        """
+        self.bus.subscribe(EventType.INCIDENT_CREATED,       self._on_incident_created)
+        self.bus.subscribe(EventType.INVESTIGATION_COMPLETE, self._on_investigation_complete)
+        self.bus.subscribe(EventType.REMEDIATION_COMPLETE,   self._on_remediation_complete)
+        self.bus.subscribe(EventType.REMEDIATION_FAILED,     self._on_remediation_failed)
 
-        Args:
-            event_type: The Event type to listen for
-            handler:    The function to call (supports both async and sync)
+        logger.info("Orchestrator started — listening for Events")
+
+    def verify_agents(self) -> List[str]:
+        """
+        Check that all required Agents are registered and running.
+        Returns a list of missing Agent names.
+
+        Called after all Agents have been started.
 
         Example:
-            bus.subscribe(EventType.INCIDENT_CREATED, handle_incident)
+            missing = orchestrator.verify_agents()
+            if missing:
+                raise RuntimeError(f"Missing: {missing}")
         """
-        if event_type not in self._subscribers:
-            self._subscribers[event_type] = []
-
-        self._subscribers[event_type].append(handler)
-        logger.debug(f"Subscribed '{handler.__name__}' -> {event_type}")
-
-    def unsubscribe(self, event_type: EventType, handler: Callable) -> None:
-        """
-        Remove a handler from the subscribers list.
-
-        Args:
-            event_type: The Event type to stop listening for
-            handler:    The handler to remove
-        """
-        if event_type in self._subscribers:
-            self._subscribers[event_type].remove(handler)
-            logger.debug(f"Unsubscribed '{handler.__name__}' <- {event_type}")
+        missing = self.registry.verify_required_agents(REQUIRED_AGENTS)
+        if missing:
+            logger.error(f"Missing required agents: {missing}")
+        else:
+            logger.info("All required agents verified ✅")
+        return missing
 
     # --------------------------------------------------------
-    # Publish - Dispatch an Event to all subscribers
+    # Step 1 — Incident detected -> start investigation
     # --------------------------------------------------------
 
-    async def publish(self, event: Event) -> None:
+    async def _on_incident_created(self, event: Event) -> None:
         """
-        Publish an Event and deliver it to all registered subscribers.
-
-        Args:
-            event: The Event to dispatch
-
-        Example:
-            await bus.publish(Event(
-                type=EventType.INCIDENT_CREATED,
-                source="monitoring_agent",
-                data={"service": "auth-api"}
-            ))
+        Triggered by: MonitoringAgent publishes INCIDENT_CREATED
+        Action: Create an IncidentContext and tell KnowledgeAgent to investigate
         """
-        # Save to history before dispatching
-        self._history.append(event)
-        logger.info(f"Publishing: {event}")
+        incident_id = event.incident_id
+        logger.info(f"[Orchestrator] New incident received: {incident_id}")
 
-        # Retrieve all handlers subscribed to this Event type
-        handlers = self._subscribers.get(event.type, [])
-
-        if not handlers:
-            logger.warning(f"No subscribers for {event.type}")
+        # Fetch the incident from StateManager
+        incident = self.state.get_incident(incident_id)
+        if not incident:
+            logger.error(f"Incident {incident_id} not found in StateManager")
             return
 
-        # Invoke each handler (supports both async and sync)
-        for handler in handlers:
-            try:
-                if asyncio.iscoroutinefunction(handler):
-                    await handler(event)    # async handler
-                else:
-                    handler(event)          # sync handler
+        # Create a fresh context for this incident
+        ctx = IncidentContext(incident=incident)
+        self._contexts[incident_id] = ctx
 
-                logger.debug(f"Handler '{handler.__name__}' executed successfully")
+        # Update state
+        self.state.update_status(incident_id, IncidentStatus.INVESTIGATING)
 
-            except Exception as e:
-                logger.error(
-                    f"Handler '{handler.__name__}' raised an error: {e}",
-                    exc_info=True
-                )
+        # Check KnowledgeAgent is available
+        if not self.registry.is_running("knowledge_agent"):
+            logger.error("KnowledgeAgent is not running — escalating")
+            ctx.escalate()
+            await self._send_alert(ctx)
+            return
 
-    def publish_sync(self, event: Event) -> None:
-        """
-        Publish an Event from synchronous code.
-        Schedules the publish as an async task.
-        """
-        asyncio.create_task(self.publish(event))
+        # Tell KnowledgeAgent to start investigating
+        await self.bus.publish(Event(
+            type=EventType.INVESTIGATION_STARTED,
+            source="orchestrator",
+            incident_id=incident_id,
+            data={
+                "service":      incident.service,
+                "description":  incident.description,
+                "metrics":      incident.metrics,
+                "logs":         incident.logs,
+            }
+        ))
 
     # --------------------------------------------------------
-    # History & Debugging
+    # Step 2 — Investigation done -> remediate or escalate
     # --------------------------------------------------------
 
-    def get_history(
-        self,
-        event_type: Optional[EventType] = None,
-        incident_id: Optional[str] = None,
-        limit: int = 50
-    ) -> List[Event]:
+    async def _on_investigation_complete(self, event: Event) -> None:
         """
-        Retrieve the log of published Events.
-
-        Args:
-            event_type:  Filter by a specific Event type (optional)
-            incident_id: Filter by a specific incident ID (optional)
-            limit:       Maximum number of Events to return
-
-        Examples:
-            bus.get_history()
-            bus.get_history(event_type=EventType.INCIDENT_CREATED)
-            bus.get_history(incident_id="INC-001")
+        Triggered by: KnowledgeAgent publishes INVESTIGATION_COMPLETE
+        Action:
+            - auto_remediate ON  -> tell SelfHealingAgent to fix it
+            - auto_remediate OFF -> escalate for human review
         """
-        history = self._history
+        incident_id = event.incident_id
+        data = event.data
 
-        if event_type:
-            history = [e for e in history if e.type == event_type]
+        logger.info(f"[Orchestrator] Investigation complete: {incident_id}")
 
-        if incident_id:
-            history = [e for e in history if e.incident_id == incident_id]
+        ctx = self._get_context(incident_id)
+        if not ctx:
+            return
 
-        return history[-limit:]
+        # Save solution into the context
+        solution = Solution(
+            incident_id=incident_id,
+            root_cause=data.get("root_cause", "Unknown"),
+            recommended_action=data.get("recommended_action", RemediationAction.CUSTOM),
+            confidence=data.get("confidence", 0.0),
+            explanation=data.get("explanation", ""),
+            raw_llm_response=data.get("raw_llm_response"),
+            retrieved_docs=data.get("retrieved_docs", []),
+        )
+        ctx.add_solution(solution)
 
-    def get_subscribers_count(self, event_type: EventType) -> int:
-        """Return the number of handlers subscribed to a given Event type."""
-        return len(self._subscribers.get(event_type, []))
+        if self.auto_remediate:
+            # Check SelfHealingAgent is available
+            if not self.registry.is_running("self_healing_agent"):
+                logger.error("SelfHealingAgent is not running — escalating")
+                ctx.escalate()
+                await self._send_alert(ctx)
+                return
 
-    def clear_history(self) -> None:
-        """Clear the full Event history log."""
-        self._history.clear()
-        logger.info("EventBus history cleared")
+            self.state.update_status(incident_id, IncidentStatus.REMEDIATING)
+
+            await self.bus.publish(Event(
+                type=EventType.REMEDIATION_STARTED,
+                source="orchestrator",
+                incident_id=incident_id,
+                data={
+                    "recommended_action": solution.recommended_action,
+                    "confidence":         solution.confidence,
+                    "service":            ctx.service,
+                }
+            ))
+        else:
+            # Manual mode — escalate for human decision
+            logger.info(f"Auto-remediate OFF — escalating: {incident_id}")
+            ctx.escalate()
+            self.state.update_status(incident_id, IncidentStatus.ESCALATED)
+            await self._send_alert(ctx)
+
+    # --------------------------------------------------------
+    # Step 3 — Remediation succeeded -> resolve
+    # --------------------------------------------------------
+
+    async def _on_remediation_complete(self, event: Event) -> None:
+        """
+        Triggered by: SelfHealingAgent publishes REMEDIATION_COMPLETE
+        Action: Mark resolved and notify team
+        """
+        incident_id = event.incident_id
+        logger.info(f"[Orchestrator] Remediation complete: {incident_id}")
+
+        ctx = self._get_context(incident_id)
+        if not ctx:
+            return
+
+        self.state.resolve_incident(incident_id)
+        self._retry_counts.pop(incident_id, None)
+
+        await self._send_alert(ctx)
+        self._cleanup(incident_id)
+
+    # --------------------------------------------------------
+    # Step 4 — Remediation failed -> retry or escalate
+    # --------------------------------------------------------
+
+    async def _on_remediation_failed(self, event: Event) -> None:
+        """
+        Triggered by: SelfHealingAgent publishes REMEDIATION_FAILED
+        Action:
+            - Retries remaining -> retry
+            - Retries exhausted -> escalate
+        """
+        incident_id = event.incident_id
+        logger.warning(f"[Orchestrator] Remediation failed: {incident_id}")
+
+        ctx = self._get_context(incident_id)
+        if not ctx:
+            return
+
+        retries = self._retry_counts.get(incident_id, 0) + 1
+        self._retry_counts[incident_id] = retries
+
+        if retries < self.max_retries:
+            logger.info(
+                f"Retrying remediation for {incident_id} "
+                f"({retries}/{self.max_retries})"
+            )
+            await self.bus.publish(Event(
+                type=EventType.REMEDIATION_STARTED,
+                source="orchestrator",
+                incident_id=incident_id,
+                data=event.data
+            ))
+        else:
+            logger.error(
+                f"All {self.max_retries} retries failed for {incident_id} — escalating"
+            )
+            ctx.escalate()
+            self.state.update_status(incident_id, IncidentStatus.ESCALATED)
+            await self._send_alert(ctx)
+            self._cleanup(incident_id)
+
+    # --------------------------------------------------------
+    # Helpers
+    # --------------------------------------------------------
+
+    async def _send_alert(self, ctx: IncidentContext) -> None:
+        """Tell AlertingAgent to send a notification."""
+        if not self.registry.is_running("alerting_agent"):
+            logger.warning("AlertingAgent is not running — skipping notification")
+            return
+
+        await self.bus.publish(Event(
+            type=EventType.ALERT_SENT,
+            source="orchestrator",
+            incident_id=ctx.incident_id,
+            data=ctx.summary()
+        ))
+
+    def _get_context(self, incident_id: str) -> Optional[IncidentContext]:
+        """Retrieve the IncidentContext for an incident. Logs error if missing."""
+        ctx = self._contexts.get(incident_id)
+        if not ctx:
+            logger.error(f"No context found for incident: {incident_id}")
+        return ctx
+
+    def _cleanup(self, incident_id: str) -> None:
+        """Remove a resolved/escalated incident from active contexts."""
+        self._contexts.pop(incident_id, None)
+        self._retry_counts.pop(incident_id, None)
+
+    # --------------------------------------------------------
+    # Inspection
+    # --------------------------------------------------------
+
+    def get_active_incidents(self) -> List[str]:
+        """Return IDs of all currently active incidents."""
+        return list(self._contexts.keys())
+
+    def get_context(self, incident_id: str) -> Optional[IncidentContext]:
+        """Public access to an incident's context."""
+        return self._contexts.get(incident_id)
 
     def __repr__(self):
-        total_subs = sum(len(v) for v in self._subscribers.values())
         return (
-            f"EventBus("
-            f"subscribers={total_subs}, "
-            f"history={len(self._history)})"
+            f"Orchestrator("
+            f"active_incidents={len(self._contexts)}, "
+            f"auto_remediate={self.auto_remediate}, "
+            f"max_retries={self.max_retries})"
         )
