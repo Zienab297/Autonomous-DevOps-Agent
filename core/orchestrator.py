@@ -1,27 +1,5 @@
 """
 Orchestrator - Workflow Director
-==================================
-The Orchestrator is the brain of the system.
-
-It:
-    1. Holds the AgentRegistry  -> knows which Agents exist
-    2. Listens to the EventBus  -> reacts to every Agent's output
-    3. Manages IncidentContexts -> one context per active incident
-    4. Decides the next step    -> drives the workflow forward
-
-Workflow it controls:
-    INCIDENT_CREATED
-         ↓
-    INVESTIGATION_STARTED  (tells KnowledgeAgent to work)
-         ↓
-    INVESTIGATION_COMPLETE
-         ↓
-    REMEDIATION_STARTED    (tells SelfHealingAgent to work)
-         ↓
-    REMEDIATION_COMPLETE -> resolve
-    REMEDIATION_FAILED   -> retry or escalate
-         ↓
-    ALERT_SENT             (tells AlertingAgent to notify)
 """
 
 import logging

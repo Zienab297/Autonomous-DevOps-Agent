@@ -1,15 +1,5 @@
 """
 AgentRegistry - Agent Registration & Discovery
-================================================
-A central directory of all Agents in the system.
-
-The Orchestrator uses the registry to:
-    - Find a specific Agent by name
-    - Check if an Agent is running before sending it work
-    - List all active Agents
-    - Detect if a required Agent is missing
-
-Think of it as the "phonebook" of the system.
 """
 
 import logging

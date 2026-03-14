@@ -1,36 +1,5 @@
 """
 Context - Incident Context Object
-===================================
-The Context is the "dossier" that travels between Agents
-during an incident workflow.
-
-Instead of passing individual variables between Agents,
-the full Context object is passed — so every Agent has
-access to everything that happened before it.
-
-Flow:
-    MonitoringAgent creates Context
-         ↓
-    KnowledgeAgent reads metrics/logs, writes solution
-         ↓
-    SelfHealingAgent reads solution, writes remediation result
-         ↓
-    AlertingAgent reads everything, sends notification
-"""
-
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import List, Optional
-
-from .models import (
-    Alert,
-    DeploymentRecord,
-    Incident,
-    IncidentStatus,
-    RemediationResult,
-    Solution,
-)
 
 logger = logging.getLogger(__name__)
 

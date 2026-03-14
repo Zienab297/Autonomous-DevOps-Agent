@@ -1,25 +1,5 @@
 """
 StateManager - Incident State Store
-=====================================
-The central store for all incidents in the system.
-
-Responsibilities:
-    - Create new incidents (called by MonitoringAgent)
-    - Update incident status as the workflow progresses
-    - Resolve or escalate incidents
-    - Query incidents by status, service, or ID
-
-Every Agent interacts with StateManager to read and write
-the current state of an incident.
-
-Uses the models from models.py — no duplicate data classes here.
-"""
-
-import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-from .models import Incident, IncidentSeverity, IncidentStatus
 
 logger = logging.getLogger(__name__)
 

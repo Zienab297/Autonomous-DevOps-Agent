@@ -1,15 +1,6 @@
 #pydantic
 """
 Models - Core Data Structures
-==============================
-All data classes used across the system.
-No logic here — just the shape of the data.
-
-Used by:
-    - StateManager   (stores Incidents)
-    - Context        (carries data between Agents)
-    - Agents         (read and write these models)
-    - Orchestrator   (reads incident status)
 """
 
 import uuid
