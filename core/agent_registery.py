@@ -1,48 +1,55 @@
 """
-core/agent_registry.py
------------------------
-Tracks all registered Agents in the system.
-The Orchestrator uses this to know which Agents are available
-and how to reach them.
+AgentRegistry - Agent Registration & Discovery
 """
 
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
-
-from core.models import AgentStatus
+from enum import Enum
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# AgentRecord — Info stored about each registered Agent
+# AgentStatus
+# ============================================================
+
+class AgentStatus(str, Enum):
+    IDLE    = "idle"      # Registered but not started
+    RUNNING = "running"   # Active and listening for Events
+    STOPPED = "stopped"   # Gracefully shut down
+    ERROR   = "error"     # Failed to start or crashed
+
+
+# ============================================================
+# AgentRecord - Metadata stored per Agent
 # ============================================================
 
 @dataclass
 class AgentRecord:
     """
-    Holds the registration info for a single Agent.
+    Metadata about a registered Agent.
+    Stored in the AgentRegistry when an Agent calls register().
 
     Example:
         AgentRecord(
             name="monitoring_agent",
-            agent=monitoring_agent_instance,
+            agent_id="monitoring_agent-a1b2c3",
+            status=AgentStatus.RUNNING
         )
     """
     name: str
-    agent: object
+    agent_id: str
     status: AgentStatus = AgentStatus.IDLE
     registered_at: datetime = field(default_factory=datetime.utcnow)
-    last_active: Optional[datetime] = None
-    metadata: Dict = field(default_factory=dict)
+    last_seen_at: datetime = field(default_factory=datetime.utcnow)
 
     def __str__(self):
         return (
-            f"AgentRecord("
-            f"name={self.name}, "
-            f"status={self.status.value})"
+            f"AgentRecord(name={self.name}, "
+            f"id={self.agent_id}, "
+            f"status={self.status})"
         )
 
 
@@ -52,135 +59,183 @@ class AgentRecord:
 
 class AgentRegistry:
     """
-    The AgentRegistry keeps track of all Agents in the system.
+    Central directory of all Agents in the system.
 
-    The Orchestrator uses it to:
-        - Register new Agents
-        - Look up Agents by name
-        - Check Agent statuses
-        - Get all available Agents
+    Used by the Orchestrator to discover and verify Agents
+    before routing Events to them.
 
     Example:
         registry = AgentRegistry()
 
-        # Register an Agent
-        registry.register("monitoring_agent", monitoring_agent)
+        # Agent registers itself on startup
+        registry.register("monitoring_agent", "monitoring_agent-a1b2c3")
+        registry.set_status("monitoring_agent", AgentStatus.RUNNING)
 
-        # Get it back
-        agent = registry.get("monitoring_agent")
+        # Orchestrator checks before routing
+        if registry.is_running("monitoring_agent"):
+            await bus.publish(event)
 
-        # Update its status
-        registry.update_status("monitoring_agent", AgentStatus.RUNNING)
+        # List all active agents
+        registry.get_all_running()
     """
 
     def __init__(self):
-        # agent_name → AgentRecord
+        # agent_name -> AgentRecord
         self._agents: Dict[str, AgentRecord] = {}
         logger.info("AgentRegistry initialized")
 
-    # ============================================================
-    # Registration
-    # ============================================================
+    # --------------------------------------------------------
+    # Register / Unregister
+    # --------------------------------------------------------
 
-    def register(
-        self,
-        name: str,
-        agent: object,
-        metadata: Optional[Dict] = None,
-    ) -> AgentRecord:
+    def register(self, name: str, agent_id: str) -> AgentRecord:
         """
-        Register a new Agent in the system.
+        Register a new Agent in the directory.
+        Called by BaseAgent during start().
 
         Args:
-            name:     Unique name for the Agent
-            agent:    The Agent instance
-            metadata: Optional extra info about the Agent
+            name:     The Agent's name (e.g. "monitoring_agent")
+            agent_id: The unique Agent ID (e.g. "monitoring_agent-a1b2c3")
 
         Returns:
-            AgentRecord
+            The created AgentRecord
         """
-        if name in self._agents:
-            logger.warning(f"[AgentRegistry] Agent '{name}' already registered — overwriting")
-
-        record = AgentRecord(
-            name=name,
-            agent=agent,
-            metadata=metadata or {},
-        )
+        record = AgentRecord(name=name, agent_id=agent_id)
         self._agents[name] = record
-        logger.info(f"[AgentRegistry] Registered: {record}")
+        logger.info(f"Agent registered: {record}")
         return record
 
     def unregister(self, name: str) -> None:
-        """Remove an Agent from the registry."""
+        """
+        Remove an Agent from the directory.
+        Called by BaseAgent during stop().
+        """
         if name in self._agents:
             del self._agents[name]
-            logger.info(f"[AgentRegistry] Unregistered: '{name}'")
+            logger.info(f"Agent unregistered: {name}")
         else:
-            logger.warning(f"[AgentRegistry] Agent '{name}' not found")
+            logger.warning(f"Tried to unregister unknown agent: {name}")
 
-    # ============================================================
-    # Lookup
-    # ============================================================
-
-    def get(self, name: str) -> Optional[AgentRecord]:
-        """Get an AgentRecord by name."""
-        return self._agents.get(name)
-
-    def get_agent(self, name: str) -> Optional[object]:
-        """Get the Agent instance directly by name."""
-        record = self._agents.get(name)
-        return record.agent if record else None
-
-    def get_all(self) -> List[AgentRecord]:
-        """Return all registered AgentRecords."""
-        return list(self._agents.values())
-
-    def get_all_names(self) -> List[str]:
-        """Return all registered Agent names."""
-        return list(self._agents.keys())
-
-    # ============================================================
+    # --------------------------------------------------------
     # Status Management
-    # ============================================================
+    # --------------------------------------------------------
 
-    def update_status(self, name: str, status: AgentStatus) -> None:
-        """Update the status of a registered Agent."""
+    def set_status(self, name: str, status: AgentStatus) -> None:
+        """
+        Update the status of a registered Agent.
+
+        Called by BaseAgent when:
+            - start()  -> RUNNING
+            - stop()   -> STOPPED
+            - error    -> ERROR
+        """
         record = self._agents.get(name)
         if not record:
-            logger.warning(f"[AgentRegistry] Agent '{name}' not found")
+            logger.warning(f"Cannot set status — agent not found: {name}")
             return
 
         record.status = status
-        record.last_active = datetime.utcnow()
-        logger.info(f"[AgentRegistry] '{name}' → {status.value}")
+        record.last_seen_at = datetime.utcnow()
+        logger.debug(f"Agent status updated: {name} -> {status}")
 
-    def get_status(self, name: str) -> Optional[AgentStatus]:
-        """Get the current status of an Agent."""
+    def heartbeat(self, name: str) -> None:
+        """
+        Update the last_seen_at timestamp for an Agent.
+        Called periodically by running Agents to signal they are alive.
+        """
         record = self._agents.get(name)
-        return record.status if record else None
+        if record:
+            record.last_seen_at = datetime.utcnow()
 
-    def get_available_agents(self) -> List[AgentRecord]:
-        """Return all Agents that are IDLE or RUNNING."""
-        return [
-            r for r in self._agents.values()
-            if r.status in (AgentStatus.IDLE, AgentStatus.RUNNING)
-        ]
+    # --------------------------------------------------------
+    # Discovery
+    # --------------------------------------------------------
+
+    def get(self, name: str) -> Optional[AgentRecord]:
+        """
+        Get a specific Agent's record by name.
+        Returns None if not found.
+        """
+        return self._agents.get(name)
 
     def is_registered(self, name: str) -> bool:
-        """Check if an Agent is registered."""
+        """Check if an Agent is registered (regardless of status)."""
         return name in self._agents
 
-    # ============================================================
-    # Summary
-    # ============================================================
+    def is_running(self, name: str) -> bool:
+        """
+        Check if a specific Agent is currently running.
+        Used by Orchestrator before routing Events.
 
-    def summary(self) -> Dict:
-        """Return a summary of all registered Agents."""
+        Example:
+            if not registry.is_running("knowledge_agent"):
+                logger.error("KnowledgeAgent is not available!")
+        """
+        record = self._agents.get(name)
+        return record is not None and record.status == AgentStatus.RUNNING
+
+    def get_all(self) -> List[AgentRecord]:
+        """Return all registered Agents (any status)."""
+        return list(self._agents.values())
+
+    def get_all_running(self) -> List[AgentRecord]:
+        """Return only Agents with RUNNING status."""
+        return [
+            record for record in self._agents.values()
+            if record.status == AgentStatus.RUNNING
+        ]
+
+    def get_all_by_status(self, status: AgentStatus) -> List[AgentRecord]:
+        """Return all Agents with a specific status."""
+        return [
+            record for record in self._agents.values()
+            if record.status == status
+        ]
+
+    # --------------------------------------------------------
+    # Validation — used by Orchestrator on startup
+    # --------------------------------------------------------
+
+    def verify_required_agents(self, required: List[str]) -> List[str]:
+        """
+        Check that all required Agents are registered and running.
+        Returns a list of missing Agent names (empty = all good).
+
+        Example:
+            missing = registry.verify_required_agents([
+                "monitoring_agent",
+                "knowledge_agent",
+                "self_healing_agent",
+                "alerting_agent",
+            ])
+            if missing:
+                raise RuntimeError(f"Missing agents: {missing}")
+        """
+        missing = []
+        for name in required:
+            if not self.is_running(name):
+                missing.append(name)
+                logger.warning(f"Required agent not running: {name}")
+        return missing
+
+    # --------------------------------------------------------
+    # Stats
+    # --------------------------------------------------------
+
+    def get_stats(self) -> dict:
+        """Return a summary of Agent statuses."""
+        stats = {status.value: 0 for status in AgentStatus}
+        for record in self._agents.values():
+            stats[record.status.value] += 1
+
         return {
-            record.name: record.status.value
-            for record in self._agents.values()
+            "total": len(self._agents),
+            "by_status": stats,
         }
 
     def __repr__(self):
-        return f"AgentRegistry(agents={list(self._agents.keys())})"
+        return (
+            f"AgentRegistry("
+            f"total={len(self._agents)}, "
+            f"running={len(self.get_all_running())})"
+        )
