@@ -8,7 +8,7 @@ This layer exists so smarter chunking can be added later
 without touching the rest of the pipeline.
 """
 
-from core.models import ParsedEntry, Chunk
+from shared.models import ParsedEntry, Chunk
 
 
 def chunk_entries(parsed_entries: list[ParsedEntry]) -> list[Chunk]:

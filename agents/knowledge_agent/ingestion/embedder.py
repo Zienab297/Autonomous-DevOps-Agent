@@ -7,8 +7,8 @@ Step 4 — Chunk → EmbeddedChunk(vector, text, metadata).
 
 #from google import genai # for use gemini embedding 
 from sentence_transformers import SentenceTransformer
-from core.models import Chunk, EmbeddedChunk
-from core.config import Config
+from shared.models import Chunk, EmbeddedChunk
+from shared.config import Config
 
 
 

@@ -1,5 +1,16 @@
 """
-Context - Incident Context Object
+core/context_manager.py
+------------------------
+Collects and manages all context related to an Incident.
+The Knowledge Agent uses this to build a full picture
+before generating a solution.
+"""
+from dataclasses import dataclass, field
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from core.models import Incident, Log, Metric, Solution, Deployment
 
 logger = logging.getLogger(__name__)
 
@@ -7,213 +18,164 @@ logger = logging.getLogger(__name__)
 @dataclass
 class IncidentContext:
     """
-    The full context of one incident as it moves through the pipeline.
+    Full context collected for a single Incident.
+    Passed to the Knowledge Agent for investigation.
 
-    Every Agent receives this object, reads what it needs,
-    and writes its output back into it before passing it forward.
-
-    Example:
-        # MonitoringAgent creates it
-        ctx = IncidentContext(incident=incident)
-
-        # KnowledgeAgent adds its findings
-        ctx.add_solution(solution)
-
-        # SelfHealingAgent adds the result
-        ctx.add_remediation_result(result)
-
-        # AlertingAgent reads the full picture
-        ctx.incident.status   -> RESOLVED
-        ctx.solution          -> Solution(...)
-        ctx.remediation_result -> RemediationResult(...)
+    Contains:
+        - The Incident itself
+        - Related Metrics
+        - Related Logs
+        - Recent Deployments
+        - Past Solutions for similar incidents
+        - Any extra metadata
     """
-
-    # The incident at the center of this context
     incident: Incident
-
-    # Filled in by KnowledgeAgent
-    solution: Optional[Solution] = None
-
-    # Filled in by SelfHealingAgent
-    remediation_result: Optional[RemediationResult] = None
-
-    # Filled in by AlertingAgent
-    alerts_sent: List[Alert] = field(default_factory=list)
-
-    # Filled in by CICDAgent (if deployment is involved)
-    deployment: Optional[DeploymentRecord] = None
-
-    # Full audit trail of Agent actions
-    timeline: List[dict] = field(default_factory=list)
-
-    # When the context was created
+    metrics: List[Metric] = field(default_factory=list)
+    logs: List[Log] = field(default_factory=list)
+    recent_deployments: List[Deployment] = field(default_factory=list)
+    past_solutions: List[Solution] = field(default_factory=list)
+    extra: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.utcnow)
 
-    # --------------------------------------------------------
-    # Shortcut properties
-    # --------------------------------------------------------
-
-    @property
-    def incident_id(self) -> str:
-        """Quick access to the incident ID."""
-        return self.incident.incident_id
-
-    @property
-    def service(self) -> str:
-        """Quick access to the affected service name."""
-        return self.incident.service
-
-    @property
-    def is_resolved(self) -> bool:
-        """True if the incident has been resolved."""
-        return self.incident.status == IncidentStatus.RESOLVED
-
-    @property
-    def is_escalated(self) -> bool:
-        """True if the incident was escalated for human review."""
-        return self.incident.status == IncidentStatus.ESCALATED
-
-    # --------------------------------------------------------
-    # Write methods — called by Agents to update the context
-    # --------------------------------------------------------
-
-    def add_solution(self, solution: Solution) -> None:
+    def to_text(self) -> str:
         """
-        Called by KnowledgeAgent after investigation is complete.
-        Stores the recommended solution and logs it to the timeline.
+        Convert the full context to a text string
+        ready to be injected into an LLM prompt.
         """
-        self.solution = solution
-        self.incident.status = IncidentStatus.REMEDIATING
-        self.incident.updated_at = datetime.utcnow()
+        lines = []
 
-        self._log_event(
-            agent="knowledge_agent",
-            action="solution_generated",
-            details={
-                "root_cause": solution.root_cause,
-                "recommended_action": solution.recommended_action,
-                "confidence": solution.confidence,
-            }
-        )
-        logger.info(f"[Context] Solution added for {self.incident_id}: {solution}")
+        lines.append(f"=== INCIDENT ===")
+        lines.append(f"ID       : {self.incident.incident_id}")
+        lines.append(f"Service  : {self.incident.service}")
+        lines.append(f"Severity : {self.incident.severity.value}")
+        lines.append(f"Description: {self.incident.description}")
+        lines.append("")
 
-    def add_remediation_result(self, result: RemediationResult) -> None:
-        """
-        Called by SelfHealingAgent after executing the fix.
-        Updates incident status based on whether it succeeded.
-        """
-        self.remediation_result = result
+        if self.metrics:
+            lines.append("=== METRICS ===")
+            for m in self.metrics[-10:]:  # last 10 metrics
+                lines.append(f"  {m.name}: {m.value}{m.unit} ({m.service})")
+            lines.append("")
 
-        if result.success:
-            self.incident.status = IncidentStatus.RESOLVED
-        else:
-            self.incident.status = IncidentStatus.FAILED
+        if self.logs:
+            lines.append("=== LOGS ===")
+            for log in self.logs[-10:]:  # last 10 logs
+                lines.append(f"  [{log.level}] {log.message[:120]}")
+            lines.append("")
 
-        self.incident.updated_at = datetime.utcnow()
+        if self.recent_deployments:
+            lines.append("=== RECENT DEPLOYMENTS ===")
+            for dep in self.recent_deployments[-3:]:  # last 3 deployments
+                lines.append(f"  {dep.deployment_id}: {dep.service} @ {dep.branch} → {dep.status.value}")
+            lines.append("")
 
-        self._log_event(
-            agent="self_healing_agent",
-            action="remediation_executed",
-            details={
-                "action": result.action,
-                "success": result.success,
-                "output": result.output,
-            }
-        )
-        logger.info(f"[Context] Remediation result added for {self.incident_id}: {result}")
+        if self.past_solutions:
+            lines.append("=== PAST SOLUTIONS ===")
+            for sol in self.past_solutions[-3:]:  # last 3 solutions
+                lines.append(f"  [{sol.source}] confidence={sol.confidence:.2f}: {sol.root_cause[:100]}")
+            lines.append("")
 
-    def add_alert(self, alert: Alert) -> None:
-        """
-        Called by AlertingAgent after sending a notification.
-        """
-        self.alerts_sent.append(alert)
+        return "\n".join(lines)
 
-        self._log_event(
-            agent="alerting_agent",
-            action="alert_sent",
-            details={
-                "channel": alert.channel,
-                "title": alert.title,
-                "delivered": alert.delivered,
-            }
-        )
-        logger.info(f"[Context] Alert sent for {self.incident_id} via {alert.channel}")
-
-    def set_deployment(self, deployment: DeploymentRecord) -> None:
-        """
-        Called by CICDAgent when a deployment is part of the workflow.
-        """
-        self.deployment = deployment
-
-        self._log_event(
-            agent="cicd_agent",
-            action="deployment_tracked",
-            details={
-                "deployment_id": deployment.deployment_id,
-                "service": deployment.service,
-                "branch": deployment.branch,
-            }
-        )
-
-    def escalate(self) -> None:
-        """
-        Mark this incident as escalated for human intervention.
-        Called by Orchestrator when automated resolution is not possible.
-        """
-        self.incident.status = IncidentStatus.ESCALATED
-        self.incident.updated_at = datetime.utcnow()
-
-        self._log_event(
-            agent="orchestrator",
-            action="escalated",
-            details={"reason": "automated resolution failed"}
-        )
-        logger.warning(f"[Context] Incident escalated: {self.incident_id}")
-
-    # --------------------------------------------------------
-    # Timeline
-    # --------------------------------------------------------
-
-    def _log_event(self, agent: str, action: str, details: dict) -> None:
-        """Append an entry to the timeline audit trail."""
-        self.timeline.append({
-            "timestamp": datetime.utcnow().isoformat(),
-            "agent": agent,
-            "action": action,
-            "details": details,
-        })
-
-    def get_timeline(self) -> List[dict]:
-        """Return the full ordered timeline of Agent actions."""
-        return self.timeline
-
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
-
-    def summary(self) -> dict:
-        """
-        Return a human-readable summary of the full incident context.
-        Used by AlertingAgent to build notification messages.
-        """
-        return {
-            "incident_id": self.incident_id,
-            "service": self.service,
-            "severity": self.incident.severity,
-            "status": self.incident.status,
-            "description": self.incident.description,
-            "root_cause": self.solution.root_cause if self.solution else None,
-            "action_taken": self.remediation_result.action if self.remediation_result else None,
-            "remediation_success": self.remediation_result.success if self.remediation_result else None,
-            "alerts_sent": len(self.alerts_sent),
-            "timeline_steps": len(self.timeline),
-            "created_at": self.created_at.isoformat(),
-        }
-
-    def __repr__(self):
+    def __str__(self):
         return (
             f"IncidentContext("
-            f"id={self.incident_id}, "
-            f"service={self.service}, "
-            f"status={self.incident.status})"
+            f"incident={self.incident.incident_id}, "
+            f"metrics={len(self.metrics)}, "
+            f"logs={len(self.logs)})"
         )
+
+
+class ContextManager:
+    """
+    Builds and stores IncidentContext for each active Incident.
+
+    Example:
+        ctx_manager = ContextManager()
+
+        # Build context for an incident
+        ctx_manager.create_context(incident)
+
+        # Add data as it arrives
+        ctx_manager.add_metrics("INC-001", metrics)
+        ctx_manager.add_logs("INC-001", logs)
+
+        # Get full context for Knowledge Agent
+        context = ctx_manager.get_context("INC-001")
+        prompt_text = context.to_text()
+    """
+
+    def __init__(self):
+        # incident_id → IncidentContext
+        self._contexts: Dict[str, IncidentContext] = {}
+        logger.info("ContextManager initialized")
+
+    # ============================================================
+    # Context Lifecycle
+    # ============================================================
+
+    def create_context(self, incident: Incident) -> IncidentContext:
+        """Create a new empty context for an Incident."""
+        context = IncidentContext(incident=incident)
+        self._contexts[incident.incident_id] = context
+        logger.info(f"[ContextManager] Context created for {incident.incident_id}")
+        return context
+
+    def get_context(self, incident_id: str) -> Optional[IncidentContext]:
+        """Get the full context for an Incident."""
+        return self._contexts.get(incident_id)
+
+    def drop_context(self, incident_id: str) -> None:
+        """Remove context after Incident is resolved."""
+        if incident_id in self._contexts:
+            del self._contexts[incident_id]
+            logger.info(f"[ContextManager] Context dropped for {incident_id}")
+
+    # ============================================================
+    # Adding Data to Context
+    # ============================================================
+
+    def add_metrics(self, incident_id: str, metrics: List[Metric]) -> None:
+        """Add metrics to an Incident context."""
+        ctx = self._contexts.get(incident_id)
+        if ctx:
+            ctx.metrics.extend(metrics)
+            logger.debug(f"[ContextManager] Added {len(metrics)} metrics to {incident_id}")
+
+    def add_logs(self, incident_id: str, logs: List[Log]) -> None:
+        """Add logs to an Incident context."""
+        ctx = self._contexts.get(incident_id)
+        if ctx:
+            ctx.logs.extend(logs)
+            logger.debug(f"[ContextManager] Added {len(logs)} logs to {incident_id}")
+
+    def add_deployment(self, incident_id: str, deployment: Deployment) -> None:
+        """Add a recent deployment to an Incident context."""
+        ctx = self._contexts.get(incident_id)
+        if ctx:
+            ctx.recent_deployments.append(deployment)
+            logger.debug(f"[ContextManager] Added deployment to {incident_id}")
+
+    def add_past_solution(self, incident_id: str, solution: Solution) -> None:
+        """Add a past solution to an Incident context."""
+        ctx = self._contexts.get(incident_id)
+        if ctx:
+            ctx.past_solutions.append(solution)
+            logger.debug(f"[ContextManager] Added past solution to {incident_id}")
+
+    def add_extra(self, incident_id: str, key: str, value: Any) -> None:
+        """Add any extra metadata to an Incident context."""
+        ctx = self._contexts.get(incident_id)
+        if ctx:
+            ctx.extra[key] = value
+
+    # ============================================================
+    # Summary
+    # ============================================================
+
+    def get_all_contexts(self) -> List[IncidentContext]:
+        """Return all active contexts."""
+        return list(self._contexts.values())
+
+    def __repr__(self):
+        return f"ContextManager(active_contexts={len(self._contexts)})"

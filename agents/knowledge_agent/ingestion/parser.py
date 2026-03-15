@@ -7,7 +7,7 @@ text     = error_pattern + keywords + root_cause  (used for embedding)
 metadata = everything else                         (stored in Qdrant payload)
 """
 
-from core.models import ParsedEntry
+from shared.models import ParsedEntry
 
 
 def parse_entries(entries: list[dict]) -> list[ParsedEntry]:

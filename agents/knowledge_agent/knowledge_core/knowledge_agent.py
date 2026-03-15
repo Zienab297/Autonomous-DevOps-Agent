@@ -23,8 +23,8 @@ import re
 import ollama
 from qdrant_client import QdrantClient
 
-from core import AgentResponse, RAGResult, RAGSource, ErrorCategory
-from core.config import Config
+from shared.models import AgentResponse, RAGResult, RAGSource, ErrorCategory
+from shared.config import Config
 from knowledge_core.retriever import retrieve
 from knowledge_core.research_agent import generate_solution
 

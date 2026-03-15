@@ -1,5 +1,5 @@
 """
-core/config.py
+shared/config.py
 --------------
 Central configuration - loaded from .env file or environment variables.
 """
@@ -54,10 +54,14 @@ def load_config() -> Config:
             "  1. Add it to your .env file: GEMINI_API_KEY=your_key\n"
             "  2. Or set it in terminal:    set GEMINI_API_KEY=your_key"
         )
+    
+    base_dir = Path(__file__).resolve().parent.parent  # agents/knowledge_agent/
+    kb_path  = str(base_dir / "data" / "knowledge_base.json")
 
     return Config(
         gemini_api_key=api_key,
         qdrant_host=os.getenv("QDRANT_HOST", "localhost"),
         qdrant_port=int(os.getenv("QDRANT_PORT", "6333")),
         similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.77")),
+        knowledge_base_path=kb_path,
     )

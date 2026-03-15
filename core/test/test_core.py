@@ -13,10 +13,16 @@ Tests:
 """
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+KNOWLEDGE_AGENT = os.path.join(ROOT, "agents", "knowledge_agent")
+
+sys.path.insert(0, KNOWLEDGE_AGENT)   
+sys.path.insert(0, ROOT) 
+
 import asyncio
 import logging
-
+from knowledge_core.knowledge_agent_adapter import KnowledgeAgentAdapter
+from ingestion.pipeline import run_pipeline
 logging.basicConfig(level=logging.INFO)
 
 from core import (
@@ -192,9 +198,14 @@ def test_orchestrator():
     print("\n--- Test 6: Orchestrator Full Workflow ---")
 
     async def run():
+        #setup: populate Qdrant 
+        
+        run_pipeline()
+        print("[SETUP] Qdrant populated\n")
         orchestrator = Orchestrator()
 
-        orchestrator.register_agent("knowledge_agent", DummyKnowledgeAgent())
+        orchestrator.register_agent("knowledge_agent", KnowledgeAgentAdapter())
+        # orchestrator.register_agent("knowledge_agent", DummyKnowledgeAgent())
         orchestrator.register_agent("self_healing_agent", DummySelfHealingAgent())
         orchestrator.register_agent("alerting_agent", DummyAlertingAgent())
 

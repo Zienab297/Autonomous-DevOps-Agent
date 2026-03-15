@@ -12,8 +12,8 @@ Each point:
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
-from core.models import EmbeddedChunk
-from core.config import Config
+from shared.models import EmbeddedChunk
+from shared.config import Config
 
 
 def build_vector_store(embedded_chunks: list[EmbeddedChunk], config: Config) -> QdrantClient:
