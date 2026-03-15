@@ -1,0 +1,247 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "description": "Knowledge graph mapping error patterns to related errors across deployment layers",
+    "layers": [
+      "Layer 1 - Build",
+      "Layer 2 - Registry",
+      "Layer 3 - Pipeline",
+      "Layer 4 - Orchestration",
+      "Layer 5 - Runtime"
+    ]
+  },
+
+  "nodes": {
+
+    "DOCKER-001": {
+      "layer": "Layer 1 - Build",
+      "related": ["DOCKER-002", "DOCKER-004", "DOCKER-005"],
+      "causes": ["K8S-002"],
+      "keywords": ["COPY failed", "build context", "dockerignore"]
+    },
+
+    "DOCKER-002": {
+      "layer": "Layer 1 - Build",
+      "related": ["DOCKER-001", "DOCKER-004"],
+      "causes": ["K8S-002"],
+      "keywords": ["apt-get", "apk", "package not found"]
+    },
+
+    "DOCKER-003": {
+      "layer": "Layer 1 - Build",
+      "related": ["COMPOSE-001", "K8S-003"],
+      "causes": [],
+      "keywords": ["port already in use", "address already in use"]
+    },
+
+    "DOCKER-004": {
+      "layer": "Layer 1 - Build",
+      "related": ["DOCKER-001", "DOCKER-002"],
+      "causes": ["K8S-001"],
+      "keywords": ["permission denied", "OCI runtime", "entrypoint"]
+    },
+
+    "DOCKER-005": {
+      "layer": "Layer 1 - Build",
+      "related": ["DOCKER-001", "DOCKER-002"],
+      "causes": [],
+      "keywords": ["no space left", "disk", "prune"]
+    },
+
+    "GHA-001": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["GHA-002", "REGISTRY-001", "K8S-002"],
+      "causes": ["K8S-002"],
+      "keywords": ["authentication", "GHCR", "registry", "permission denied"]
+    },
+
+    "GHA-002": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["GHA-001", "SEC-001"],
+      "causes": [],
+      "keywords": ["secret not found", "environment variable empty"]
+    },
+
+    "GHA-003": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["GHA-004"],
+      "causes": [],
+      "keywords": ["runner offline", "no runners available"]
+    },
+
+    "GHA-004": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["HELM-002"],
+      "causes": [],
+      "keywords": ["yaml syntax", "invalid workflow", "indentation"]
+    },
+
+    "GHA-005": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["GHA-001", "GHA-002"],
+      "causes": [],
+      "keywords": ["deployment approval", "environment protection"]
+    },
+
+    "GHA-006": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["CI-001"],
+      "causes": [],
+      "keywords": ["cache not found", "cache miss"]
+    },
+
+    "K8S-001": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-002", "K8S-008", "K8S-009", "DOCKER-004"],
+      "causes": ["K8S-006"],
+      "keywords": ["CrashLoopBackOff", "OOMKilled", "container restart"]
+    },
+
+    "K8S-002": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-001", "GHA-001", "REGISTRY-001", "DOCKER-001"],
+      "causes": ["K8S-001", "K8S-006"],
+      "keywords": ["ImagePullBackOff", "ErrImagePull", "image not found"]
+    },
+
+    "K8S-003": {
+      "layer": "Layer 5 - Runtime",
+      "related": ["K8S-007", "COMPOSE-001", "INFRA-001"],
+      "causes": [],
+      "keywords": ["service not reachable", "connection refused", "no endpoints"]
+    },
+
+    "K8S-004": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["COMPOSE-002", "INFRA-002"],
+      "causes": [],
+      "keywords": ["PVC pending", "PersistentVolumeClaim", "StorageClass"]
+    },
+
+    "K8S-005": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["GHA-001", "SEC-001"],
+      "causes": [],
+      "keywords": ["forbidden", "RBAC", "ServiceAccount"]
+    },
+
+    "K8S-006": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-001", "K8S-002", "K8S-008", "HELM-001"],
+      "causes": [],
+      "keywords": ["deployment rollout stuck", "ProgressDeadlineExceeded", "unavailable replicas"]
+    },
+
+    "K8S-007": {
+      "layer": "Layer 5 - Runtime",
+      "related": ["K8S-003", "NET-001"],
+      "causes": [],
+      "keywords": ["502 Bad Gateway", "503 Service Unavailable", "Ingress"]
+    },
+
+    "K8S-008": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-001", "INFRA-002"],
+      "causes": ["K8S-001", "K8S-006"],
+      "keywords": ["Insufficient CPU", "Insufficient memory", "Unschedulable"]
+    },
+
+    "K8S-009": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-001", "GHA-002", "SEC-001"],
+      "causes": ["K8S-001"],
+      "keywords": ["ConfigMap not found", "Secret not found", "MountVolume failed"]
+    },
+
+    "K8S-010": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-008"],
+      "causes": [],
+      "keywords": ["HPA", "metrics not available", "unable to fetch metrics"]
+    },
+
+    "COMPOSE-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": ["K8S-003", "DOCKER-003", "INFRA-001"],
+      "causes": [],
+      "keywords": ["service cannot connect", "no such host", "localhost refused"]
+    },
+
+    "COMPOSE-002": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-004"],
+      "causes": [],
+      "keywords": ["named volume not found", "volume mount failed"]
+    },
+
+    "HELM-001": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-006"],
+      "causes": [],
+      "keywords": ["helm upgrade failed", "immutable field", "spec.selector"]
+    },
+
+    "HELM-002": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["GHA-004"],
+      "causes": [],
+      "keywords": ["helm template error", "nil pointer", "YAML parse error"]
+    },
+
+    "CI-001": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["GHA-006", "CI-002"],
+      "causes": [],
+      "keywords": ["module not found", "Cannot find module", "dependency missing"]
+    },
+
+    "CI-002": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["CI-001"],
+      "causes": [],
+      "keywords": ["test suite failed", "no tests ran", "test not found"]
+    },
+
+    "SEC-001": {
+      "layer": "Layer 3 - Pipeline",
+      "related": ["GHA-002", "K8S-005", "K8S-009"],
+      "causes": [],
+      "keywords": ["hardcoded secret", "secret scanning", "credential exposed"]
+    },
+
+    "NET-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": ["K8S-007", "INFRA-001"],
+      "causes": [],
+      "keywords": ["TLS certificate failed", "SSL handshake", "x509"]
+    },
+
+    "DB-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": ["K8S-001", "K8S-009", "COMPOSE-001"],
+      "causes": ["K8S-001"],
+      "keywords": ["migration failed", "relation does not exist", "table not found"]
+    },
+
+    "REGISTRY-001": {
+      "layer": "Layer 2 - Registry",
+      "related": ["K8S-002", "GHA-001"],
+      "causes": ["K8S-002"],
+      "keywords": ["rate limit exceeded", "toomanyrequests", "docker hub"]
+    },
+
+    "INFRA-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": ["K8S-003", "COMPOSE-001"],
+      "causes": [],
+      "keywords": ["DNS resolution failed", "could not resolve host", "EAI_AGAIN"]
+    },
+
+    "INFRA-002": {
+      "layer": "Layer 4 - Orchestration",
+      "related": ["K8S-008", "K8S-004"],
+      "causes": ["K8S-008"],
+      "keywords": ["ResourceQuota exceeded", "forbidden exceeded quota", "pods forbidden"]
+    }
+  }
+}
