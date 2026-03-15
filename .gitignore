@@ -2,4 +2,5 @@
 **/__pycache__/
 *.pyc
 *.pyo
-/cli/devops_agent.egg-info/
+/devops_agent/devops_agent.egg-info/
+what's next.txt
