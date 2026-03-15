@@ -10,8 +10,8 @@ Returns GeneratedSolution.
 """
 
 import ollama
-from core.models import GeneratedSolution, RAGSource
-from core.config import Config
+from shared.models import GeneratedSolution, RAGSource
+from shared.config import Config
 from tools.web_search_tool import web_search, format_results_for_prompt
 
 

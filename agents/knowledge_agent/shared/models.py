@@ -1,5 +1,5 @@
 """
-core/models.py
+shared/models.py
 --------------
 All shared dataclasses and enums for the Knowledge Agent SDK.
 
@@ -129,6 +129,7 @@ class AgentResponse:
     suggested_commands: list[str]           = field(default_factory=list)
     action_needed:      bool                = True
     rag_result:         Optional[RAGResult] = None  # set if source=KNOWLEDGE_BASE
+    web_sources:        list[str]           = field(default_factory=list)
 
 
 # ── 4. Incident & Fix models ──────────────────────────────────────────────────

@@ -1,215 +1,176 @@
 """
-StateManager - Incident State Store
+core/state_manager.py
+----------------------
+Tracks the state of Incidents and Agents across the system.
+The single source of truth for what is happening right now.
+"""
+from dataclasses import dataclass, field
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
+from core.models import (
+    AgentStatus,
+    Incident,
+    IncidentStatus,
+    RemediationAction,
+    Solution,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class StateManager:
     """
-    Stores and manages all Incident objects in the system.
+    The StateManager is the single source of truth for the system.
+
+    It tracks:
+        - Active and resolved Incidents
+        - Agent statuses
+        - Solutions generated per Incident
+        - Remediation actions taken per Incident
 
     Example:
         state = StateManager()
 
-        # MonitoringAgent creates an incident
-        incident = state.create_incident(
-            service="auth-api",
-            severity=IncidentSeverity.HIGH,
-            description="Error rate spiked to 45%",
-            metrics={"error_rate": 0.45},
-            logs=["ERROR: connection timeout"]
-        )
+        # Track a new incident
+        state.add_incident(incident)
 
-        # Orchestrator updates the status
-        state.update_status(incident.incident_id, IncidentStatus.INVESTIGATING)
+        # Update its status
+        state.update_incident_status("INC-001", IncidentStatus.INVESTIGATING)
 
-        # Orchestrator resolves after fix
-        state.resolve_incident(incident.incident_id)
+        # Check what's active
+        state.get_active_incidents()
     """
 
     def __init__(self):
-        # incident_id -> Incident
+        # incident_id → Incident
         self._incidents: Dict[str, Incident] = {}
+
+        # agent_name → AgentStatus
+        self._agent_statuses: Dict[str, AgentStatus] = {}
+
+        # incident_id → list of Solutions
+        self._solutions: Dict[str, List[Solution]] = {}
+
+        # incident_id → list of RemediationActions
+        self._actions: Dict[str, List[RemediationAction]] = {}
+
         logger.info("StateManager initialized")
 
-    # --------------------------------------------------------
-    # Create
-    # --------------------------------------------------------
+    # ============================================================
+    # Incident Management
+    # ============================================================
 
-    def create_incident(
-        self,
-        service: str,
-        severity: IncidentSeverity,
-        description: str,
-        metrics: Optional[Dict[str, Any]] = None,
-        logs: Optional[List[str]] = None,
-    ) -> Incident:
-        """
-        Create a new Incident and store it.
-        Called by: MonitoringAgent when an anomaly is detected.
-
-        Returns:
-            The created Incident object (from models.py)
-        """
-        incident = Incident(
-            service=service,
-            severity=severity,
-            description=description,
-            metrics=metrics or {},
-            logs=logs or [],
-        )
-
+    def add_incident(self, incident: Incident) -> None:
+        """Add a new Incident to the state."""
         self._incidents[incident.incident_id] = incident
-        logger.info(f"Incident created: {incident}")
-        return incident
-
-    # --------------------------------------------------------
-    # Read
-    # --------------------------------------------------------
+        logger.info(f"[StateManager] Incident added: {incident}")
 
     def get_incident(self, incident_id: str) -> Optional[Incident]:
-        """
-        Retrieve an Incident by ID.
-        Returns None if not found.
-        """
+        """Get an Incident by ID."""
+        return self._incidents.get(incident_id)
+
+    def update_incident_status(
+        self, incident_id: str, status: IncidentStatus
+    ) -> None:
+        """Update the status of an Incident."""
         incident = self._incidents.get(incident_id)
         if not incident:
-            logger.warning(f"Incident not found: {incident_id}")
-        return incident
+            logger.warning(f"[StateManager] Incident not found: {incident_id}")
+            return
 
-    def get_all(self) -> List[Incident]:
-        """Return all incidents regardless of status."""
-        return list(self._incidents.values())
-
-    def get_active_incidents(self) -> List[Incident]:
-        """
-        Return all incidents still in progress.
-        (DETECTED, INVESTIGATING, REMEDIATING)
-        """
-        active = {
-            IncidentStatus.DETECTED,
-            IncidentStatus.INVESTIGATING,
-            IncidentStatus.REMEDIATING,
-        }
-        return [i for i in self._incidents.values() if i.status in active]
-
-    def get_by_service(self, service: str) -> List[Incident]:
-        """Return all incidents for a specific service."""
-        return [i for i in self._incidents.values() if i.service == service]
-
-    def get_by_status(self, status: IncidentStatus) -> List[Incident]:
-        """Return all incidents with a specific status."""
-        return [i for i in self._incidents.values() if i.status == status]
-
-    # --------------------------------------------------------
-    # Update
-    # --------------------------------------------------------
-
-    def update_status(
-        self,
-        incident_id: str,
-        status: IncidentStatus
-    ) -> Optional[Incident]:
-        """
-        Update the status of an incident.
-        Called by: Orchestrator at every step of the workflow.
-
-        Example:
-            state.update_status(incident_id, IncidentStatus.INVESTIGATING)
-            state.update_status(incident_id, IncidentStatus.REMEDIATING)
-        """
-        incident = self.get_incident(incident_id)
-        if not incident:
-            return None
-
-        previous = incident.status
         incident.status = status
         incident.updated_at = datetime.utcnow()
+        logger.info(f"[StateManager] Incident {incident_id} → {status.value}")
 
-        logger.info(f"Status updated: {incident_id} | {previous} -> {status}")
-        return incident
+    def get_active_incidents(self) -> List[Incident]:
+        """Return all Incidents that are not resolved or failed."""
+        return [
+            i for i in self._incidents.values()
+            if i.status not in (IncidentStatus.RESOLVED, IncidentStatus.FAILED)
+        ]
 
-    def append_logs(self, incident_id: str, logs: List[str]) -> Optional[Incident]:
-        """
-        Add new log lines to an existing incident.
-        Called by: MonitoringAgent if more logs come in.
-        """
-        incident = self.get_incident(incident_id)
-        if not incident:
+    def get_all_incidents(self) -> List[Incident]:
+        """Return all Incidents."""
+        return list(self._incidents.values())
+
+    def get_resolved_incidents(self) -> List[Incident]:
+        """Return all resolved Incidents."""
+        return [
+            i for i in self._incidents.values()
+            if i.status == IncidentStatus.RESOLVED
+        ]
+
+    # ============================================================
+    # Agent Status Management
+    # ============================================================
+
+    def set_agent_status(self, agent_name: str, status: AgentStatus) -> None:
+        """Update the status of an Agent."""
+        self._agent_statuses[agent_name] = status
+        logger.info(f"[StateManager] Agent '{agent_name}' → {status.value}")
+
+    def get_agent_status(self, agent_name: str) -> Optional[AgentStatus]:
+        """Get the current status of an Agent."""
+        return self._agent_statuses.get(agent_name)
+
+    def get_all_agent_statuses(self) -> Dict[str, AgentStatus]:
+        """Return all agent statuses."""
+        return dict(self._agent_statuses)
+
+    # ============================================================
+    # Solution Management
+    # ============================================================
+
+    def add_solution(self, solution: Solution) -> None:
+        """Store a Solution generated for an Incident."""
+        if solution.incident_id not in self._solutions:
+            self._solutions[solution.incident_id] = []
+        self._solutions[solution.incident_id].append(solution)
+        logger.info(f"[StateManager] Solution added for {solution.incident_id}")
+
+    def get_solutions(self, incident_id: str) -> List[Solution]:
+        """Get all Solutions generated for an Incident."""
+        return self._solutions.get(incident_id, [])
+
+    def get_best_solution(self, incident_id: str) -> Optional[Solution]:
+        """Get the highest confidence Solution for an Incident."""
+        solutions = self._solutions.get(incident_id, [])
+        if not solutions:
             return None
+        return max(solutions, key=lambda s: s.confidence)
 
-        incident.logs.extend(logs)
-        incident.updated_at = datetime.utcnow()
-        return incident
+    # ============================================================
+    # Remediation Action Management
+    # ============================================================
 
-    def update_metrics(self, incident_id: str, metrics: Dict[str, Any]) -> Optional[Incident]:
-        """
-        Merge new metrics into an existing incident.
-        Called by: MonitoringAgent during verification.
-        """
-        incident = self.get_incident(incident_id)
-        if not incident:
-            return None
+    def add_action(self, action: RemediationAction) -> None:
+        """Store a RemediationAction taken for an Incident."""
+        if action.incident_id not in self._actions:
+            self._actions[action.incident_id] = []
+        self._actions[action.incident_id].append(action)
+        logger.info(f"[StateManager] Action added for {action.incident_id}: {action.command[:50]}")
 
-        incident.metrics.update(metrics)
-        incident.updated_at = datetime.utcnow()
-        return incident
+    def get_actions(self, incident_id: str) -> List[RemediationAction]:
+        """Get all RemediationActions taken for an Incident."""
+        return self._actions.get(incident_id, [])
 
-    # --------------------------------------------------------
-    # Resolve / Fail / Escalate
-    # --------------------------------------------------------
+    # ============================================================
+    # Summary
+    # ============================================================
 
-    def resolve_incident(self, incident_id: str) -> Optional[Incident]:
-        """
-        Mark an incident as resolved.
-        Called by: Orchestrator after REMEDIATION_COMPLETE.
-        """
-        incident = self.update_status(incident_id, IncidentStatus.RESOLVED)
-        if incident:
-            logger.info(f"Incident resolved: {incident_id} ✅")
-        return incident
-
-    def fail_incident(self, incident_id: str) -> Optional[Incident]:
-        """
-        Mark an incident as failed.
-        Called by: Orchestrator when all retries are exhausted.
-        """
-        incident = self.update_status(incident_id, IncidentStatus.FAILED)
-        if incident:
-            logger.warning(f"Incident failed: {incident_id} ❌")
-        return incident
-
-    def escalate_incident(self, incident_id: str) -> Optional[Incident]:
-        """
-        Mark an incident as escalated for human intervention.
-        Called by: Orchestrator when auto-remediation is not possible.
-        """
-        incident = self.update_status(incident_id, IncidentStatus.ESCALATED)
-        if incident:
-            logger.warning(f"Incident escalated: {incident_id} ⚠️")
-        return incident
-
-    # --------------------------------------------------------
-    # Stats
-    # --------------------------------------------------------
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Return a quick summary of all incidents in the system."""
-        by_status: Dict[str, int] = {}
-        for status in IncidentStatus:
-            count = len(self.get_by_status(status))
-            if count > 0:
-                by_status[status.value] = count
-
+    def summary(self) -> Dict:
+        """Return a summary of the current system state."""
         return {
-            "total":   len(self._incidents),
-            "active":  len(self.get_active_incidents()),
-            "by_status": by_status,
+            "total_incidents"  : len(self._incidents),
+            "active_incidents" : len(self.get_active_incidents()),
+            "resolved_incidents": len(self.get_resolved_incidents()),
+            "agents"           : self.get_all_agent_statuses(),
         }
 
     def __repr__(self):
         return (
             f"StateManager("
-            f"total={len(self._incidents)}, "
-            f"active={len(self.get_active_incidents())})"
+            f"incidents={len(self._incidents)}, "
+            f"agents={len(self._agent_statuses)})"
         )

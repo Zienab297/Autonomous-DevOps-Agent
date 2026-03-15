@@ -1,317 +1,311 @@
 """
-Orchestrator - Workflow Director
+core/orchestrator.py
+---------------------
+The Orchestrator is the brain of the system.
+It coordinates all Agents, manages incident workflows,
+and ensures the right Agent is called at the right time.
+
+Workflow:
+    Incident Created
+         │
+         ▼
+    Knowledge Agent  →  Solution
+         │
+         ▼
+    Self-Healing Agent  →  Remediation
+         │
+         ▼
+    Alerting Agent  →  Notification
 """
 
+import asyncio
 import logging
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Optional
 
-from .agent_registry import AgentRegistry, AgentStatus
-from .context import IncidentContext
-from .event_bus import Event, EventBus, EventType
-from .models import IncidentStatus, RemediationAction, Solution
-from .state_manager import StateManager
+from core.models import (
+    AgentStatus,
+    Incident,
+    IncidentStatus,
+    Solution,
+)
+from core.event_bus import EventBus, Event, EventType
+from core.state_manager import StateManager
+from core.context_manager import ContextManager
+from core.agent_registery import AgentRegistry
 
 logger = logging.getLogger(__name__)
-
-# Required agents that must be running before the system can operate
-REQUIRED_AGENTS = [
-    "monitoring_agent",
-    "knowledge_agent",
-    "self_healing_agent",
-    "alerting_agent",
-]
 
 
 class Orchestrator:
     """
-    Drives the full incident workflow from detection to resolution.
+    The Orchestrator coordinates all Agents in the system.
+
+    Responsibilities:
+        - Register and manage Agents
+        - Listen for Events from the EventBus
+        - Trigger the correct Agent for each Event
+        - Track incident workflow from detection to resolution
 
     Example:
-        bus      = EventBus()
-        state    = StateManager()
-        registry = AgentRegistry()
+        orchestrator = Orchestrator()
 
-        orchestrator = Orchestrator(
-            event_bus=bus,
-            state_manager=state,
-            agent_registry=registry,
-            auto_remediate=True,
-            max_retries=3
-        )
+        # Register agents
+        orchestrator.register_agent("monitoring_agent", monitoring_agent)
+        orchestrator.register_agent("knowledge_agent", knowledge_agent)
+        orchestrator.register_agent("self_healing_agent", healing_agent)
+        orchestrator.register_agent("alerting_agent", alerting_agent)
 
-        orchestrator.start()
+        # Start the system
+        await orchestrator.start()
     """
 
-    def __init__(
-        self,
-        event_bus: EventBus,
-        state_manager: StateManager,
-        agent_registry: AgentRegistry,
-        auto_remediate: bool = True,
-        max_retries: int = 3,
-    ):
-        self.bus = event_bus
-        self.state = state_manager
-        self.registry = agent_registry
-        self.auto_remediate = auto_remediate
-        self.max_retries = max_retries
+    def __init__(self):
+        self.event_bus       = EventBus()
+        self.state_manager   = StateManager()
+        self.context_manager = ContextManager()
+        self.registry        = AgentRegistry()
+        self._running        = False
 
-        # incident_id -> IncidentContext
-        # One context object per active incident
-        self._contexts: Dict[str, IncidentContext] = {}
-
-        # incident_id -> retry count
-        self._retry_counts: Dict[str, int] = {}
+        self._subscribe_to_events()
 
         logger.info("Orchestrator initialized")
 
-    # --------------------------------------------------------
-    # Startup
-    # --------------------------------------------------------
+    # ============================================================
+    # Setup
+    # ============================================================
 
-    def start(self) -> None:
+    def _subscribe_to_events(self) -> None:
+        """Subscribe to all core EventBus events."""
+        self.event_bus.subscribe(
+            EventType.INCIDENT_CREATED,
+            self._on_incident_created,
+        )
+        self.event_bus.subscribe(
+            EventType.INVESTIGATION_COMPLETE,
+            self._on_investigation_complete,
+        )
+        self.event_bus.subscribe(
+            EventType.REMEDIATION_COMPLETE,
+            self._on_remediation_complete,
+        )
+        self.event_bus.subscribe(
+            EventType.REMEDIATION_FAILED,
+            self._on_remediation_failed,
+        )
+
+    def register_agent(
+        self,
+        name: str,
+        agent: object,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Register an Agent with the Orchestrator."""
+        self.registry.register(name, agent, metadata)
+        self.state_manager.set_agent_status(name, AgentStatus.IDLE)
+        logger.info(f"[Orchestrator] Agent registered: '{name}'")
+
+    # ============================================================
+    # Lifecycle
+    # ============================================================
+
+    async def start(self) -> None:
+        """Start the Orchestrator."""
+        self._running = True
+        logger.info("[Orchestrator] Started")
+
+    async def stop(self) -> None:
+        """Stop the Orchestrator and all Agents."""
+        self._running = False
+
+        for record in self.registry.get_all():
+            self.state_manager.set_agent_status(
+                record.name, AgentStatus.STOPPED
+            )
+
+        logger.info("[Orchestrator] Stopped")
+
+    # ============================================================
+    # Incident Workflow
+    # ============================================================
+
+    async def handle_incident(self, incident: Incident) -> None:
         """
-        Subscribe to all workflow Events on the EventBus.
-        Must be called once before the system starts.
+        Main entry point — trigger the full incident workflow.
+
+        Steps:
+            1. Save incident to state
+            2. Create context
+            3. Publish INCIDENT_CREATED event
+            4. Knowledge Agent investigates
+            5. Self-Healing Agent remediates
+            6. Alerting Agent notifies
         """
-        self.bus.subscribe(EventType.INCIDENT_CREATED,       self._on_incident_created)
-        self.bus.subscribe(EventType.INVESTIGATION_COMPLETE, self._on_investigation_complete)
-        self.bus.subscribe(EventType.REMEDIATION_COMPLETE,   self._on_remediation_complete)
-        self.bus.subscribe(EventType.REMEDIATION_FAILED,     self._on_remediation_failed)
+        logger.info(f"[Orchestrator] Handling: {incident}")
 
-        logger.info("Orchestrator started — listening for Events")
+        # Step 1 — Save to state
+        self.state_manager.add_incident(incident)
+        self.state_manager.update_incident_status(
+            incident.incident_id, IncidentStatus.INVESTIGATING
+        )
 
-    def verify_agents(self) -> List[str]:
-        """
-        Check that all required Agents are registered and running.
-        Returns a list of missing Agent names.
+        # Step 2 — Create context
+        self.context_manager.create_context(incident)
 
-        Called after all Agents have been started.
-
-        Example:
-            missing = orchestrator.verify_agents()
-            if missing:
-                raise RuntimeError(f"Missing: {missing}")
-        """
-        missing = self.registry.verify_required_agents(REQUIRED_AGENTS)
-        if missing:
-            logger.error(f"Missing required agents: {missing}")
-        else:
-            logger.info("All required agents verified ✅")
-        return missing
-
-    # --------------------------------------------------------
-    # Step 1 — Incident detected -> start investigation
-    # --------------------------------------------------------
-
-    async def _on_incident_created(self, event: Event) -> None:
-        """
-        Triggered by: MonitoringAgent publishes INCIDENT_CREATED
-        Action: Create an IncidentContext and tell KnowledgeAgent to investigate
-        """
-        incident_id = event.incident_id
-        logger.info(f"[Orchestrator] New incident received: {incident_id}")
-
-        # Fetch the incident from StateManager
-        incident = self.state.get_incident(incident_id)
-        if not incident:
-            logger.error(f"Incident {incident_id} not found in StateManager")
-            return
-
-        # Create a fresh context for this incident
-        ctx = IncidentContext(incident=incident)
-        self._contexts[incident_id] = ctx
-
-        # Update state
-        self.state.update_status(incident_id, IncidentStatus.INVESTIGATING)
-
-        # Check KnowledgeAgent is available
-        if not self.registry.is_running("knowledge_agent"):
-            logger.error("KnowledgeAgent is not running — escalating")
-            ctx.escalate()
-            await self._send_alert(ctx)
-            return
-
-        # Tell KnowledgeAgent to start investigating
-        await self.bus.publish(Event(
-            type=EventType.INVESTIGATION_STARTED,
+        # Step 3 — Publish event
+        await self.event_bus.publish(Event(
+            type=EventType.INCIDENT_CREATED,
             source="orchestrator",
-            incident_id=incident_id,
+            incident_id=incident.incident_id,
             data={
-                "service":      incident.service,
-                "description":  incident.description,
-                "metrics":      incident.metrics,
-                "logs":         incident.logs,
+                "incident_id": incident.incident_id,
+                "service"    : incident.service,
+                "severity"   : incident.severity.value,
+                "description": incident.description,
             }
         ))
 
-    # --------------------------------------------------------
-    # Step 2 — Investigation done -> remediate or escalate
-    # --------------------------------------------------------
+    # ============================================================
+    # Event Handlers
+    # ============================================================
+
+    async def _on_incident_created(self, event: Event) -> None:
+        """Triggered when a new Incident is created — call Knowledge Agent."""
+        logger.info(f"[Orchestrator] Incident created → calling Knowledge Agent")
+
+        knowledge_agent = self.registry.get_agent("knowledge_agent")
+        if not knowledge_agent:
+            logger.error("[Orchestrator] Knowledge Agent not registered!")
+            return
+
+        self.state_manager.set_agent_status(
+            "knowledge_agent", AgentStatus.RUNNING
+        )
+
+        context = self.context_manager.get_context(event.incident_id)
+
+        try:
+            solution = await knowledge_agent.investigate(context)
+
+            if solution:
+                self.state_manager.add_solution(solution)
+
+                await self.event_bus.publish(Event(
+                    type=EventType.INVESTIGATION_COMPLETE,
+                    source="knowledge_agent",
+                    incident_id=event.incident_id,
+                    data={"solution": solution},
+                ))
+
+        except Exception as e:
+            logger.error(f"[Orchestrator] Knowledge Agent failed: {e}")
+
+        finally:
+            self.state_manager.set_agent_status(
+                "knowledge_agent", AgentStatus.IDLE
+            )
 
     async def _on_investigation_complete(self, event: Event) -> None:
-        """
-        Triggered by: KnowledgeAgent publishes INVESTIGATION_COMPLETE
-        Action:
-            - auto_remediate ON  -> tell SelfHealingAgent to fix it
-            - auto_remediate OFF -> escalate for human review
-        """
-        incident_id = event.incident_id
-        data = event.data
+        """Triggered when investigation is done — call Self-Healing Agent."""
+        logger.info(f"[Orchestrator] Investigation complete → calling Self-Healing Agent")
 
-        logger.info(f"[Orchestrator] Investigation complete: {incident_id}")
-
-        ctx = self._get_context(incident_id)
-        if not ctx:
+        healing_agent = self.registry.get_agent("self_healing_agent")
+        if not healing_agent:
+            logger.error("[Orchestrator] Self-Healing Agent not registered!")
             return
 
-        # Save solution into the context
-        solution = Solution(
-            incident_id=incident_id,
-            root_cause=data.get("root_cause", "Unknown"),
-            recommended_action=data.get("recommended_action", RemediationAction.CUSTOM),
-            confidence=data.get("confidence", 0.0),
-            explanation=data.get("explanation", ""),
-            raw_llm_response=data.get("raw_llm_response"),
-            retrieved_docs=data.get("retrieved_docs", []),
+        self.state_manager.set_agent_status(
+            "self_healing_agent", AgentStatus.RUNNING
         )
-        ctx.add_solution(solution)
 
-        if self.auto_remediate:
-            # Check SelfHealingAgent is available
-            if not self.registry.is_running("self_healing_agent"):
-                logger.error("SelfHealingAgent is not running — escalating")
-                ctx.escalate()
-                await self._send_alert(ctx)
-                return
+        solution: Solution = event.data.get("solution")
 
-            self.state.update_status(incident_id, IncidentStatus.REMEDIATING)
+        self.state_manager.update_incident_status(
+            event.incident_id, IncidentStatus.REMEDIATING
+        )
 
-            await self.bus.publish(Event(
-                type=EventType.REMEDIATION_STARTED,
-                source="orchestrator",
-                incident_id=incident_id,
-                data={
-                    "recommended_action": solution.recommended_action,
-                    "confidence":         solution.confidence,
-                    "service":            ctx.service,
-                }
-            ))
-        else:
-            # Manual mode — escalate for human decision
-            logger.info(f"Auto-remediate OFF — escalating: {incident_id}")
-            ctx.escalate()
-            self.state.update_status(incident_id, IncidentStatus.ESCALATED)
-            await self._send_alert(ctx)
+        try:
+            await healing_agent.remediate(solution)
 
-    # --------------------------------------------------------
-    # Step 3 — Remediation succeeded -> resolve
-    # --------------------------------------------------------
+        except Exception as e:
+            logger.error(f"[Orchestrator] Self-Healing Agent failed: {e}")
+
+        finally:
+            self.state_manager.set_agent_status(
+                "self_healing_agent", AgentStatus.IDLE
+            )
 
     async def _on_remediation_complete(self, event: Event) -> None:
-        """
-        Triggered by: SelfHealingAgent publishes REMEDIATION_COMPLETE
-        Action: Mark resolved and notify team
-        """
-        incident_id = event.incident_id
-        logger.info(f"[Orchestrator] Remediation complete: {incident_id}")
+        """Triggered when remediation succeeds — resolve incident and notify."""
+        logger.info(f"[Orchestrator] Remediation complete → resolving incident")
 
-        ctx = self._get_context(incident_id)
-        if not ctx:
-            return
+        self.state_manager.update_incident_status(
+            event.incident_id, IncidentStatus.RESOLVED
+        )
 
-        self.state.resolve_incident(incident_id)
-        self._retry_counts.pop(incident_id, None)
+        await self._send_alert(
+            incident_id=event.incident_id,
+            title="Incident Resolved",
+            message=f"Incident {event.incident_id} has been resolved automatically.",
+        )
 
-        await self._send_alert(ctx)
-        self._cleanup(incident_id)
-
-    # --------------------------------------------------------
-    # Step 4 — Remediation failed -> retry or escalate
-    # --------------------------------------------------------
+        self.context_manager.drop_context(event.incident_id)
 
     async def _on_remediation_failed(self, event: Event) -> None:
-        """
-        Triggered by: SelfHealingAgent publishes REMEDIATION_FAILED
-        Action:
-            - Retries remaining -> retry
-            - Retries exhausted -> escalate
-        """
-        incident_id = event.incident_id
-        logger.warning(f"[Orchestrator] Remediation failed: {incident_id}")
+        """Triggered when remediation fails — mark failed and notify."""
+        logger.warning(f"[Orchestrator] Remediation failed for {event.incident_id}")
 
-        ctx = self._get_context(incident_id)
-        if not ctx:
-            return
+        self.state_manager.update_incident_status(
+            event.incident_id, IncidentStatus.FAILED
+        )
 
-        retries = self._retry_counts.get(incident_id, 0) + 1
-        self._retry_counts[incident_id] = retries
+        await self._send_alert(
+            incident_id=event.incident_id,
+            title="Remediation Failed",
+            message=f"Incident {event.incident_id} could not be resolved automatically. Manual intervention required.",
+        )
 
-        if retries < self.max_retries:
-            logger.info(
-                f"Retrying remediation for {incident_id} "
-                f"({retries}/{self.max_retries})"
-            )
-            await self.bus.publish(Event(
-                type=EventType.REMEDIATION_STARTED,
-                source="orchestrator",
-                incident_id=incident_id,
-                data=event.data
-            ))
-        else:
-            logger.error(
-                f"All {self.max_retries} retries failed for {incident_id} — escalating"
-            )
-            ctx.escalate()
-            self.state.update_status(incident_id, IncidentStatus.ESCALATED)
-            await self._send_alert(ctx)
-            self._cleanup(incident_id)
-
-    # --------------------------------------------------------
+    # ============================================================
     # Helpers
-    # --------------------------------------------------------
+    # ============================================================
 
-    async def _send_alert(self, ctx: IncidentContext) -> None:
-        """Tell AlertingAgent to send a notification."""
-        if not self.registry.is_running("alerting_agent"):
-            logger.warning("AlertingAgent is not running — skipping notification")
+    async def _send_alert(
+        self,
+        incident_id: str,
+        title: str,
+        message: str,
+    ) -> None:
+        """Send an alert via the Alerting Agent if available."""
+        alerting_agent = self.registry.get_agent("alerting_agent")
+        if not alerting_agent:
+            logger.warning("[Orchestrator] Alerting Agent not registered — skipping alert")
             return
 
-        await self.bus.publish(Event(
-            type=EventType.ALERT_SENT,
-            source="orchestrator",
-            incident_id=ctx.incident_id,
-            data=ctx.summary()
-        ))
+        try:
+            await alerting_agent.send(
+                incident_id=incident_id,
+                title=title,
+                message=message,
+            )
+        except Exception as e:
+            logger.error(f"[Orchestrator] Alerting Agent failed: {e}")
 
-    def _get_context(self, incident_id: str) -> Optional[IncidentContext]:
-        """Retrieve the IncidentContext for an incident. Logs error if missing."""
-        ctx = self._contexts.get(incident_id)
-        if not ctx:
-            logger.error(f"No context found for incident: {incident_id}")
-        return ctx
+    # ============================================================
+    # Summary
+    # ============================================================
 
-    def _cleanup(self, incident_id: str) -> None:
-        """Remove a resolved/escalated incident from active contexts."""
-        self._contexts.pop(incident_id, None)
-        self._retry_counts.pop(incident_id, None)
-
-    # --------------------------------------------------------
-    # Inspection
-    # --------------------------------------------------------
-
-    def get_active_incidents(self) -> List[str]:
-        """Return IDs of all currently active incidents."""
-        return list(self._contexts.keys())
-
-    def get_context(self, incident_id: str) -> Optional[IncidentContext]:
-        """Public access to an incident's context."""
-        return self._contexts.get(incident_id)
+    def summary(self) -> dict:
+        """Return a full system summary."""
+        return {
+            "orchestrator" : "running" if self._running else "stopped",
+            "agents"       : self.registry.summary(),
+            "state"        : self.state_manager.summary(),
+            "event_history": len(self.event_bus.get_history()),
+        }
 
     def __repr__(self):
         return (
             f"Orchestrator("
-            f"active_incidents={len(self._contexts)}, "
-            f"auto_remediate={self.auto_remediate}, "
-            f"max_retries={self.max_retries})"
+            f"running={self._running}, "
+            f"agents={self.registry.get_all_names()})"
         )

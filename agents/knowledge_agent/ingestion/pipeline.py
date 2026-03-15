@@ -8,7 +8,7 @@ Usage:
     GEMINI_API_KEY=your_key python -m ingestion.pipeline
 """
 
-from core.config import load_config
+from shared.config import load_config
 from ingestion.loader       import load_knowledge_base
 from ingestion.parser       import parse_entries
 from ingestion.chunker      import chunk_entries

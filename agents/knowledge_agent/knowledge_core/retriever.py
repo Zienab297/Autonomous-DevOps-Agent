@@ -9,8 +9,8 @@ Embeds incoming error message → searches Qdrant → returns RetrievalResult.
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 
-from core.models import RetrievalResult
-from core.config import Config
+from shared.models import RetrievalResult
+from shared.config import Config
 
 
 def retrieve(error_message: str, client: QdrantClient, config: Config) -> RetrievalResult:
