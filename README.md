@@ -12,3 +12,19 @@ when updating the agent use both command
 
 testing the integration between devops_agent and the core
 `pytest tests/cli_core_integration_test.py -v`
+
+
+## Running the Agents
+
+**Knowledge Agent** — make sure Qdrant is running first
+```bash
+docker run -p 6333:6333 qdrant/qdrant
+cd agents/knowledge_agent
+python test_knowledge_agent.py
+```
+
+**Core** — make sure Qdrant is running first
+```bash
+docker run -p 6333:6333 qdrant/qdrant
+cd core/test
+python test_core.py
