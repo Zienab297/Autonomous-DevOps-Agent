@@ -1,7 +1,7 @@
 # DevOps-Multi-Agent-System
 
 
-## Commands
+## SDK and CLI Setting up Commands 
 
 setting up the devops agent to run at any directory
 `pip install -e .`
