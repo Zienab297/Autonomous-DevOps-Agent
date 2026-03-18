@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,7 +19,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
