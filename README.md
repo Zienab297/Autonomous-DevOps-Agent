@@ -4,14 +4,20 @@
 ## SDK and CLI Setting up Commands 
 
 setting up the devops agent to run at any directory
-`pip install -e .`
+```bash
+pip install -e .
+```
 
 when updating the agent use both command
-`pip uninstall devops-agent -y`
-`pip install -e .`
+```bash
+pip uninstall devops-agent -y
+pip install -e .
+```
 
 testing the integration between devops_agent and the core
-`pytest tests/cli_core_integration_test.py -v`
+```bash
+pytest tests/cli_core_integration_test.py -v
+```
 
 
 ## Running the Agents
