@@ -54,7 +54,10 @@ class RemediationStatus(str, Enum):
     FAILED   = "failed"
     REJECTED = "rejected"
 
-
+class VerificationStatus(str, Enum):
+    PASS    = "PASS"
+    FAIL    = "FAIL"
+    UNKNOWN = "UNKNOWN"     # LLM could not determine from outputs
 # ============================================================
 # Core Models
 # ============================================================
@@ -133,13 +136,229 @@ class Solution:
     references: List[str] = field(default_factory=list)
     source: str = "knowledge_base"
     created_at: datetime = field(default_factory=datetime.utcnow)
-
+     # ── NEW FIELDS ──────────────────────────────────────
+    files_to_modify: List[Dict] = field(default_factory=list)
+        # Each entry:  {"path": str, "action": str, "content": str}
+        # action = "replace_line" | "append" | "overwrite"
+        
     def __str__(self):
         return (
             f"Solution(incident={self.incident_id}, "
             f"confidence={self.confidence:.2f}, "
             f"source={self.source})"
         )
+
+@dataclass
+class LLMFixResponse:
+    """
+    Response from the LLM Fixer Agent after analyzing a Solution
+    and applying file-level modifications.
+
+    Example:
+        LLMFixResponse(
+            incident_id="INC-001",
+            modified_files=[{"path": "deploy.yaml", "new_content": "..."}],
+            steps=["Identified misconfigured replica count", "Updated replicas to 3"],
+            confidence=0.91
+        )
+    """
+    incident_id: str
+    modified_files: List[Dict]
+    # Each entry: {"path": str, "new_content": str, "action": str}
+
+    steps: List[str]
+    confidence: float
+    remediation_commands: List[Dict]    = field(default_factory=list)
+    raw_response: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+    def __str__(self):
+        return (
+            f"LLMFixResponse(incident={self.incident_id}, "
+            f"files={len(self.modified_files)}, "
+            f"confidence={self.confidence:.2f})"
+        )
+
+@dataclass
+class FileModificationResult:
+    """
+    Holds the before/after state of a single file touched by the fixer.
+
+    Example:
+        FileModificationResult(
+            path="k8s/deployment.yaml",
+            old_content="replicas: 1\n...",
+            new_content="replicas: 3\n...",
+            action="overwrite",
+            applied=True,
+        )
+    """
+    path: str
+    old_content: str           # content read from disk BEFORE the fix
+    new_content: str           # content produced by the LLM
+    action: str                # overwrite | append | replace_line
+    applied: bool = False      # True once written to disk
+    backup_path: Optional[str] = None   
+    error: Optional[str] = None
+
+    def __str__(self):
+        status = "applied" if self.applied else ("error" if self.error else "pending")
+        return (
+            f"FileModificationResult("
+            f"path={self.path}, "
+            f"action={self.action}, "
+            f"backup={self.backup_path}, "
+            f"status={status})"
+        )
+
+@dataclass
+class CommandExecutionResult:
+    """
+    Outcome of a single remediation command executed after file changes.
+ 
+    Example:
+        CommandExecutionResult(
+            command="systemctl restart nginx",
+            description="Reload nginx after config update",
+            order=1,
+            on_failure="abort",
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+    """
+    command: str
+    description: str
+    order: int
+    on_failure: str                     # "abort" | "continue" | "retry"
+    returncode: Optional[int] = None    # None if not yet run / skipped
+    stdout: str = ""
+    stderr: str = ""
+    skipped: bool = False               # True if an earlier abort stopped execution
+    error: Optional[str] = None         # Python-level exception message, if any
+ 
+    @property
+    def succeeded(self) -> bool:
+        return self.returncode == 0
+ 
+    def __str__(self):
+        if self.skipped:
+            state = "skipped"
+        elif self.error:
+            state = f"error({self.error})"
+        elif self.returncode is None:
+            state = "pending"
+        else:
+            state = "ok" if self.succeeded else f"failed(rc={self.returncode})"
+        return (
+            f"CommandExecutionResult("
+            f"order={self.order}, "
+            f"cmd={self.command!r}, "
+            f"state={state})"
+        )
+    
+
+@dataclass
+class CommandResult:
+    """
+    Result of a single verification command execution.
+
+    Example:
+        CommandResult(
+            command="pip check",
+            exit_code=0,
+            stdout="No broken requirements found.",
+            stderr="",
+            passed=True,
+        )
+    """
+    command:   str
+    exit_code: int
+    stdout:    str
+    stderr:    str
+    passed:    bool            # exit_code == 0
+    error:     Optional[str] = None   # set if subprocess itself failed
+
+    def __str__(self):
+        status = "✓" if self.passed else "✗"
+        return (
+            f"CommandResult({status} exit={self.exit_code}, "
+            f"cmd={self.command[:60]})"
+        )
+
+@dataclass
+class VerificationReport:
+    """
+    Final report produced by the LLM Verifier.
+
+    Example:
+        VerificationReport(
+            incident_id="INC-001",
+            status=VerificationStatus.PASS,
+            commands_run=["pip check", "python -c 'import httpx'"],
+            results=[...],
+            reason="All packages resolved. httpx imported successfully.",
+            confidence=0.97,
+        )
+    """
+    incident_id:   str
+    status:        VerificationStatus
+    commands_run:  List[str]
+    results:       List[CommandResult]
+    reason:        str
+    confidence:    float
+    raw_response:  Optional[str] = None
+    created_at:    datetime = field(default_factory=datetime.utcnow)
+
+    def __str__(self):
+        return (
+            f"VerificationReport("
+            f"incident={self.incident_id}, "
+            f"status={self.status.value}, "
+            f"commands={len(self.commands_run)}, "
+            f"confidence={self.confidence:.2f})"
+        )
+
+@dataclass
+class SelfHealingResult:
+    """
+    Final result returned by the Self-Healing Agent after processing a Solution.
+
+    Example:
+        SelfHealingResult(
+            incident_id="INC-001",
+            status=RemediationStatus.SUCCESS,
+            file_modifications=[...],
+            steps=["Updated replicas", "Fixed env var"],
+            confidence=0.91,
+        )
+    """
+    incident_id: str
+    status: RemediationStatus
+    file_modifications: List[FileModificationResult] = field(default_factory=list)
+    steps: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    validation_errors: List[str] = field(default_factory=list)
+    remediation_command_results: List[CommandExecutionResult] = field(default_factory=list)
+    llm_response: Optional[LLMFixResponse] = None
+    verification: Optional[VerificationReport] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+    def __str__(self):
+        ver = self.verification.status.value if self.verification else "not_run"
+        cmd_ok  = sum(1 for c in self.remediation_command_results if c.succeeded)
+        cmd_tot = len(self.remediation_command_results)
+        return (
+            f"SelfHealingResult("
+            f"incident={self.incident_id}, "
+            f"status={self.status.value}, "
+            f"files={len(self.file_modifications)}, "
+            f"cmds={cmd_ok}/{cmd_tot}, "
+            f"verification={ver}, "
+            f"confidence={self.confidence:.2f})"
+        )
+
+
 
 
 @dataclass
