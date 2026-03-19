@@ -1,7 +1,7 @@
 {
   "metadata": {
     "version": "1.0.0",
-    "description": "Knowledge graph mapping error patterns to related errors across deployment layers",
+    "description": "System-level knowledge graph linking errors, services, dependencies, and deployments across layers",
     "layers": [
       "Layer 1 - Build",
       "Layer 2 - Registry",
