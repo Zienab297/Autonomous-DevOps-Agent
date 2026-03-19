@@ -1,0 +1,26 @@
+name: CI Pipeline
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: |
+          $deps = Get-Content requirements_.txt
+          foreach ($dep in $deps) {
+            pip install $dep
+          }
+
+      - name: Run app
+        run: python main.py
