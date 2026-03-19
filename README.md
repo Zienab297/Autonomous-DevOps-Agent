@@ -34,3 +34,9 @@ python test_knowledge_agent.py
 docker run -p 6333:6333 qdrant/qdrant
 cd core/test
 python test_core.py
+**Scaffold Agent** — make sure Ollama is running first
+```bash
+ollama pull llama3.2:3b
+cd agents/scaffold_agent
+python test_scaffold_agent.py
+```
