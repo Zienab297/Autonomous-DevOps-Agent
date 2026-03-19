@@ -19,7 +19,7 @@ from typing import List, Dict, Optional
 from core.models import LLMFixResponse
 from groq import Groq
 
-client = Groq(api_key="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")  # or set GROQ_API_KEY env variable
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))  # or set GROQ_API_KEY env variable
 # ── constant ──────────────────────────────────────────────────────────────────
 MODEL = "openai/gpt-oss-120b"
 

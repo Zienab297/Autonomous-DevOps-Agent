@@ -21,8 +21,8 @@ from enum import Enum
 from typing import List, Optional
 from groq import Groq
 from core.models import VerificationStatus, CommandResult, VerificationReport
-
-client = Groq(api_key="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")
+import os
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 logger = logging.getLogger(__name__)
 
