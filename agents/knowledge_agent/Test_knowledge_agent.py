@@ -1,19 +1,5 @@
 """
 test_knowledge_agent.py
------------------------
-End-to-end test for the Knowledge Agent layer.
-
-Before running:
-  1. docker run -p 6333:6333 qdrant/qdrant
-  2. export GEMINI_API_KEY=your_key
-  3. python test_knowledge_agent.py
-
-What this test does:
-  - Runs the full ingestion pipeline (loads JSON -> Qdrant)
-  - Tests 3 scenarios:
-      Case 1 : error EXISTS in knowledge base  -> expects KB match
-      Case 2 : error EXISTS in knowledge base  -> different category
-      Case 3 : error DOES NOT exist in KB      -> expects LLM fallback
 """
 
 import os
@@ -26,38 +12,67 @@ from shared.models  import RAGSource
 
 from ingestion.pipeline             import run_pipeline
 from knowledge_core.knowledge_agent import KnowledgeAgent
+from knowledge_core.knowledge_graph import KnowledgeGraph
 
-
-# ── test cases ────────────────────────────────────────────────────────────────
 
 TEST_CASES = [
+     {
+        "name"  : "Case 2 -- Docker COPY error",
+        "error" : "COPY failed: file not found in build context",
+        "expect": RAGSource.KNOWLEDGE_BASE,
+    },
     {
-        "name"  : "Case 1 — Terraform state lock (should use LLM fallback)",
+        "name"  : "Case 1 -- Terraform state lock (should use LLM fallback)",
         "error" : "Error locking state: Error acquiring the state lock: ConditionalCheckFailedException: The conditional request failed",
         "expect": RAGSource.LLM_GENERATED,
     },
     # {
-    #     "name"  : "Case 2 — Docker COPY error (should match KB)",
+    #     "name"  : "Case 2 -- Docker COPY error (should match KB)",
     #     "error" : "COPY failed: file not found in build context or excluded by .dockerignore: stat app/config.yaml: file does not exist",
     #     "expect": RAGSource.KNOWLEDGE_BASE,
     # },
     # {
-    #     "name"  : "Case 3 — Kubernetes CrashLoopBackOff (should match KB)",
+    #     "name"  : "Case 3 -- Kubernetes CrashLoopBackOff (should match KB)",
     #     "error" : "Back-off restarting failed container: my-app-xyz has status CrashLoopBackOff restarts=8",
     #     "expect": RAGSource.KNOWLEDGE_BASE,
     # },
     # {
-    #     "name"  : "Case 4 — Hardcoded secret detected (should match KB)",
+    #     "name"  : "Case 4 -- Hardcoded secret detected (should match KB)",
     #     "error" : "Hardcoded secret detected in code / secret scanning alert",
     #     "expect": RAGSource.KNOWLEDGE_BASE,
     # },
 ]
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
 def print_separator(char="─", width=60):
     print(char * width)
+
+
+def print_graph_section(error_message: str, graph: KnowledgeGraph):
+    """Show what the Knowledge Graph found for this error."""
+    print()
+    print("  -- Knowledge Graph --")
+
+    related_ids = graph.get_related_ids(error_message)
+
+    if not related_ids:
+        print("  No related nodes found")
+        print("  --------------------")
+        return
+
+    print(f"  matched nodes  : {len(related_ids)}")
+    for entry_id in related_ids:
+        layer    = graph.get_layer(entry_id)
+        keywords = graph.get_keywords(entry_id)
+        print(f"  {entry_id:<15} | {layer:<30} | keywords: {', '.join(keywords[:3])}")
+
+    all_keywords = []
+    for entry_id in related_ids:
+        all_keywords.extend(graph.get_keywords(entry_id))
+    all_keywords = list(dict.fromkeys(all_keywords))
+    print(f"  enriched query : +{len(all_keywords)} keywords added to search")
+    print("  --------------------")
+    print()
 
 
 def print_response(response):
@@ -65,20 +80,36 @@ def print_response(response):
     print(f"  confidence : {response.confidence:.2f}")
     print(f"  category   : {response.category.value}")
     print(f"  action     : {response.action_needed}")
+
+    # KB reference
+    if response.source == RAGSource.KNOWLEDGE_BASE and response.rag_result:
+        print()
+        print("  -- KB Reference --")
+        print(f"  entry_id      : {response.rag_result.entry_id}")
+        print(f"  error_pattern : {response.rag_result.error_pattern}")
+        print(f"  root_cause    : {response.rag_result.root_cause}")
+        print("  ------------------")
+
+    # web search references
+    if response.source == RAGSource.LLM_GENERATED and response.web_sources:
+        print()
+        print("  -- Web Search References --")
+        for i, url in enumerate(response.web_sources[:5], 1):
+            print(f"  [{i}] {url}")
+        print("  ---------------------------")
+
+    # commands
     if response.suggested_commands:
-        print(f"  commands   :")
+        print()
+        print("  commands:")
         for cmd in response.suggested_commands[:3]:
             print(f"    $ {cmd}")
+
     print()
-    print("  healing_prompt (first 300 chars):")
-    print("  " + response.healing_prompt[:300].replace("\n", "\n  "))
-    print()
-    print("  -- formatted response --")
+    print("  -- Solution --")
     print("  " + response.healing_prompt.replace("\n", "\n  "))
-    print("  ------------------------")
+    print("  --------------")
 
-
-# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     print_separator("=")
@@ -91,6 +122,7 @@ def main():
     print("[SETUP] Qdrant populated\n")
 
     agent  = KnowledgeAgent(config)
+    graph  = agent.graph           # reuse the same graph instance
     passed = 0
     failed = 0
 
@@ -98,8 +130,11 @@ def main():
         print_separator()
         print(f"\n{tc['name']}")
         print(f"\n  error: {tc['error'][:80]}...")
-        print()
 
+        # ── show Knowledge Graph section ──────────────────────────────────
+        print_graph_section(tc["error"], graph)
+
+        # ── run agent ────────────────────────────────────────────────────
         response = agent.run(tc["error"])
         print_response(response)
 

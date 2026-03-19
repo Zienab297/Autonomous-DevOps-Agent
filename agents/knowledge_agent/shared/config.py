@@ -34,7 +34,7 @@ class Config:
     collection_name: str  = "devops_knowledge"
 
     # Retrieval
-    similarity_threshold: float = 0.77
+    similarity_threshold: float = 0.70
     top_k: int                  = 1
 
     # Ingestion
@@ -62,6 +62,6 @@ def load_config() -> Config:
         gemini_api_key=api_key,
         qdrant_host=os.getenv("QDRANT_HOST", "localhost"),
         qdrant_port=int(os.getenv("QDRANT_PORT", "6333")),
-        similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.77")),
+        similarity_threshold=float(os.getenv("SIMILARITY_THRESHOLD", "0.70")),
         knowledge_base_path=kb_path,
     )

@@ -1,11 +1,14 @@
 from setup_path import *
 """
 knowledge_core/knowledge_agent.py
-------------------------
+----------------------------------
 Main entry point for the Knowledge Agent layer.
 
 Flow:
     error_message
+        │
+        ▼
+    Knowledge Graph enriches query
         │
         ▼
     retriever  ──found──▶  Ollama formats KB answer ▶  AgentResponse (source=knowledge_base)
@@ -25,8 +28,9 @@ from qdrant_client import QdrantClient
 
 from shared.models import AgentResponse, RAGResult, RAGSource, ErrorCategory
 from shared.config import Config
-from knowledge_core.retriever import retrieve
-from knowledge_core.research_agent import generate_solution
+from knowledge_core.retriever       import retrieve
+from knowledge_core.research_agent  import generate_solution
+from knowledge_core.knowledge_graph import KnowledgeGraph   # ← جديد
 
 
 class KnowledgeAgent:
@@ -37,19 +41,18 @@ class KnowledgeAgent:
             host=config.qdrant_host,
             port=config.qdrant_port,
         )
+        self.graph = KnowledgeGraph()                        # ← جديد
 
     def run(self, error_message: str) -> AgentResponse:
         print(f"\n[KnowledgeAgent] Processing: {error_message[:100]}...")
 
         # ── try knowledge base first ─────────────────────────────────────
-        retrieval = retrieve(error_message, self.client, self.config)
+        retrieval = retrieve(error_message, self.client, self.config, self.graph)  # ← جديد
 
         if retrieval.found:
-            print(f"[KnowledgeAgent] ✓ Found in knowledge base "
-                  f"(score={retrieval.score})")
+            print(f"[KnowledgeAgent] Found in knowledge base (score={retrieval.score})")
             entry = retrieval.entry
 
-            # ── format KB answer with Ollama ─────────────────────────────
             formatted_prompt = self._format_with_llm(error_message, entry)
 
             return AgentResponse(
@@ -70,7 +73,7 @@ class KnowledgeAgent:
             )
 
         # ── fallback: LLM + web search ───────────────────────────────────
-        print(f"[KnowledgeAgent] ✗ Not found (score={retrieval.score}) "
+        print(f"[KnowledgeAgent] Not found (score={retrieval.score}) "
               f"→ calling LLM generator...")
         solution = generate_solution(error_message, self.config)
 
@@ -81,6 +84,7 @@ class KnowledgeAgent:
             suggested_commands=self._extract_commands(solution.healing_prompt),
             category=ErrorCategory.UNKNOWN,
             action_needed=True,
+            web_sources=solution.web_sources,
         )
 
     def _format_with_llm(self, error_message: str, entry: dict) -> str:
@@ -98,7 +102,6 @@ Rewrite this as a clear, friendly, step-by-step explanation that:
 2. Gives exact steps to fix it
 3. Includes the relevant commands
 """
-
         print(f"[KnowledgeAgent] Formatting KB answer with Ollama...")
         response = ollama.chat(
             model=self.config.generation_model,
@@ -110,7 +113,6 @@ Rewrite this as a clear, friendly, step-by-step explanation that:
     def _extract_commands(healing_prompt: str) -> list[str]:
         commands = []
 
-        # extract from ```bash ... ``` blocks
         bash_blocks = re.findall(r"```(?:bash|sh)\n(.*?)```", healing_prompt, re.DOTALL)
         for block in bash_blocks:
             for line in block.splitlines():
@@ -118,7 +120,6 @@ Rewrite this as a clear, friendly, step-by-step explanation that:
                 if line and not line.startswith("#"):
                     commands.append(line)
 
-        # fallback: lines starting with kubectl / docker / helm / git
         if not commands:
             for line in healing_prompt.splitlines():
                 line = line.strip()
