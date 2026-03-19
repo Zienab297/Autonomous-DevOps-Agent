@@ -17,10 +17,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          $deps = Get-Content requirements_.txt
-          foreach ($dep in $deps) {
-            pip install $dep
-          }
+          while IFS= read -r pkg; do pip install "$pkg"; done < requirements_.txt
 
       - name: Run app
         run: python main.py
