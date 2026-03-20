@@ -154,6 +154,29 @@ class StateManager:
     def get_actions(self, incident_id: str) -> List[RemediationAction]:
         """Get all RemediationActions taken for an Incident."""
         return self._actions.get(incident_id, [])
+    
+    # CI/CD Deployment Management
+    def add_deployment(self, deployment) -> None:
+        if not hasattr(self, "_deployments"):
+            self._deployments = {}
+        self._deployments[deployment.deployment_id] = deployment
+        logger.info(f"[StateManager] Deployment added: {deployment}")
+
+    def get_deployment(self, deployment_id: str):
+        if not hasattr(self, "_deployments"):
+            return None
+        return self._deployments.get(deployment_id)
+
+    def get_deployments_for_service(self, service: str) -> list:
+        if not hasattr(self, "_deployments"):
+            return []
+        return [d for d in self._deployments.values() if d.service == service]
+
+    def get_all_deployments(self) -> list:
+        if not hasattr(self, "_deployments"):
+            return []
+        return list(self._deployments.values())
+
 
     # ============================================================
     # Summary
@@ -173,4 +196,7 @@ class StateManager:
             f"StateManager("
             f"incidents={len(self._incidents)}, "
             f"agents={len(self._agent_statuses)})"
+        )
+    
+    
         )
