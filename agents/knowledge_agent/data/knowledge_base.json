@@ -1,0 +1,407 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "domain": "DevOps Automation - Docker / GitHub Actions / Kubernetes",
+    "description": "RAG knowledge base of common errors and structured healing prompts for AI self-healing agent",
+    "total_entries": 40
+  },
+  "entries": [
+
+    {
+      "id": "DOCKER-001",
+      "category": "Docker",
+      "subcategory": "Build",
+      "error_pattern": "COPY failed: file not found in build context",
+      "error_keywords": ["COPY failed", "file not found", "build context"],
+      "error_example": "COPY failed: file not found in build context or excluded by .dockerignore: stat app/config.yaml: file does not exist",
+      "root_cause": "The file path referenced in the Dockerfile COPY instruction does not exist relative to the Docker build context, or is excluded by .dockerignore.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker build error.\n\nERROR TYPE: COPY failed - file not found in build context\n\nCONTEXT:\n- Dockerfile has a COPY instruction referencing a file/directory that does not exist at the given path\n- The build context is the directory passed to `docker build`\n- .dockerignore may be excluding the file\n\nTASK:\n1. Read the full Dockerfile and identify the failing COPY instruction\n2. Check if the referenced file/directory exists at the correct relative path from the build context root\n3. Check .dockerignore for patterns that may exclude the file\n4. Apply ONE of these fixes:\n   a. If file exists but wrong path: correct the COPY source path in the Dockerfile\n   b. If file is in .dockerignore: remove or whitelist the pattern using `!filename`\n   c. If file is missing: create a placeholder or update the Dockerfile to not COPY it\n5. Output the corrected Dockerfile section with explanation\n\nOUTPUT FORMAT:\n```dockerfile\n# FIXED: [brief explanation]\nCOPY [corrected-source] [destination]\n```",
+      "tags": ["docker", "build", "COPY", "context", "dockerignore"]
+    },
+
+    {
+      "id": "DOCKER-002",
+      "category": "Docker",
+      "subcategory": "Build",
+      "error_pattern": "RUN apt-get / apk failed - package not found",
+      "error_keywords": ["E: Unable to locate package", "ERROR: unable to select packages", "apk fetch", "apt-get install"],
+      "error_example": "E: Unable to locate package python3-dev\n#8 ERROR: process '/bin/sh -c apt-get install -y python3-dev' did not complete successfully",
+      "root_cause": "Package name is wrong, the package list is stale (missing apt-get update), or the base image does not include the required package repository.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker package installation error.\n\nERROR TYPE: Package not found during RUN apt-get / apk add\n\nCONTEXT:\n- A RUN instruction failed because a package could not be located\n- Common causes: missing `apt-get update`, wrong package name, wrong base image\n\nTASK:\n1. Identify the failing RUN instruction and package name\n2. Check whether `apt-get update` or `apk update` is called BEFORE the install in the same RUN layer\n3. Verify the package name is correct for the base image's OS/version (Debian vs Alpine vs Ubuntu)\n4. Apply fixes:\n   a. Add `apt-get update &&` before `apt-get install` in the same RUN command\n   b. Correct the package name if wrong (e.g., `python3-dev` → `python3-devel` on Alpine)\n   c. Add the required repository if the package is in a non-default repo\n5. Combine update + install in a single RUN layer to minimize image size\n\nOUTPUT FORMAT:\n```dockerfile\n# FIXED: Combined update+install, corrected package name\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n    [package-name] \\\n  && rm -rf /var/lib/apt/lists/*\n```",
+      "tags": ["docker", "build", "apt-get", "apk", "package", "linux"]
+    },
+
+    {
+      "id": "DOCKER-003",
+      "category": "Docker",
+      "subcategory": "Runtime",
+      "error_pattern": "Port already in use / address already in use",
+      "error_keywords": ["bind: address already in use", "port is already allocated", "Bind for 0.0.0.0"],
+      "error_example": "docker: Error response from daemon: driver failed programming external connectivity: Bind for 0.0.0.0:8080 failed: port is already allocated.",
+      "root_cause": "The host port specified in `-p` or `ports:` mapping is already bound by another process or container.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker port conflict error.\n\nERROR TYPE: Port already in use / address already in use\n\nCONTEXT:\n- Docker cannot bind the host port because it is already allocated\n- This occurs in `docker run -p`, docker-compose `ports:`, or Kubernetes hostPort\n\nTASK:\n1. Identify the conflicting host port from the error message\n2. Determine the fix strategy:\n   a. If another container holds the port: find it with `docker ps` and stop it, OR change the host port mapping\n   b. If a host process holds the port: identify with `lsof -i :<port>` or `netstat -tulnp | grep <port>`\n3. Generate the corrected configuration using an available port OR dynamic port assignment\n4. If updating docker-compose.yml, output the corrected `ports:` section\n5. If updating a run script, output the corrected `-p` flag\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Changed host port from [old] to [new] to avoid conflict\nports:\n  - \"[new-port]:[container-port]\"\n```\n\nAlso provide the diagnostic command to verify no process holds the new port:\n```bash\nlsof -i :[new-port] || echo 'Port is free'\n```",
+      "tags": ["docker", "runtime", "port", "network", "conflict"]
+    },
+
+    {
+      "id": "DOCKER-004",
+      "category": "Docker",
+      "subcategory": "Build",
+      "error_pattern": "OCI runtime create failed / permission denied",
+      "error_keywords": ["permission denied", "OCI runtime", "exec format error", "operation not permitted"],
+      "error_example": "OCI runtime create failed: container_linux.go:380: starting container process caused: exec: \"/entrypoint.sh\": permission denied",
+      "root_cause": "The entrypoint or CMD script does not have execute permissions, or there is a cross-platform binary mismatch (e.g., ARM vs AMD64).",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker OCI runtime / permission denied error.\n\nERROR TYPE: OCI runtime create failed - permission denied or exec format error\n\nCONTEXT:\n- The container cannot execute the entrypoint or CMD\n- Cause A: Script missing execute bit (`chmod +x`)\n- Cause B: Wrong binary architecture (ARM image on AMD64 host or vice versa)\n- Cause C: Windows line endings (CRLF) in shell scripts\n\nTASK:\n1. Identify whether the error is permission or exec format related\n2. For permission denied:\n   a. Add `RUN chmod +x /entrypoint.sh` in the Dockerfile BEFORE the ENTRYPOINT instruction\n   b. Alternatively set permissions at COPY time: `COPY --chmod=755 entrypoint.sh /`\n3. For exec format error:\n   a. Check the FROM image platform matches the target host\n   b. Add `--platform=linux/amd64` to the FROM instruction or build command\n4. For CRLF issues: add `RUN sed -i 's/\\r//' /entrypoint.sh`\n\nOUTPUT FORMAT:\n```dockerfile\n# FIXED: Added execute permission to entrypoint\nCOPY --chmod=755 entrypoint.sh /entrypoint.sh\nENTRYPOINT [\"/entrypoint.sh\"]\n```",
+      "tags": ["docker", "runtime", "permissions", "entrypoint", "chmod", "architecture"]
+    },
+
+    {
+      "id": "DOCKER-005",
+      "category": "Docker",
+      "subcategory": "Build",
+      "error_pattern": "No space left on device during build",
+      "error_keywords": ["no space left on device", "write /var/lib/docker", "disk quota exceeded"],
+      "error_example": "error creating overlay mount to /var/lib/docker/overlay2: no space left on device",
+      "root_cause": "Docker daemon has run out of disk space due to accumulated unused images, containers, volumes, or build cache.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker 'no space left on device' error.\n\nERROR TYPE: Docker disk space exhausted\n\nCONTEXT:\n- Docker build or run failed due to full disk\n- Accumulated images/containers/volumes/build cache consume disk\n\nTASK:\n1. Generate cleanup commands to free space (safe, non-destructive to running containers)\n2. Optimize the Dockerfile to reduce final image size\n3. Add .dockerignore entries to exclude unnecessary files from build context\n\nOUTPUT FORMAT:\n\nImmediate fix (cleanup commands):\n```bash\n# Remove stopped containers, unused networks, dangling images, build cache\ndocker system prune -f\n# If more space needed (removes ALL unused images, not just dangling)\ndocker system prune -af --volumes\n```\n\nDockerfile optimization:\n```dockerfile\n# FIXED: Reduced layers, cleaned package cache in same RUN step\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n    [packages] \\\n  && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*\n```\n\n.dockerignore additions:\n```\nnode_modules/\n.git/\n*.log\ndist/\n.env\n```",
+      "tags": ["docker", "disk", "space", "prune", "optimization", "dockerignore"]
+    },
+
+    {
+      "id": "GHA-001",
+      "category": "GitHub Actions",
+      "subcategory": "Authentication",
+      "error_pattern": "Permission denied pushing to registry / GHCR authentication failed",
+      "error_keywords": ["denied: permission_denied", "unauthorized", "authentication required", "ghcr.io", "docker login failed"],
+      "error_example": "Error: buildx failed with: ERROR [auth] error getting credentials - err: exit status 1\ndenied: permission_denied: write_package",
+      "root_cause": "The workflow token lacks write:packages permission, or the GITHUB_TOKEN is not properly passed to docker login for GHCR.",
+      "healing_prompt": "You are a DevOps healing agent fixing a GitHub Actions registry authentication error.\n\nERROR TYPE: Permission denied pushing to container registry (GHCR / Docker Hub)\n\nCONTEXT:\n- The workflow fails when pushing a Docker image to a registry\n- For GHCR: GITHUB_TOKEN needs `packages: write` permission\n- For Docker Hub: credentials must be stored as repository secrets\n\nTASK:\n1. Identify which registry is failing (GHCR vs Docker Hub vs ECR)\n2. For GHCR fix:\n   a. Add `permissions: packages: write` to the job or workflow level\n   b. Use `${{ secrets.GITHUB_TOKEN }}` for login password\n3. For Docker Hub fix:\n   a. Ensure `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets exist\n   b. Use `docker/login-action` with correct secret references\n4. Output the corrected workflow YAML section\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Added packages write permission and correct login step\npermissions:\n  contents: read\n  packages: write\n\nsteps:\n  - name: Log in to GitHub Container Registry\n    uses: docker/login-action@v3\n    with:\n      registry: ghcr.io\n      username: ${{ github.actor }}\n      password: ${{ secrets.GITHUB_TOKEN }}\n```",
+      "tags": ["github-actions", "authentication", "GHCR", "docker", "registry", "permissions", "secrets"]
+    },
+
+    {
+      "id": "GHA-002",
+      "category": "GitHub Actions",
+      "subcategory": "Secrets",
+      "error_pattern": "Secret not found / environment variable empty",
+      "error_keywords": ["secret not found", "Input required and not supplied", "env variable is empty", "undefined secret"],
+      "error_example": "Error: Input required and not supplied: token\nError: The `AWS_ACCESS_KEY_ID` environment variable must be set",
+      "root_cause": "A required secret is not defined in the repository/organization settings, or the secret name in the workflow YAML does not match the stored secret name (case-sensitive).",
+      "healing_prompt": "You are a DevOps healing agent fixing a GitHub Actions missing secret error.\n\nERROR TYPE: Required secret or environment variable not found\n\nCONTEXT:\n- A step requires a secret that is either undefined or misnamed\n- Secret names are case-sensitive in GitHub Actions\n- Secrets are not available to pull request workflows from forks by default\n\nTASK:\n1. Identify the missing secret name from the error\n2. Check the workflow YAML for the secret reference syntax\n3. Provide fixes:\n   a. Correct the YAML reference if there is a typo: `${{ secrets.CORRECT_NAME }}`\n   b. Add a fallback default if the secret is optional: `${{ secrets.TOKEN || '' }}`\n   c. Add a validation step before use to give a clear error message\n4. Output the corrected workflow step AND instructions for adding the secret to GitHub\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Corrected secret reference and added validation\n- name: Validate required secrets\n  run: |\n    if [ -z \"${{ secrets.MY_SECRET }}\" ]; then\n      echo \"ERROR: MY_SECRET is not set. Add it in Settings > Secrets > Actions\"\n      exit 1\n    fi\n\n- name: Use secret\n  env:\n    MY_TOKEN: ${{ secrets.MY_SECRET }}\n  run: echo \"Secret is available\"\n```\n\nGitHub UI instructions: Settings → Secrets and variables → Actions → New repository secret → Name: `MY_SECRET`",
+      "tags": ["github-actions", "secrets", "environment", "variables", "configuration"]
+    },
+
+    {
+      "id": "GHA-003",
+      "category": "GitHub Actions",
+      "subcategory": "Runner",
+      "error_pattern": "No runners available / runner offline",
+      "error_keywords": ["No hosted runners", "runner is offline", "runner has not connected", "Waiting for a runner to pick up this job"],
+      "error_example": "This workflow job or run is requesting a self-hosted runner with labels: [self-hosted, linux, production]. No online runners with this label combination are available.",
+      "root_cause": "Self-hosted runner is offline, unregistered, or the requested labels do not match any available runner. GitHub-hosted runners may have capacity issues.",
+      "healing_prompt": "You are a DevOps healing agent fixing a GitHub Actions runner availability error.\n\nERROR TYPE: No runners available / self-hosted runner offline\n\nCONTEXT:\n- The workflow cannot start because no runner matches the requested labels\n- For self-hosted: runner process may be stopped or labels misconfigured\n- For GitHub-hosted: label may be incorrect\n\nTASK:\n1. Determine if this is a self-hosted or GitHub-hosted runner issue\n2. For self-hosted runner:\n   a. Provide the commands to check and restart the runner service\n   b. Correct the `runs-on` labels in the workflow to match actual runner labels\n3. For GitHub-hosted runner:\n   a. Correct the label to a valid GitHub-hosted runner: `ubuntu-latest`, `windows-latest`, `macos-latest`\n4. Add a fallback strategy if appropriate\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Corrected runner label to valid GitHub-hosted runner\njobs:\n  build:\n    runs-on: ubuntu-latest  # Changed from [self-hosted, linux, production]\n```\n\nSelf-hosted runner restart commands:\n```bash\n# On the runner machine\ncd /path/to/actions-runner\nsudo ./svc.sh status\nsudo ./svc.sh start\n```",
+      "tags": ["github-actions", "runner", "self-hosted", "labels", "infrastructure"]
+    },
+
+    {
+      "id": "GHA-004",
+      "category": "GitHub Actions",
+      "subcategory": "Workflow Syntax",
+      "error_pattern": "Invalid workflow file / YAML syntax error",
+      "error_keywords": ["Invalid workflow file", "yaml: line", "mapping values are not allowed", "could not parse", "unexpected value"],
+      "error_example": "Invalid workflow file: .github/workflows/deploy.yml#L34\nyaml: line 34: mapping values are not allowed in this context",
+      "root_cause": "YAML syntax error in the workflow file: incorrect indentation, missing quotes around special characters, tab instead of spaces, or invalid structure.",
+      "healing_prompt": "You are a DevOps healing agent fixing a GitHub Actions invalid YAML workflow file.\n\nERROR TYPE: Invalid workflow file - YAML syntax error\n\nCONTEXT:\n- GitHub rejected the workflow file due to YAML parsing error\n- Common causes: wrong indentation (tabs vs spaces), unquoted special characters (`:`  `{` `}` `*`), missing `|` for multiline strings\n- Line number is given in the error\n\nTASK:\n1. Parse the provided workflow file and locate the error at the given line\n2. Identify the specific YAML violation:\n   a. Tabs used instead of 2-space indentation\n   b. Unquoted string containing `:`, `{`, `}`, `[`, `]`, `#`, `*`, `&`\n   c. Incorrect nesting level\n   d. Missing quotes on `on:` key (should be quoted: `\"on\":`)\n3. Output the corrected YAML with the fix highlighted\n4. Validate the structure follows GitHub Actions schema: `on` → `jobs` → `steps`\n\nOUTPUT FORMAT:\n```yaml\n# FIXED at line [N]: [description of fix]\n\"on\":  # Quoted to avoid YAML reserved word conflict\n  push:\n    branches: [\"main\"]\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n```",
+      "tags": ["github-actions", "yaml", "syntax", "workflow", "indentation"]
+    },
+
+    {
+      "id": "GHA-005",
+      "category": "GitHub Actions",
+      "subcategory": "Deployment",
+      "error_pattern": "Deployment to environment requires approval / environment protection rule",
+      "error_keywords": ["Environment protection rule", "required reviewer", "waiting for review", "deployment was not approved"],
+      "error_example": "Deployment to production was not approved. A required reviewer must approve this deployment.",
+      "root_cause": "The target GitHub environment has protection rules (required reviewers) that must approve before deployment proceeds.",
+      "healing_prompt": "You are a DevOps healing agent addressing a GitHub Actions environment protection / approval workflow issue.\n\nERROR TYPE: Deployment blocked by environment protection rule\n\nCONTEXT:\n- The workflow is trying to deploy to a protected environment (e.g., `production`)\n- This is often INTENTIONAL security behavior, not a bug\n- Fix may mean: auto-approve for staging, keep protection for production, or restructure jobs\n\nTASK:\n1. Determine if this block is intentional (production) or accidental (wrong environment name)\n2. If wrong environment name: correct the `environment:` field in the job\n3. If the protection rule should be removed for automated deployments:\n   a. Provide GitHub UI steps to remove or modify protection rules\n   b. Suggest using a separate staging environment without protection\n4. If approval is needed: add a notification step before the deployment job\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Separated staging (auto) from production (requires approval)\njobs:\n  deploy-staging:\n    environment: staging  # No protection rules\n    runs-on: ubuntu-latest\n    steps:\n      - name: Deploy to staging\n        run: echo \"Auto-deploying to staging\"\n\n  deploy-production:\n    environment: production  # Has required reviewer protection\n    needs: [deploy-staging]\n    runs-on: ubuntu-latest\n    steps:\n      - name: Deploy to production\n        run: echo \"Deploying to production after approval\"\n```",
+      "tags": ["github-actions", "deployment", "environment", "approval", "protection", "security"]
+    },
+
+    {
+      "id": "GHA-006",
+      "category": "GitHub Actions",
+      "subcategory": "Caching",
+      "error_pattern": "Cache not found / cache restore failed",
+      "error_keywords": ["Cache not found", "cache miss", "restore keys", "cache restore failed", "actions/cache"],
+      "error_example": "Cache not found for input keys: node-modules-${{ hashFiles('**/package-lock.json') }}\nCache Size: ~0 MB (0 B)",
+      "root_cause": "Cache key does not match any stored cache. This is normal on first run but may indicate a wrong cache key pattern or the cache was evicted.",
+      "healing_prompt": "You are a DevOps healing agent fixing a GitHub Actions cache miss issue.\n\nERROR TYPE: Cache not found / ineffective caching strategy\n\nCONTEXT:\n- `actions/cache` restore step found no matching cache entry\n- First run will always miss; subsequent runs should hit\n- Wrong `key` pattern prevents cache hits between runs\n\nTASK:\n1. Review the `actions/cache` step configuration\n2. Ensure the cache `key` is deterministic and stable (based on lock files, not timestamps)\n3. Add `restore-keys` as fallback partial matches\n4. Verify the `path` matches where the package manager stores dependencies\n5. Output the corrected cache step\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Proper cache key with restore-keys fallback\n- name: Cache node modules\n  uses: actions/cache@v4\n  with:\n    path: ~/.npm\n    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}\n    restore-keys: |\n      ${{ runner.os }}-node-\n\n# For Python (pip):\n- name: Cache pip packages  \n  uses: actions/cache@v4\n  with:\n    path: ~/.cache/pip\n    key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}\n    restore-keys: |\n      ${{ runner.os }}-pip-\n```",
+      "tags": ["github-actions", "cache", "performance", "npm", "pip", "dependencies"]
+    },
+
+    {
+      "id": "K8S-001",
+      "category": "Kubernetes",
+      "subcategory": "Pod",
+      "error_pattern": "CrashLoopBackOff",
+      "error_keywords": ["CrashLoopBackOff", "Back-off restarting failed container", "OOMKilled"],
+      "error_example": "NAME           READY   STATUS             RESTARTS   AGE\nmy-app-xyz     0/1     CrashLoopBackOff   8          10m",
+      "root_cause": "Container starts and immediately exits with a non-zero code. Common causes: application error on startup, missing environment variables/secrets, wrong command/args, insufficient memory (OOMKilled).",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes CrashLoopBackOff error.\n\nERROR TYPE: Pod CrashLoopBackOff - container keeps crashing on startup\n\nCONTEXT:\n- Kubernetes restarts the container but it keeps crashing\n- Exit code reveals cause: 1=app error, 137=OOMKilled, 126=permission denied, 127=command not found\n- Check logs with: `kubectl logs <pod> --previous`\n\nTASK:\n1. First, retrieve and analyze the crash logs to determine exit code and error message\n2. Based on exit code, apply targeted fix:\n   a. Exit 1 (app error): Fix environment variables, config mounts, or application startup logic\n   b. Exit 137 (OOMKilled): Increase `resources.limits.memory` in the deployment spec\n   c. Exit 127 (command not found): Fix `command`/`args` in container spec to match the actual binary\n   d. Exit 126 (permission denied): Add `securityContext` or fix file permissions in image\n3. Output the corrected Deployment YAML section\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: [specific fix based on exit code]\ncontainers:\n  - name: my-app\n    image: my-app:latest\n    resources:\n      requests:\n        memory: \"128Mi\"\n        cpu: \"100m\"\n      limits:\n        memory: \"512Mi\"  # Increased from 128Mi\n        cpu: \"500m\"\n    env:\n      - name: DATABASE_URL\n        valueFrom:\n          secretKeyRef:\n            name: app-secrets\n            key: database-url\n```\n\nDiagnostic commands:\n```bash\nkubectl logs <pod-name> --previous\nkubectl describe pod <pod-name>\nkubectl get events --sort-by=.lastTimestamp\n```",
+      "tags": ["kubernetes", "pod", "CrashLoopBackOff", "OOMKilled", "container", "startup"]
+    },
+
+    {
+      "id": "K8S-002",
+      "category": "Kubernetes",
+      "subcategory": "Pod",
+      "error_pattern": "ImagePullBackOff / ErrImagePull",
+      "error_keywords": ["ImagePullBackOff", "ErrImagePull", "Failed to pull image", "image pull failed", "not found"],
+      "error_example": "Failed to pull image \"my-registry.io/app:v1.2.3\": rpc error: code = Unknown desc = failed to pull and unpack image: not found",
+      "root_cause": "Kubernetes cannot pull the container image. Causes: image tag doesn't exist, wrong registry URL, registry requires authentication (imagePullSecret missing), or network access to registry is blocked.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes ImagePullBackOff error.\n\nERROR TYPE: ImagePullBackOff - Kubernetes cannot pull container image\n\nCONTEXT:\n- Node cannot download the image from the registry\n- Cause A: Image tag does not exist in the registry\n- Cause B: Private registry requires imagePullSecret\n- Cause C: Wrong registry URL or image name typo\n- Cause D: Network policy blocks registry access\n\nTASK:\n1. Verify the image exists: `docker manifest inspect <image>:<tag>`\n2. For private registry authentication:\n   a. Create the imagePullSecret in the correct namespace\n   b. Reference it in the Pod/Deployment spec\n3. For wrong image name/tag: correct the `image:` field\n4. Output the corrected Deployment YAML with imagePullSecret\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Added imagePullSecret for private registry\napiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      imagePullSecrets:\n        - name: registry-credentials  # Must exist in same namespace\n      containers:\n        - name: my-app\n          image: my-registry.io/app:v1.2.3  # Verify this tag exists\n```\n\nCreate imagePullSecret:\n```bash\nkubectl create secret docker-registry registry-credentials \\\n  --docker-server=my-registry.io \\\n  --docker-username=<username> \\\n  --docker-password=<password> \\\n  --namespace=<namespace>\n```",
+      "tags": ["kubernetes", "pod", "image", "registry", "imagePullSecret", "authentication"]
+    },
+
+    {
+      "id": "K8S-003",
+      "category": "Kubernetes",
+      "subcategory": "Networking",
+      "error_pattern": "Service not reachable / connection refused between pods",
+      "error_keywords": ["connection refused", "dial tcp", "no endpoints available", "service unreachable", "EOF"],
+      "error_example": "dial tcp 10.96.45.12:80: connect: connection refused\nError: Get \"http://my-service:8080/health\": dial tcp: lookup my-service: no such host",
+      "root_cause": "Service selector does not match pod labels, pods are not running, wrong port in Service spec, or NetworkPolicy blocks traffic.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes inter-service connectivity error.\n\nERROR TYPE: Service not reachable / connection refused between pods\n\nCONTEXT:\n- A pod cannot connect to a Kubernetes Service\n- Service routes traffic using label selectors to pod endpoints\n- Service DNS: `<service-name>.<namespace>.svc.cluster.local`\n\nTASK:\n1. Verify the Service selector matches the target Pod labels EXACTLY\n2. Check that the Service `port` and `targetPort` correctly map to the container port\n3. Confirm the target pods are Running and Ready: `kubectl get pods -l <selector>`\n4. Check endpoints are populated: `kubectl get endpoints <service-name>`\n5. Output corrected Service YAML with matching selector\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Aligned service selector with pod labels\napiVersion: v1\nkind: Service\nmetadata:\n  name: my-service\nspec:\n  selector:\n    app: my-app          # Must EXACTLY match pod template labels\n    version: production  # Remove extra labels that don't match pods\n  ports:\n    - protocol: TCP\n      port: 80           # Port the Service listens on\n      targetPort: 8080   # Port the container listens on\n```\n\nDiagnostic commands:\n```bash\nkubectl get endpoints my-service\nkubectl get pods --show-labels | grep my-app\nkubectl describe service my-service\n```",
+      "tags": ["kubernetes", "networking", "service", "selector", "labels", "endpoints", "DNS"]
+    },
+
+    {
+      "id": "K8S-004",
+      "category": "Kubernetes",
+      "subcategory": "Storage",
+      "error_pattern": "PersistentVolumeClaim pending / no matching PV",
+      "error_keywords": ["PVC pending", "no persistent volumes available", "ProvisioningFailed", "Pending", "PersistentVolumeClaim"],
+      "error_example": "persistentvolumeclaim/my-pvc  Pending\nWarning  ProvisioningFailed  storageclass.storage.k8s.io \"standard\" not found",
+      "root_cause": "No PersistentVolume matches the PVC's storageClassName, access mode, or capacity requirements. StorageClass may not exist in the cluster.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes PersistentVolumeClaim stuck in Pending state.\n\nERROR TYPE: PVC Pending - no matching PersistentVolume or StorageClass\n\nCONTEXT:\n- PVC cannot bind because no PV satisfies the claim\n- Common causes: wrong storageClassName, insufficient PV capacity, mismatched accessModes\n- Dynamic provisioning requires a valid StorageClass with a working provisioner\n\nTASK:\n1. Check available StorageClasses: `kubectl get storageclass`\n2. Check available PVs: `kubectl get pv`\n3. Identify the mismatch (storageClass name, accessMode, or size)\n4. Fix options:\n   a. Update PVC storageClassName to match an existing StorageClass\n   b. Create a matching PV manually if dynamic provisioning is unavailable\n   c. Adjust accessModes (ReadWriteOnce for block, ReadWriteMany for NFS)\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Corrected storageClassName and accessMode\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: my-pvc\nspec:\n  accessModes:\n    - ReadWriteOnce  # Use ReadWriteMany only for NFS/shared storage\n  storageClassName: standard  # Must match: kubectl get storageclass\n  resources:\n    requests:\n      storage: 5Gi\n```\n\nDiagnostic commands:\n```bash\nkubectl get storageclass\nkubectl describe pvc my-pvc\nkubectl get pv\n```",
+      "tags": ["kubernetes", "storage", "PVC", "PersistentVolume", "StorageClass", "provisioning"]
+    },
+
+    {
+      "id": "K8S-005",
+      "category": "Kubernetes",
+      "subcategory": "RBAC",
+      "error_pattern": "Forbidden / RBAC authorization failed",
+      "error_keywords": ["forbidden", "User cannot", "RBAC: access denied", "is forbidden", "serviceaccount"],
+      "error_example": "Error from server (Forbidden): pods is forbidden: User \"system:serviceaccount:default:my-sa\" cannot list resource \"pods\" in API group \"\"",
+      "root_cause": "The ServiceAccount used by the pod or CI/CD tool does not have the required RBAC permissions (Role/ClusterRole binding missing or incomplete).",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes RBAC forbidden error.\n\nERROR TYPE: Kubernetes RBAC authorization failure - forbidden access\n\nCONTEXT:\n- A ServiceAccount is trying to perform an action it has no permission for\n- RBAC requires: ServiceAccount + Role (with rules) + RoleBinding (linking them)\n- ClusterRole/ClusterRoleBinding for cluster-wide resources\n\nTASK:\n1. Identify from the error: the ServiceAccount, namespace, resource type, and verb (list/get/create/etc.)\n2. Create a Role with the minimum required permissions (principle of least privilege)\n3. Bind the Role to the ServiceAccount with a RoleBinding\n4. Output complete YAML: ServiceAccount + Role + RoleBinding\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Added RBAC permissions for ServiceAccount\napiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: my-sa\n  namespace: default\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: my-sa-role\n  namespace: default\nrules:\n  - apiGroups: [\"\"]        # \"\" = core API group\n    resources: [\"pods\"]    # Resource from error message\n    verbs: [\"get\", \"list\", \"watch\"]  # Minimum required verbs\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: my-sa-rolebinding\n  namespace: default\nsubjects:\n  - kind: ServiceAccount\n    name: my-sa\n    namespace: default\nroleRef:\n  kind: Role\n  name: my-sa-role\n  apiGroup: rbac.authorization.k8s.io\n```",
+      "tags": ["kubernetes", "RBAC", "security", "ServiceAccount", "Role", "RoleBinding", "permissions"]
+    },
+
+    {
+      "id": "K8S-006",
+      "category": "Kubernetes",
+      "subcategory": "Deployment",
+      "error_pattern": "Deployment rollout stuck / pods not progressing",
+      "error_keywords": ["Waiting for deployment rollout", "unavailable replicas", "DeadlineExceeded", "Progressing False", "minReadySeconds"],
+      "error_example": "error: deployment \"my-app\" exceeded its progress deadline\nCondition: Progressing=False, reason=ProgressDeadlineExceeded",
+      "root_cause": "New pods fail to become Ready within the progressDeadlineSeconds (default 600s). Usually caused by CrashLoopBackOff, failed readinessProbe, or resource constraints preventing scheduling.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes Deployment rollout stuck / progress deadline exceeded error.\n\nERROR TYPE: Deployment rollout stuck - ProgressDeadlineExceeded\n\nCONTEXT:\n- New ReplicaSet pods are not becoming Ready within the deadline\n- Root cause is usually: bad image, failing readinessProbe, insufficient resources, or node pressure\n- Old pods may still be running (rollout paused for safety)\n\nTASK:\n1. Check new pod status and logs\n2. Identify whether issue is: bad image, probe failure, resource limits, or scheduling\n3. Apply fix:\n   a. If bad image: rollback with `kubectl rollout undo deployment/my-app`\n   b. If probe too strict: adjust readinessProbe `initialDelaySeconds` and `timeoutSeconds`\n   c. If resource pressure: adjust `resources.requests` to match available node capacity\n4. Output corrected Deployment spec with probe and resource fixes\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Adjusted readiness probe timing and resource requests\ncontainers:\n  - name: my-app\n    readinessProbe:\n      httpGet:\n        path: /health\n        port: 8080\n      initialDelaySeconds: 30   # Increased from 5 - give app time to start\n      periodSeconds: 10\n      failureThreshold: 3\n      timeoutSeconds: 5         # Increased from 1\n    resources:\n      requests:\n        memory: \"256Mi\"   # Realistic request matching actual usage\n        cpu: \"250m\"\n      limits:\n        memory: \"512Mi\"\n        cpu: \"500m\"\n```\n\nEmergency rollback:\n```bash\nkubectl rollout undo deployment/my-app\nkubectl rollout status deployment/my-app\n```",
+      "tags": ["kubernetes", "deployment", "rollout", "readinessProbe", "resources", "rollback"]
+    },
+
+    {
+      "id": "K8S-007",
+      "category": "Kubernetes",
+      "subcategory": "Ingress",
+      "error_pattern": "Ingress 502/503/404 - backend not reachable",
+      "error_keywords": ["502 Bad Gateway", "503 Service Unavailable", "404 Not Found", "upstream connect error", "no endpoints"],
+      "error_example": "Error 502: Bad Gateway\nnginx: [error] upstream connect error or disconnect/reset while connecting to upstream, client: 10.0.0.1, upstream: \"http://10.96.45.10:8080\"",
+      "root_cause": "Ingress controller cannot reach the backend Service. Causes: Service not existing, wrong port in Ingress backend, pods not ready, or TLS/HTTP mismatch.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes Ingress 502/503 error.\n\nERROR TYPE: Ingress gateway error - backend Service unreachable\n\nCONTEXT:\n- Ingress controller returns 502/503 when it cannot forward to the backend Service\n- 502: Got a bad response from backend (container crashed or wrong port)\n- 503: No healthy endpoints available (no ready pods)\n- 404: Ingress path rules don't match the request path\n\nTASK:\n1. Verify the Service name and port in the Ingress `backend` spec exist\n2. Check the Service has Ready endpoints: `kubectl get endpoints <service>`\n3. Ensure Ingress path and pathType match the application's actual routes\n4. For TLS: verify the secret name and certificate validity\n5. Output the corrected Ingress YAML\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Corrected service name, port, and path configuration\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: my-ingress\n  annotations:\n    nginx.ingress.kubernetes.io/rewrite-target: /\nspec:\n  ingressClassName: nginx\n  rules:\n    - host: my-app.example.com\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend:\n              service:\n                name: my-service   # Must match Service metadata.name exactly\n                port:\n                  number: 80       # Must match Service spec.ports[].port\n```\n\nDiagnostic commands:\n```bash\nkubectl get endpoints my-service\nkubectl describe ingress my-ingress\nkubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx\n```",
+      "tags": ["kubernetes", "ingress", "nginx", "502", "503", "networking", "TLS"]
+    },
+
+    {
+      "id": "K8S-008",
+      "category": "Kubernetes",
+      "subcategory": "Resources",
+      "error_pattern": "Insufficient CPU/Memory - pod cannot be scheduled",
+      "error_keywords": ["Insufficient cpu", "Insufficient memory", "0/3 nodes are available", "Unschedulable", "FailedScheduling"],
+      "error_example": "Warning  FailedScheduling  default-scheduler  0/3 nodes are available: 3 Insufficient cpu, 3 Insufficient memory.",
+      "root_cause": "No node in the cluster has enough allocatable CPU/memory to satisfy the pod's resource requests. Either requests are too high, or nodes are overcommitted.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes pod scheduling failure due to insufficient resources.\n\nERROR TYPE: Pod unschedulable - Insufficient CPU or Memory on all nodes\n\nCONTEXT:\n- Scheduler cannot place the pod because resource requests exceed available node capacity\n- `requests` are what the scheduler uses for placement decisions\n- `limits` are what the kubelet enforces at runtime\n\nTASK:\n1. Check actual node allocatable resources: `kubectl describe nodes | grep -A5 Allocatable`\n2. Check what is currently consuming node resources: `kubectl top nodes`\n3. Adjust the pod's resource `requests` to be realistic (not zero, not too high)\n4. If cluster is truly full: add node capacity or reduce replicas\n5. Output corrected Deployment with proper resource settings\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Set realistic resource requests matching actual app needs\ncontainers:\n  - name: my-app\n    resources:\n      requests:\n        memory: \"64Mi\"   # What the app typically uses at idle\n        cpu: \"50m\"       # 50 millicores = 0.05 vCPU\n      limits:\n        memory: \"256Mi\"  # Max memory before OOMKill\n        cpu: \"200m\"      # Max CPU (throttled, not killed)\n```\n\nDiagnostic commands:\n```bash\nkubectl describe nodes | grep -A5 'Allocatable'\nkubectl top nodes\nkubectl describe pod <pending-pod>\n```",
+      "tags": ["kubernetes", "scheduling", "resources", "CPU", "memory", "requests", "limits"]
+    },
+
+    {
+      "id": "K8S-009",
+      "category": "Kubernetes",
+      "subcategory": "ConfigMap/Secret",
+      "error_pattern": "ConfigMap or Secret not found when mounting",
+      "error_keywords": ["configmap not found", "secret not found", "MountVolume.SetUp failed", "couldn't find key", "Error: secret"],
+      "error_example": "MountVolume.SetUp failed for volume \"config\" : configmap \"app-config\" not found\nWarning  Failed  Error: secret \"db-credentials\" not found",
+      "root_cause": "Pod references a ConfigMap or Secret that does not exist in the same namespace, or the key referenced in the volumeMount/env does not exist in the resource.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes missing ConfigMap or Secret mount error.\n\nERROR TYPE: ConfigMap or Secret not found when pod tries to mount it\n\nCONTEXT:\n- Pod spec references a ConfigMap/Secret that doesn't exist in the same namespace\n- OR the specific key referenced doesn't exist in the ConfigMap/Secret\n- ConfigMaps/Secrets are namespace-scoped\n\nTASK:\n1. Identify the missing ConfigMap/Secret name and namespace from the error\n2. Check if it exists: `kubectl get configmap <name> -n <namespace>`\n3. Apply fix:\n   a. If missing: create the ConfigMap/Secret with the required keys\n   b. If key missing: add the missing key to the existing resource\n   c. If wrong namespace: ensure resource is in the same namespace as the pod\n4. Output the ConfigMap/Secret creation YAML AND the corrected pod volume reference\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Created the missing ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config\n  namespace: default  # Must match pod namespace\ndata:\n  DATABASE_HOST: \"postgres-service\"\n  APP_PORT: \"8080\"\n  LOG_LEVEL: \"info\"\n---\n# Pod spec reference (for verification):\nvolumes:\n  - name: config\n    configMap:\n      name: app-config  # Must match ConfigMap metadata.name\n```\n\nFor Secrets:\n```bash\nkubectl create secret generic db-credentials \\\n  --from-literal=username=myuser \\\n  --from-literal=password=mypassword \\\n  --namespace=default\n```",
+      "tags": ["kubernetes", "ConfigMap", "Secret", "volumes", "mounts", "namespace", "configuration"]
+    },
+
+    {
+      "id": "K8S-010",
+      "category": "Kubernetes",
+      "subcategory": "HPA",
+      "error_pattern": "HPA unable to fetch metrics / unknown metrics",
+      "error_keywords": ["unable to fetch metrics", "metrics not available", "FailedGetResourceMetric", "metrics-server", "HorizontalPodAutoscaler"],
+      "error_example": "Warning  FailedGetResourceMetric  horizontal-pod-autoscaler  unable to get metrics for resource cpu: unable to fetch metrics from resource metrics API",
+      "root_cause": "Kubernetes metrics-server is not installed, not running, or HPA references a custom metric source that is not configured.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes HPA metrics unavailable error.\n\nERROR TYPE: HorizontalPodAutoscaler cannot fetch metrics\n\nCONTEXT:\n- HPA requires metrics-server to be running in the cluster for CPU/memory scaling\n- Custom metrics (Prometheus) require prometheus-adapter\n- HPA will not scale (stays at minimum replicas) when metrics are unavailable\n\nTASK:\n1. Check if metrics-server is running: `kubectl get deployment metrics-server -n kube-system`\n2. If missing: install metrics-server\n3. If custom metric: verify prometheus-adapter is configured\n4. Verify HPA spec uses supported metric types\n5. Output installation commands and corrected HPA YAML\n\nOUTPUT FORMAT:\n\nInstall metrics-server:\n```bash\nkubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml\n# Verify after ~1 minute:\nkubectl top nodes\n```\n\nCorrected HPA spec:\n```yaml\n# FIXED: Proper HPA using standard CPU metric\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: my-app-hpa\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: my-app\n  minReplicas: 2\n  maxReplicas: 10\n  metrics:\n    - type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n          averageUtilization: 70  # Scale when avg CPU > 70%\n```",
+      "tags": ["kubernetes", "HPA", "autoscaling", "metrics-server", "scaling", "CPU"]
+    },
+
+    {
+      "id": "COMPOSE-001",
+      "category": "Docker Compose",
+      "subcategory": "Networking",
+      "error_pattern": "Service cannot connect to another service by name",
+      "error_keywords": ["could not connect to server", "connection refused", "dial tcp", "no such host", "getaddrinfos"],
+      "error_example": "Error: getaddrinfo ENOTFOUND postgres\nError: connect ECONNREFUSED 127.0.0.1:5432",
+      "root_cause": "Service is trying to connect to another service using localhost (127.0.0.1) instead of the Docker Compose service name. Or the target service is not in the same network.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker Compose inter-service connectivity error.\n\nERROR TYPE: Service cannot reach another service in Docker Compose\n\nCONTEXT:\n- In Docker Compose, services communicate using service names as DNS hostnames\n- Using `localhost` or `127.0.0.1` does NOT work between containers\n- All services on the same `networks:` entry can communicate by service name\n- Services need to depend on each other with health checks for startup ordering\n\nTASK:\n1. Identify the connection string in the failing service's environment variables\n2. Replace `localhost`/`127.0.0.1` with the target service name from docker-compose.yml\n3. Add `depends_on` with `condition: service_healthy` for proper startup ordering\n4. Ensure both services are on the same network\n5. Output the corrected docker-compose.yml sections\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Using service name as hostname and added depends_on with healthcheck\nservices:\n  app:\n    image: my-app:latest\n    environment:\n      - DATABASE_URL=postgresql://user:pass@postgres:5432/mydb  # 'postgres' = service name\n    depends_on:\n      postgres:\n        condition: service_healthy\n    networks:\n      - app-network\n\n  postgres:\n    image: postgres:15\n    environment:\n      POSTGRES_USER: user\n      POSTGRES_PASSWORD: pass\n      POSTGRES_DB: mydb\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U user\"]\n      interval: 10s\n      timeout: 5s\n      retries: 5\n    networks:\n      - app-network\n\nnetworks:\n  app-network:\n    driver: bridge\n```",
+      "tags": ["docker-compose", "networking", "DNS", "service-name", "depends_on", "healthcheck"]
+    },
+
+    {
+      "id": "COMPOSE-002",
+      "category": "Docker Compose",
+      "subcategory": "Volumes",
+      "error_pattern": "Named volume not found / volume mount fails",
+      "error_keywords": ["volume not found", "no such volume", "invalid mount config", "volume mount failed"],
+      "error_example": "Error response from daemon: invalid mount config for type \"volume\": no such volume: myapp_data",
+      "root_cause": "Volume referenced in `volumes:` mount is not declared in the top-level `volumes:` section, or the volume name has a prefix mismatch.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker Compose volume configuration error.\n\nERROR TYPE: Named volume not found or invalid volume mount configuration\n\nCONTEXT:\n- Named volumes must be declared in the top-level `volumes:` section of docker-compose.yml\n- Bind mounts use absolute or relative host paths (no top-level declaration needed)\n- Volume names are prefixed with the project name by default: `projectname_volumename`\n\nTASK:\n1. Identify the volume name causing the error\n2. Check if it's declared in the top-level `volumes:` section\n3. Choose the correct volume type:\n   a. Named volume: declare in top-level `volumes:` - data persists across container restarts\n   b. Bind mount: use `./host/path:/container/path` - maps host directory\n4. Output the corrected docker-compose.yml with proper volume declaration\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Properly declared named volume in top-level volumes section\nservices:\n  postgres:\n    image: postgres:15\n    volumes:\n      - postgres_data:/var/lib/postgresql/data  # Named volume\n      - ./init-scripts:/docker-entrypoint-initdb.d  # Bind mount for init\n\n  app:\n    image: my-app:latest\n    volumes:\n      - app_uploads:/app/uploads  # Named volume for persistence\n\n# REQUIRED: Top-level volumes declaration\nvolumes:\n  postgres_data:  # Declares the named volume\n    driver: local\n  app_uploads:\n    driver: local\n```",
+      "tags": ["docker-compose", "volumes", "persistence", "bind-mount", "named-volume"]
+    },
+
+    {
+      "id": "HELM-001",
+      "category": "Helm",
+      "subcategory": "Deployment",
+      "error_pattern": "Helm upgrade failed - cannot patch immutable field",
+      "error_keywords": ["cannot patch", "field is immutable", "Deployment.apps", "spec.selector", "UPGRADE FAILED"],
+      "error_example": "UPGRADE FAILED: cannot patch \"my-release\" with kind Deployment: Deployment.apps \"my-release\" is invalid: spec.selector: Invalid value: immutable field",
+      "root_cause": "Helm is trying to change an immutable field (like `spec.selector` in a Deployment) that cannot be updated after creation. Requires deleting and recreating the resource.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Helm upgrade failed - immutable field error.\n\nERROR TYPE: Helm upgrade failed - cannot modify immutable Kubernetes field\n\nCONTEXT:\n- Some Kubernetes fields are immutable after creation (e.g., Deployment `spec.selector`)\n- Helm upgrade cannot change these fields; requires delete and recreate\n- Safe strategies: `helm upgrade --force`, delete old release, or use `kubectl rollout restart`\n\nTASK:\n1. Identify the immutable field causing the issue\n2. Determine the safe remediation path:\n   a. `--force` flag: deletes and recreates the resource (brief downtime)\n   b. Manual delete + helm install: for zero-conflict fresh start\n   c. If selector labels changed: revert the chart label change instead\n3. Output the fix command and the corrected Helm values if applicable\n\nOUTPUT FORMAT:\n\nOption A - Force upgrade (brief downtime):\n```bash\n# FIXED: Force flag to delete and recreate the immutable resource\nhelm upgrade my-release ./my-chart \\\n  --namespace my-namespace \\\n  --force \\\n  --wait\n```\n\nOption B - Uninstall and reinstall:\n```bash\nhelm uninstall my-release --namespace my-namespace\nhelm install my-release ./my-chart --namespace my-namespace --wait\n```\n\nIf the issue is changed selector labels, revert in values.yaml:\n```yaml\n# values.yaml - FIXED: Reverted selector labels to original values\nlabels:\n  app: my-app          # Must NOT change after initial deploy\n  version: stable      # This label was incorrectly changed\n```",
+      "tags": ["helm", "kubernetes", "upgrade", "immutable", "selector", "deployment"]
+    },
+
+    {
+      "id": "HELM-002",
+      "category": "Helm",
+      "subcategory": "Templates",
+      "error_pattern": "Helm template rendering error / YAML parsing failed",
+      "error_keywords": ["Error: YAML parse error", "template: ", "wrong type for value", "execute: template", "nil pointer evaluating"],
+      "error_example": "Error: YAML parse error on my-chart/templates/deployment.yaml: error converting YAML to JSON: yaml: line 45: mapping values are not allowed in this context\nError: template: my-chart/templates/deployment.yaml:12:22: executing \"my-chart/templates/deployment.yaml\" at <.Values.image.tag>: nil pointer evaluating interface {}.tag",
+      "root_cause": "Helm template has invalid Go template syntax, references a Values key that doesn't exist (nil pointer), or produces invalid YAML output.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Helm chart template rendering error.\n\nERROR TYPE: Helm template rendering failed - nil pointer or YAML error\n\nCONTEXT:\n- Helm uses Go templates; `{{ .Values.key }}` must reference existing values\n- Nil pointer: the values path doesn't exist in values.yaml\n- YAML error: the template generates invalid YAML (usually indentation with `toYaml`)\n\nTASK:\n1. Identify the template file and line number from the error\n2. For nil pointer: add the missing key to values.yaml with a default, or use `default` function in template\n3. For YAML parse error: fix indentation using `indent` or `nindent` with `toYaml`\n4. Test with `helm template` before applying\n\nOUTPUT FORMAT:\n\nTemplate fix (nil pointer with default):\n```yaml\n# FIXED: Added default value to prevent nil pointer\nimage: {{ .Values.image.repository | default \"my-app\" }}:{{ .Values.image.tag | default \"latest\" }}\n```\n\nTemplate fix (toYaml indentation):\n```yaml\n# FIXED: Used nindent for proper YAML block indentation\nenv:\n{{- toYaml .Values.env | nindent 12 }}\n```\n\nvalues.yaml additions:\n```yaml\n# FIXED: Added missing values with defaults\nimage:\n  repository: my-registry.io/my-app\n  tag: \"1.0.0\"\n  pullPolicy: IfNotPresent\n\nenv:\n  - name: LOG_LEVEL\n    value: info\n```\n\nValidation command:\n```bash\nhelm template my-release ./my-chart --debug 2>&1 | head -50\nhelm lint ./my-chart\n```",
+      "tags": ["helm", "templates", "go-templates", "values", "YAML", "nil-pointer"]
+    },
+
+    {
+      "id": "CI-001",
+      "category": "CI/CD General",
+      "subcategory": "Build",
+      "error_pattern": "Build fails due to missing dependency / module not found",
+      "error_keywords": ["Module not found", "Cannot find module", "ModuleNotFoundError", "No module named", "ImportError", "require() of ES module"],
+      "error_example": "Error: Cannot find module '@/components/Button'\nModuleNotFoundError: No module named 'fastapi'\nnpm ERR! Cannot find module 'express'",
+      "root_cause": "Dependency is not installed (missing npm install / pip install step), module path alias is not configured, or lockfile is out of sync with package manifest.",
+      "healing_prompt": "You are a DevOps healing agent fixing a missing dependency / module not found error in a CI/CD pipeline.\n\nERROR TYPE: Missing dependency - module not found during build or runtime\n\nCONTEXT:\n- Dependency is declared but not installed, OR package.json/requirements.txt is missing it\n- CI/CD must install dependencies before build/test steps\n- Path aliases (@/components) require configuration in tsconfig/webpack/vite\n\nTASK:\n1. Identify the missing module name and the runtime (Node.js, Python, etc.)\n2. Check if it's in package.json / requirements.txt\n3. Fix the pipeline step to install dependencies BEFORE build:\n   a. Add `npm ci` or `pip install -r requirements.txt` step\n   b. If missing from manifest: add the package and commit the change\n4. For path aliases: output the tsconfig.json or vite.config fix\n5. Output the corrected workflow steps\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Added dependency installation step before build\nsteps:\n  - name: Install dependencies\n    run: npm ci  # Use 'ci' not 'install' for reproducible installs\n\n  - name: Build application  \n    run: npm run build\n\n  - name: Run tests\n    run: npm test\n```\n\nFor Python:\n```yaml\n  - name: Install Python dependencies\n    run: pip install -r requirements.txt\n```\n\nFor missing package (add to manifest):\n```bash\nnpm install express --save  # Then commit package.json + package-lock.json\npip install fastapi && pip freeze > requirements.txt  # Then commit\n```",
+      "tags": ["CI/CD", "dependencies", "npm", "pip", "build", "modules", "imports"]
+    },
+
+    {
+      "id": "CI-002",
+      "category": "CI/CD General",
+      "subcategory": "Testing",
+      "error_pattern": "Test suite fails / tests not found",
+      "error_keywords": ["Test suite failed to run", "no test files found", "FAIL", "jest", "pytest", "exit code 1"],
+      "error_example": "FAIL src/app.test.js\nTest suite failed to run: Your test suite must contain at least one test.\nERROR: no tests ran",
+      "root_cause": "Test configuration points to wrong directory, test files have wrong naming pattern, or test runner is not installed.",
+      "healing_prompt": "You are a DevOps healing agent fixing a CI/CD test suite failure.\n\nERROR TYPE: Test suite fails to run or no tests found\n\nCONTEXT:\n- Test runner cannot find test files or the test suite has a configuration error\n- Jest default pattern: `**/*.test.{js,ts}` or `**/__tests__/**`\n- Pytest default: `test_*.py` or `*_test.py` in current directory and subdirs\n\nTASK:\n1. Identify the test runner and the error type (no files found vs suite error)\n2. Fix the test configuration to point to the correct directory/pattern\n3. Ensure the working directory in CI is set correctly\n4. Output the corrected test step and config file\n\nOUTPUT FORMAT:\n```yaml\n# FIXED: Set correct working directory and test command\n- name: Run tests\n  working-directory: ./src  # If tests are in a subdirectory\n  run: npx jest --testPathPattern='.*\\.test\\.(js|ts)$' --passWithNoTests\n```\n\nFor pytest:\n```yaml\n- name: Run Python tests\n  run: python -m pytest tests/ -v --tb=short\n```\n\nJest config fix (jest.config.js):\n```javascript\n// FIXED: Correct testMatch pattern\nmodule.exports = {\n  testMatch: ['**/__tests__/**/*.[jt]s?(x)', '**/?(*.)+(spec|test).[jt]s?(x)'],\n  testPathIgnorePatterns: ['/node_modules/', '/dist/'],\n};\n```",
+      "tags": ["CI/CD", "testing", "jest", "pytest", "test-runner", "configuration"]
+    },
+
+    {
+      "id": "SEC-001",
+      "category": "Security",
+      "subcategory": "Secrets",
+      "error_pattern": "Hardcoded secret detected in code / secret scanning alert",
+      "error_keywords": ["hardcoded secret", "secret scanning", "credential", "API key in code", "token exposed", "push protection"],
+      "error_example": "Secret scanning: GitHub has found a AWS access key in commit abc123\nPush protection: Secret detected before push: 'AKIA...' matches pattern 'aws-access-key-id'",
+      "root_cause": "A secret (API key, password, token) was committed directly in source code instead of being managed through environment variables or a secrets manager.",
+      "healing_prompt": "You are a DevOps healing agent fixing a hardcoded secret / credential exposure issue.\n\nERROR TYPE: Hardcoded secret detected in source code\n\nCONTEXT:\n- A credential was committed to the repository - this is a SECURITY INCIDENT\n- The secret must be rotated IMMEDIATELY (assume it is compromised)\n- Code must be fixed to use environment variables or secrets manager\n- Git history must be cleaned if the secret was committed\n\nTASK:\n1. URGENT: Rotate/revoke the exposed credential immediately (output instructions)\n2. Replace hardcoded value with environment variable reference\n3. Add the secret to .gitignore / ensure .env is ignored\n4. If already committed: provide git history cleanup commands\n5. Output the corrected code and the secure pattern\n\nOUTPUT FORMAT:\n\nStep 1 - Rotate credential immediately:\n```\nACTION REQUIRED: Revoke the exposed credential before anything else:\n- AWS: IAM Console → Users → Security credentials → Deactivate/Delete\n- GitHub Token: Settings → Developer settings → Personal access tokens → Revoke\n- DockerHub: Account Settings → Security → Access Tokens → Delete\n```\n\nStep 2 - Fix code:\n```python\n# BEFORE (INSECURE):\napi_key = \"sk-abc123hardcoded\"\n\n# FIXED: Use environment variable\nimport os\napi_key = os.environ.get(\"API_KEY\")\nif not api_key:\n    raise ValueError(\"API_KEY environment variable is required\")\n```\n\nStep 3 - Git history cleanup:\n```bash\n# Remove secret from git history (DESTRUCTIVE - coordinate with team)\ngit filter-branch --force --index-filter \\\n  'git rm --cached --ignore-unmatch path/to/secret-file' HEAD\ngit push --force-with-lease\n```\n\nStep 4 - Add to .gitignore:\n```\n.env\n.env.local\n*.key\nsecrets/\n```",
+      "tags": ["security", "secrets", "credentials", "git", "environment-variables", "incident-response"]
+    },
+
+    {
+      "id": "NET-001",
+      "category": "Networking",
+      "subcategory": "TLS/SSL",
+      "error_pattern": "TLS certificate verification failed / SSL handshake error",
+      "error_keywords": ["certificate verify failed", "SSL handshake", "x509:", "certificate has expired", "tls: bad certificate", "CERTIFICATE_VERIFY_FAILED"],
+      "error_example": "x509: certificate signed by unknown authority\nssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate",
+      "root_cause": "TLS certificate is expired, self-signed without trust, hostname mismatch, or the CA certificate is not in the system trust store.",
+      "healing_prompt": "You are a DevOps healing agent fixing a TLS/SSL certificate verification error.\n\nERROR TYPE: TLS certificate verification failed\n\nCONTEXT:\n- Certificate issue types: expired, self-signed, wrong hostname, untrusted CA\n- DO NOT simply disable TLS verification (insecure) - fix the root cause\n- In Kubernetes: cert-manager can automate certificate lifecycle\n\nTASK:\n1. Diagnose the specific certificate error:\n   a. Expired: renew or use cert-manager for auto-renewal\n   b. Self-signed: add CA to trust store OR use valid cert from Let's Encrypt\n   c. Hostname mismatch: update cert SAN or fix the hostname used to connect\n2. For Let's Encrypt with cert-manager in Kubernetes: output the ClusterIssuer + Certificate YAMLs\n3. For internal CA: output commands to add CA to container trust store\n\nOUTPUT FORMAT:\n\nKubernetes cert-manager setup:\n```yaml\n# FIXED: Automated TLS with cert-manager + Let's Encrypt\napiVersion: cert-manager.io/v1\nkind: ClusterIssuer\nmetadata:\n  name: letsencrypt-prod\nspec:\n  acme:\n    server: https://acme-v02.api.letsencrypt.org/directory\n    email: admin@example.com\n    privateKeySecretRef:\n      name: letsencrypt-prod-key\n    solvers:\n      - http01:\n          ingress:\n            class: nginx\n---\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  annotations:\n    cert-manager.io/cluster-issuer: letsencrypt-prod\nspec:\n  tls:\n    - hosts: [my-app.example.com]\n      secretName: my-app-tls\n```\n\nDiagnose certificate:\n```bash\nopenssl s_client -connect my-app.example.com:443 -servername my-app.example.com 2>/dev/null | openssl x509 -noout -dates -subject\n```",
+      "tags": ["networking", "TLS", "SSL", "certificates", "cert-manager", "Let's-Encrypt", "x509"]
+    },
+
+    {
+      "id": "DB-001",
+      "category": "Database",
+      "subcategory": "Migration",
+      "error_pattern": "Database migration failed / relation does not exist",
+      "error_keywords": ["relation does not exist", "migration failed", "column does not exist", "table not found", "ERROR: syntax error at or near"],
+      "error_example": "ERROR: relation \"users\" does not exist\nDjango migration failed: django.db.utils.ProgrammingError: column \"email\" of relation \"users\" does not exist",
+      "root_cause": "Database migrations were not run before starting the application, migrations are out of order, or a migration file is corrupted/missing.",
+      "healing_prompt": "You are a DevOps healing agent fixing a database migration failure.\n\nERROR TYPE: Database migration failed - relation or column does not exist\n\nCONTEXT:\n- Application is trying to access a table/column that hasn't been created yet\n- Migrations must run BEFORE the application starts\n- In containers/Kubernetes: use an init container or migration job for this\n\nTASK:\n1. Identify the missing table/column from the error\n2. Ensure migrations run before app startup:\n   a. Docker Compose: use `command: sh -c \"migrate && start-app\"`\n   b. Kubernetes: use an init container or pre-deploy Job\n3. For Kubernetes, output a migration Job that runs before the Deployment\n4. Output the corrected startup configuration\n\nOUTPUT FORMAT:\n\nDocker Compose fix:\n```yaml\n# FIXED: Run migrations before starting the application\nservices:\n  app:\n    command: sh -c \"python manage.py migrate && python manage.py runserver 0.0.0.0:8000\"\n    depends_on:\n      postgres:\n        condition: service_healthy\n```\n\nKubernetes migration Job:\n```yaml\n# FIXED: Run migration as Kubernetes Job before Deployment\napiVersion: batch/v1\nkind: Job\nmetadata:\n  name: db-migration\nspec:\n  template:\n    spec:\n      restartPolicy: OnFailure\n      containers:\n        - name: migrate\n          image: my-app:latest\n          command: [\"python\", \"manage.py\", \"migrate\"]\n          env:\n            - name: DATABASE_URL\n              valueFrom:\n                secretKeyRef:\n                  name: db-secret\n                  key: url\n```",
+      "tags": ["database", "migration", "PostgreSQL", "Django", "Kubernetes", "init-container", "Job"]
+    },
+
+    {
+      "id": "REGISTRY-001",
+      "category": "Container Registry",
+      "subcategory": "Rate Limiting",
+      "error_pattern": "Docker Hub rate limit exceeded",
+      "error_keywords": ["toomanyrequests", "rate limit", "429", "You have reached your pull rate limit", "pull rate limit exceeded"],
+      "error_example": "toomanyrequests: You have reached your pull rate limit. You may increase the limit by authenticating and upgrading: https://www.docker.com/increase-rate-limits",
+      "root_cause": "Docker Hub rate limits anonymous pulls (100/6h) and free authenticated pulls (200/6h). CI/CD pipelines hitting this limit need authentication or a mirror.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Docker Hub rate limit error in CI/CD.\n\nERROR TYPE: Docker Hub pull rate limit exceeded\n\nCONTEXT:\n- Anonymous: 100 pulls per 6 hours per IP\n- Authenticated free: 200 pulls per 6 hours\n- Docker Pro/Team: unlimited\n- CI/CD runners share IPs → quickly hits anonymous limits\n\nTASK:\n1. Add Docker Hub authentication to the CI workflow\n2. Configure Kubernetes to use authenticated pulls via imagePullSecret\n3. Optionally: use GitHub Container Registry (GHCR) or ECR as a mirror/cache\n4. Output the complete fix for both CI and Kubernetes\n\nOUTPUT FORMAT:\n\nGitHub Actions fix:\n```yaml\n# FIXED: Authenticate with Docker Hub to increase rate limit\n- name: Log in to Docker Hub\n  uses: docker/login-action@v3\n  with:\n    username: ${{ secrets.DOCKERHUB_USERNAME }}\n    password: ${{ secrets.DOCKERHUB_TOKEN }}  # Use Access Token, not password\n```\n\nKubernetes imagePullSecret:\n```bash\nkubectl create secret docker-registry dockerhub-credentials \\\n  --docker-server=https://index.docker.io/v1/ \\\n  --docker-username=<username> \\\n  --docker-password=<access-token> \\\n  --namespace=default\n```\n\n```yaml\n# In Deployment spec:\nspec:\n  imagePullSecrets:\n    - name: dockerhub-credentials\n```\n\nAlternative: Use GHCR mirror to cache public images and avoid Docker Hub entirely.",
+      "tags": ["docker-hub", "rate-limit", "registry", "authentication", "CI/CD", "Kubernetes"]
+    },
+
+    {
+      "id": "INFRA-001",
+      "category": "Infrastructure",
+      "subcategory": "DNS",
+      "error_pattern": "DNS resolution failure in CI/CD or containers",
+      "error_keywords": ["could not resolve host", "Name or service not known", "EAI_AGAIN", "DNS resolution failed", "temporary failure in name resolution"],
+      "error_example": "curl: (6) Could not resolve host: api.example.com\nEAI_AGAIN registry-1.docker.io: Temporary failure in name resolution",
+      "root_cause": "DNS resolver is not configured, network is isolated (air-gapped CI/CD), or DNS server is overloaded/unreachable in the container network.",
+      "healing_prompt": "You are a DevOps healing agent fixing a DNS resolution failure in CI/CD or containers.\n\nERROR TYPE: DNS resolution failure - cannot resolve hostnames\n\nCONTEXT:\n- Container DNS defaults to the host's resolver via /etc/resolv.conf\n- Kubernetes uses CoreDNS for internal service resolution\n- CI/CD agents in private networks may not have external DNS access\n\nTASK:\n1. Identify if the failure is for internal (k8s service) or external (internet) DNS\n2. For containers: check /etc/resolv.conf and add explicit DNS servers\n3. For Kubernetes CoreDNS: check CoreDNS pods are running\n4. For CI/CD: verify network allows outbound DNS (port 53 UDP/TCP)\n5. Output the fix appropriate to the context\n\nOUTPUT FORMAT:\n\nDockerfile DNS fix:\n```dockerfile\n# FIXED: Add explicit DNS configuration\n# Note: DNS is usually set at runtime, not build time\n# Add to docker run or docker-compose.yml:\n```\n\ndocker-compose.yml DNS fix:\n```yaml\n# FIXED: Explicit DNS servers for container\nservices:\n  app:\n    image: my-app:latest\n    dns:\n      - 8.8.8.8\n      - 8.8.4.4\n    dns_search:\n      - example.com\n```\n\nKubernetes CoreDNS check:\n```bash\n# Check CoreDNS is running\nkubectl get pods -n kube-system -l k8s-app=kube-dns\n\n# Test DNS from a pod\nkubectl run dns-test --image=busybox --rm -it --restart=Never -- nslookup kubernetes.default\n\n# Restart CoreDNS if needed\nkubectl rollout restart deployment/coredns -n kube-system\n```",
+      "tags": ["networking", "DNS", "CoreDNS", "docker", "resolution", "containers"]
+    },
+
+    {
+      "id": "INFRA-002",
+      "category": "Infrastructure",
+      "subcategory": "Resource Quota",
+      "error_pattern": "Kubernetes resource quota exceeded",
+      "error_keywords": ["exceeded quota", "ResourceQuota", "forbidden: exceeded quota", "pods forbidden", "limitrange"],
+      "error_example": "Error from server (Forbidden): error when creating \"deployment.yaml\": pods \"my-app\" is forbidden: exceeded quota: namespace-quota, requested: pods=1, used: pods=10, limited: pods=10",
+      "root_cause": "The namespace has a ResourceQuota that limits the total number of pods, CPU, memory, or other resources. The quota has been reached.",
+      "healing_prompt": "You are a DevOps healing agent fixing a Kubernetes ResourceQuota exceeded error.\n\nERROR TYPE: Kubernetes ResourceQuota exceeded in namespace\n\nCONTEXT:\n- Namespaces can have quotas on: pods, CPU, memory, services, PVCs, etc.\n- All new pod resources must fit within the remaining quota\n- Fix: increase quota, reduce resource requests, or clean up unused resources\n\nTASK:\n1. Identify which quota dimension is exceeded (pods, CPU, memory)\n2. Check current quota usage: `kubectl describe quota -n <namespace>`\n3. Fix options:\n   a. Delete unused deployments/pods in the namespace\n   b. Reduce resource requests on existing deployments\n   c. Increase the ResourceQuota (requires cluster-admin)\n4. Output the corrected ResourceQuota YAML or cleanup commands\n\nOUTPUT FORMAT:\n\nCheck quota usage:\n```bash\nkubectl describe resourcequota -n my-namespace\nkubectl get pods -n my-namespace\nkubectl top pods -n my-namespace\n```\n\nIncrease quota (cluster-admin required):\n```yaml\n# FIXED: Increased pod and resource limits in namespace quota\napiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: namespace-quota\n  namespace: my-namespace\nspec:\n  hard:\n    pods: \"20\"              # Increased from 10\n    requests.cpu: \"4\"       # Total CPU requests\n    requests.memory: 8Gi    # Total memory requests\n    limits.cpu: \"8\"\n    limits.memory: 16Gi\n```\n\nClean up unused resources:\n```bash\n# Remove completed/failed pods\nkubectl delete pods -n my-namespace --field-selector=status.phase=Succeeded\nkubectl delete pods -n my-namespace --field-selector=status.phase=Failed\n```",
+      "tags": ["kubernetes", "ResourceQuota", "namespace", "limits", "quota", "scheduling"]
+    }
+
+  ]
+}

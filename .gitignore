@@ -1,6 +1,6 @@
-.env
 **/__pycache__/
 *.pyc
 *.pyo
 /devops_agent/devops_agent.egg-info/
-what's next.txt
+.env
+/devops_agent/devops_agent.egg-info/

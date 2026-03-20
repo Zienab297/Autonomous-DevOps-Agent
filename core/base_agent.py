@@ -187,6 +187,8 @@ class BaseAgent(ABC):
                 from core.agent_registery import AgentStatus
                 self._registry.register(self.name, self)
                 self._registry.update_status(self.name, AgentStatus.RUNNING)
+                self._registry.register(self.name, self.agent_id)
+                self._registry.set_status(self.name, AgentStatus.RUNNING)
 
             # Run subclass setup
             await self._setup()
@@ -209,6 +211,7 @@ class BaseAgent(ABC):
             if self._registry:
                 from core.agent_registery import AgentStatus
                 self._registry.update_status(self.name, AgentStatus.ERROR)
+                self._registry.set_status(self.name, AgentStatus.ERROR)
 
             raise
 
@@ -249,6 +252,7 @@ class BaseAgent(ABC):
         if self._registry:
             from core.agent_registery import AgentStatus
             self._registry.update_status(self.name, AgentStatus.STOPPED)        
+            self._registry.set_status(self.name, AgentStatus.STOPPED)
             self._registry.unregister(self.name)
 
         self._state = AgentState.STOPPED
