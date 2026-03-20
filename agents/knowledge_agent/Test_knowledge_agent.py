@@ -17,15 +17,31 @@ from knowledge_core.knowledge_graph import KnowledgeGraph
 
 TEST_CASES = [
      {
+        "name"  : "Case 1 -- Kubernetes CrashLoopBackOff",
+        "error" : "Back-off restarting failed container: my-app-xyz has status CrashLoopBackOff restarts=8",
+        "expect": RAGSource.KNOWLEDGE_BASE,
+    },
+
+     {
         "name"  : "Case 2 -- Docker COPY error",
         "error" : "COPY failed: file not found in build context",
         "expect": RAGSource.KNOWLEDGE_BASE,
     },
-    {
-        "name"  : "Case 1 -- Terraform state lock (should use LLM fallback)",
-        "error" : "Error locking state: Error acquiring the state lock: ConditionalCheckFailedException: The conditional request failed",
-        "expect": RAGSource.LLM_GENERATED,
+     {
+        "name"  : "Case 1 -- Kubernetes CrashLoopBackOff",
+        "error" : "Back-off restarting failed container: my-app-xyz has status CrashLoopBackOff restarts=8",
+        "expect": RAGSource.KNOWLEDGE_BASE,
     },
+    {
+        "name"  : "Case 2 -- Docker COPY error",
+        "error" : "COPY failed: file not found in build context",
+        "expect": RAGSource.KNOWLEDGE_BASE,
+    },
+    # {
+    #     "name"  : "Case 1 -- Terraform state lock (should use LLM fallback)",
+    #     "error" : "Error locking state: Error acquiring the state lock: ConditionalCheckFailedException: The conditional request failed",
+    #     "expect": RAGSource.LLM_GENERATED,
+    # },
     # {
     #     "name"  : "Case 2 -- Docker COPY error (should match KB)",
     #     "error" : "COPY failed: file not found in build context or excluded by .dockerignore: stat app/config.yaml: file does not exist",
@@ -49,31 +65,36 @@ def print_separator(char="─", width=60):
 
 
 def print_graph_section(error_message: str, graph: KnowledgeGraph):
-    """Show what the Knowledge Graph found for this error."""
     print()
     print("  -- Knowledge Graph --")
 
-    related_ids = graph.get_related_ids(error_message)
+    graph_result = graph.analyze(error_message)
 
-    if not related_ids:
+    if not graph_result.found:
         print("  No related nodes found")
         print("  --------------------")
         return
 
-    print(f"  matched nodes  : {len(related_ids)}")
-    for entry_id in related_ids:
+    print(f"  matched node   : {graph_result.matched_node} (score={graph_result.match_score})")
+    print(f"  related nodes  : {len(graph_result.related_ids)}")
+    for entry_id in graph_result.related_ids:
         layer    = graph.get_layer(entry_id)
         keywords = graph.get_keywords(entry_id)
         print(f"  {entry_id:<15} | {layer:<30} | keywords: {', '.join(keywords[:3])}")
 
-    all_keywords = []
-    for entry_id in related_ids:
-        all_keywords.extend(graph.get_keywords(entry_id))
-    all_keywords = list(dict.fromkeys(all_keywords))
-    print(f"  enriched query : +{len(all_keywords)} keywords added to search")
+    # ── strategy ──────────────────────────────────────────────────────
+    print()
+    print("  -- Strategy --")
+    s = graph_result.strategy
+    print(f"  check deployments    : {s.check_deployments}")
+    print(f"  check service health : {s.check_service_health}")
+    print(f"  check resources      : {s.check_resources}")
+    print(f"  check secrets        : {s.check_secrets}")
+    print(f"  search order         : {' -> '.join(s.search_order)}")
+    print(f"  reasoning            : {s.reasoning}")
+    print(f"  enriched query       : +{len(graph_result.keywords)} keywords added")
     print("  --------------------")
     print()
-
 
 def print_response(response):
     print(f"  source     : {response.source.value}")

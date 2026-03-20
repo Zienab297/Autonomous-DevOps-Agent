@@ -1,0 +1,59 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "description": "Service dependency map — used to detect cascading failures",
+    "usage": "When an error affects a service, check its dependents for cascading impact"
+  },
+
+  "services": {
+
+    "api-gateway": {
+      "depends_on": ["auth-service", "payment-service", "notification-service"],
+      "depended_by": [],
+      "type": "gateway",
+      "critical": true
+    },
+
+    "auth-service": {
+      "depends_on": ["postgres", "redis"],
+      "depended_by": ["api-gateway", "payment-service"],
+      "type": "backend",
+      "critical": true
+    },
+
+    "payment-service": {
+      "depends_on": ["auth-service", "postgres", "rabbitmq"],
+      "depended_by": ["api-gateway"],
+      "type": "backend",
+      "critical": true
+    },
+
+    "notification-service": {
+      "depends_on": ["rabbitmq", "redis"],
+      "depended_by": ["api-gateway"],
+      "type": "backend",
+      "critical": false
+    },
+
+    "postgres": {
+      "depends_on": [],
+      "depended_by": ["auth-service", "payment-service"],
+      "type": "database",
+      "critical": true
+    },
+
+    "redis": {
+      "depends_on": [],
+      "depended_by": ["auth-service", "notification-service"],
+      "type": "cache",
+      "critical": false
+    },
+
+    "rabbitmq": {
+      "depends_on": [],
+      "depended_by": ["payment-service", "notification-service"],
+      "type": "queue",
+      "critical": false
+    }
+  }
+}

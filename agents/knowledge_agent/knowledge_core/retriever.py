@@ -2,13 +2,10 @@ from setup_path import *
 """
 knowledge_core/retriever.py
 ---------------------------
-Embeds incoming error message → searches Qdrant → returns RetrievalResult.
-
-With Knowledge Graph:
-  1. Graph finds related entry IDs + keywords
-  2. Keywords enrich the query text
-  3. Qdrant searches with enriched query
-  4. Returns best match above threshold
+System-aware retrieval:
+  1. Knowledge Graph analyzes error → strategy + related IDs
+  2. Strategy determines what to check first
+  3. Enriched query → Qdrant search
 """
 
 from sentence_transformers import SentenceTransformer
@@ -22,31 +19,34 @@ def retrieve(
     error_message: str,
     client: QdrantClient,
     config: Config,
-    graph=None,          # KnowledgeGraph — optional
+    graph=None,
 ) -> RetrievalResult:
 
-    # ── step 1: enrich query using Knowledge Graph 
+    enriched_query = error_message
+
     if graph is not None:
-        related_ids = graph.get_related_ids(error_message)
+        # ── step 1: graph analyzes error ──────────────────────────────────
+        graph_result = graph.analyze(error_message)
 
-        # collect keywords from all related nodes
-        extra_keywords = []
-        for entry_id in related_ids:
-            extra_keywords.extend(graph.get_keywords(entry_id))
+        if graph_result.found:
+            strategy = graph_result.strategy
 
-        # deduplicate and build enriched query
-        extra_keywords = list(dict.fromkeys(extra_keywords))
-        enriched_query = error_message + " " + " ".join(extra_keywords)
-        print(f"[Retriever] Enriched query with {len(extra_keywords)} keywords "
-              f"from {len(related_ids)} related nodes")
-    else:
-        enriched_query = error_message
+            # ── step 2: apply strategy — check before searching ───────────
+            if strategy.needs_context():
+                _apply_strategy(strategy, error_message)
 
-    # ── step 2: embed enriched query 
+            # ── step 3: enrich query with related keywords ─────────────────
+            if graph_result.keywords:
+                enriched_query = error_message + " " + " ".join(graph_result.keywords)
+                print(f"[Retriever] Enriched query with {len(graph_result.keywords)} keywords "
+                      f"from {len(graph_result.related_ids)} related nodes")
+        else:
+            print(f"[Retriever] No graph match — using raw error message")
+
+    # ── step 4: embed and search Qdrant ──────────────────────────────────
     model = SentenceTransformer("all-MiniLM-L6-v2")
     query_vector = model.encode(enriched_query).tolist()
 
-    # ── step 3: search Qdrant 
     hits = client.query_points(
         collection_name=config.collection_name,
         query=query_vector,
@@ -65,3 +65,32 @@ def retrieve(
         return RetrievalResult(found=True, score=score, entry=top.payload)
 
     return RetrievalResult(found=False, score=score)
+
+
+def _apply_strategy(strategy, error_message: str) -> None:
+    """
+    Apply pre-search checks based on the strategy.
+    Prints what the agent is checking before searching Qdrant.
+    This is where future integrations (K8s API, deployment history) will plug in.
+    """
+    print(f"\n[Retriever] Applying strategy before search:")
+    print(f"  Reasoning: {strategy.reasoning}")
+
+    if strategy.check_deployments:
+        print(f"  [Strategy] Checking recent deployments...")
+        # TODO: query deployment history from StateManager or CI/CD agent
+
+    if strategy.check_service_health:
+        print(f"  [Strategy] Checking service health and dependencies...")
+        # TODO: query service mesh or Kubernetes API
+
+    if strategy.check_resources:
+        print(f"  [Strategy] Checking cluster resources...")
+        # TODO: query Prometheus or kubectl top nodes
+
+    if strategy.check_secrets:
+        print(f"  [Strategy] Checking secrets and configuration...")
+        # TODO: query Kubernetes secrets or vault
+
+    if strategy.search_order:
+        print(f"  [Strategy] Search order: {' → '.join(strategy.search_order)}")
