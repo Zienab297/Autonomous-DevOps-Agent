@@ -166,7 +166,12 @@ class GroqAnalyzer:
         model:    str = GROQ_MODEL,
         timeout:  int = 30,
     ):
-        self._api_key = api_key or os.getenv("GROQ_API_KEY", "")
+        # Use api_key if explicitly provided (even empty string means "no key").
+        # Only fall back to env var when api_key is None (not provided at all).
+        if api_key is None:
+            self._api_key = os.getenv("GROQ_API_KEY", "")
+        else:
+            self._api_key = api_key
         self._model   = model
         self._timeout = aiohttp.ClientTimeout(total=timeout)
 
@@ -222,7 +227,7 @@ class GroqAnalyzer:
         payload = {
             "model":       self._model,
             "temperature": 0.1,
-            "max_tokens":  1024,
+            "max_tokens":  2048,
             "messages":    [{"role": "user", "content": prompt}],
         }
         headers = {

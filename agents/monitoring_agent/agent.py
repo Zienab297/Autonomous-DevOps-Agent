@@ -140,10 +140,22 @@ class MonitoringAgent(BaseAgent):
         """
         Main loop: poll every service, detect anomalies, publish incidents.
         Runs until the agent is stopped.
+
+        Sleep-first design: waits one full interval before the first poll.
+        This prevents a double-poll when tests call _poll_service() manually
+        right after start(), and gives the agent time to settle in production.
         """
-        self.logger.info("[MonitoringAgent] First poll starting...")
+        self.logger.info(
+            "[MonitoringAgent] Poll loop running — first poll in %.0fs",
+            self._config.poll_interval,
+        )
 
         while True:
+            try:
+                await asyncio.sleep(self._config.poll_interval)
+            except asyncio.CancelledError:
+                break
+
             try:
                 await self._poll_all_services()
             except asyncio.CancelledError:
@@ -153,11 +165,6 @@ class MonitoringAgent(BaseAgent):
                     "[MonitoringAgent] Unexpected error in poll loop: %s",
                     e, exc_info=True,
                 )
-
-            try:
-                await asyncio.sleep(self._config.poll_interval)
-            except asyncio.CancelledError:
-                break
 
     async def _poll_all_services(self) -> None:
         """Poll all configured services concurrently."""
