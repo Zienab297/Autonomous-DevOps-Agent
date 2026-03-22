@@ -1,0 +1,47 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "description": "Deployment history — used to correlate incidents with recent deployments",
+    "usage": "When an incident occurs, check if a deployment happened in the last 30 minutes"
+  },
+
+  "deployments": [
+    {
+      "id": "deploy-001",
+      "service": "auth-service",
+      "version": "v2.3.1",
+      "branch": "main",
+      "triggered_by": "github-actions",
+      "status": "success",
+      "started_at": "2025-03-21T10:00:00Z",
+      "finished_at": "2025-03-21T10:05:00Z",
+      "changes": ["updated JWT expiry", "fixed login bug"],
+      "image": "ghcr.io/org/auth-service:v2.3.1"
+    },
+    {
+      "id": "deploy-002",
+      "service": "payment-service",
+      "version": "v1.8.0",
+      "branch": "main",
+      "triggered_by": "github-actions",
+      "status": "failed",
+      "started_at": "2025-03-21T11:00:00Z",
+      "finished_at": "2025-03-21T11:03:00Z",
+      "changes": ["added new payment provider", "updated dependencies"],
+      "image": "ghcr.io/org/payment-service:v1.8.0",
+      "error": "CrashLoopBackOff after deployment"
+    },
+    {
+      "id": "deploy-003",
+      "service": "api-gateway",
+      "version": "v3.0.0",
+      "branch": "main",
+      "triggered_by": "manual",
+      "status": "success",
+      "started_at": "2025-03-21T09:00:00Z",
+      "finished_at": "2025-03-21T09:08:00Z",
+      "changes": ["rate limiting update", "new routes added"],
+      "image": "ghcr.io/org/api-gateway:v3.0.0"
+    }
+  ]
+}

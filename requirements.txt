@@ -1,0 +1,105 @@
+annotated-types==0.7.0
+anyio==4.12.1
+certifi @ file:///home/conda/feedstock_root/build_artifacts/certifi_1772001073725/work/certifi
+distro==1.9.0
+groq==1.1.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.11
+packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1769093650/work
+pydantic==2.12.5
+pydantic_core==2.41.5
+python-dotenv==1.2.2
+sniffio==1.3.1
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+# ============================================================
+# Autonomous DevOps Agent SDK - Requirements
+# ============================================================
+
+# ============================================================
+# Phase 1 - Core Architecture
+# (no external dependencies - standard library only)
+# ============================================================
+pyyaml>=6.0.1                  # config.yaml parsing
+
+
+# ============================================================
+# Phase 2 - Monitoring Layer
+# ============================================================
+prometheus-client>=0.19.0      # Prometheus metrics
+requests>=2.31.0               # HTTP calls to Prometheus API
+aiohttp>=3.9.0                 # Async HTTP (Loki / CloudWatch)
+
+
+# ============================================================
+# Phase 3 - Knowledge Agent (RAG)
+# ============================================================
+openai>=1.12.0                 # LLM provider (GPT-4)
+tiktoken>=0.6.0                # Token counting for LLM
+faiss-cpu>=1.7.4               # Vector store (local)
+sentence-transformers>=2.5.0   # Embeddings
+langchain>=0.1.0               # RAG pipeline helpers
+langchain-community>=0.0.20    # LangChain integrations
+
+
+# ============================================================
+# Phase 4 - Self-Healing Layer
+# ============================================================
+kubernetes>=29.0.0             # Kubernetes client
+docker>=7.0.0                  # Docker client
+paramiko>=3.4.0                # SSH remote execution
+
+
+# ============================================================
+# Phase 5 - CI/CD Integration
+# ============================================================
+PyGithub>=2.1.1                # GitHub API
+python-gitlab>=4.4.0           # GitLab API
+
+
+# ============================================================
+# Phase 6 - Alerting System
+# ============================================================
+slack-sdk>=3.26.0              # Slack notifications
+sendgrid>=6.11.0               # Email notifications
+
+
+# ============================================================
+# Phase 7 - SDK Interface
+# ============================================================
+fastapi>=0.109.0               # REST API
+uvicorn>=0.27.0                # ASGI server
+typer>=0.9.0                   # CLI interface
+rich>=13.7.0                   # Pretty CLI output
+
+
+# ============================================================
+# Utilities (used across all phases)
+# ============================================================
+pydantic>=2.6.0                # Data validation
+python-dotenv>=1.0.0           # Load .env files
+tenacity>=8.2.3                # Retry logic
+structlog>=24.1.0              # Structured logging
+
+# ── Knowledge Agent — Requirements ───────────────────────────────────────────
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# External services needed:
+#   - Qdrant  : docker run -p 6333:6333 qdrant/qdrant
+#   - Gemini  : export GEMINI_API_KEY=your_key
+
+# LLM + Embeddings (new package - replaces google-generativeai)
+google-genai>=0.8.0
+sentence-transformers
+
+# Vector Database
+qdrant-client>=1.9.0
+# Models
+ollama
+# Web Search (free, no API key)
+duckduckgo-search>=6.0.0
+ddgs

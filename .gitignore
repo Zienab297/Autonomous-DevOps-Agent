@@ -1,1 +1,7 @@
 .env
+**/__pycache__/
+*.pyc
+*.pyo
+/devops_agent/devops_agent.egg-info/
+.env
+/devops_agent/devops_agent.egg-info/

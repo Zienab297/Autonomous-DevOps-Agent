@@ -1,0 +1,972 @@
+{
+  "metadata": {
+    "version": "2.0.0",
+    "description": "System-level knowledge graph linking errors, services, dependencies, and deployments across layers",
+    "layers": [
+      "Layer 1 - Build",
+      "Layer 2 - Registry",
+      "Layer 3 - Pipeline",
+      "Layer 4 - Orchestration",
+      "Layer 5 - Runtime"
+    ],
+    "strategies": {
+      "check_deployments": "check recent deployments before searching",
+      "check_service_health": "check service dependencies before searching",
+      "check_resources": "check cluster resources before searching",
+      "check_secrets": "check secrets and config before searching"
+    }
+  },
+  "nodes": {
+    "DOCKER-001": {
+      "layer": "Layer 1 - Build",
+      "related": [
+        "DOCKER-002",
+        "DOCKER-004",
+        "DOCKER-005"
+      ],
+      "causes": [
+        "K8S-002"
+      ],
+      "keywords": [
+        "COPY failed",
+        "build context",
+        "dockerignore"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Docker",
+          "CI/CD General"
+        ],
+        "reasoning": "Pure build error \u2014 no need to check runtime state"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "build_failure"
+    },
+    "DOCKER-002": {
+      "layer": "Layer 1 - Build",
+      "related": [
+        "DOCKER-001",
+        "DOCKER-004"
+      ],
+      "causes": [
+        "K8S-002"
+      ],
+      "keywords": [
+        "apt-get",
+        "apk",
+        "package not found"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Docker"
+        ],
+        "reasoning": "Package install error \u2014 check base image and package name"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "build_failure"
+    },
+    "DOCKER-003": {
+      "layer": "Layer 1 - Build",
+      "related": [
+        "COMPOSE-001",
+        "K8S-003"
+      ],
+      "causes": [],
+      "keywords": [
+        "port already in use",
+        "address already in use"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": true,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Docker",
+          "Networking"
+        ],
+        "reasoning": "Port conflict \u2014 check what else is running on that port"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "port_conflict"
+    },
+    "DOCKER-004": {
+      "layer": "Layer 1 - Build",
+      "related": [
+        "DOCKER-001",
+        "DOCKER-002"
+      ],
+      "causes": [
+        "K8S-001"
+      ],
+      "keywords": [
+        "permission denied",
+        "OCI runtime",
+        "entrypoint"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Docker"
+        ],
+        "reasoning": "Permission error \u2014 check entrypoint and file permissions"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "runtime_failure"
+    },
+    "DOCKER-005": {
+      "layer": "Layer 1 - Build",
+      "related": [
+        "DOCKER-001",
+        "DOCKER-002"
+      ],
+      "causes": [],
+      "keywords": [
+        "no space left",
+        "disk",
+        "prune"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "Docker"
+        ],
+        "reasoning": "Disk space error \u2014 check host resources first"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "build_failure"
+    },
+    "GHA-001": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "GHA-002",
+        "REGISTRY-001",
+        "K8S-002"
+      ],
+      "causes": [
+        "K8S-002"
+      ],
+      "keywords": [
+        "authentication",
+        "GHCR",
+        "registry",
+        "permission denied"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "GitHub Actions",
+          "Container Registry"
+        ],
+        "reasoning": "Auth error \u2014 check secrets and recent pipeline changes"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_failure"
+    },
+    "GHA-002": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "GHA-001",
+        "SEC-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "secret not found",
+        "environment variable empty"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "GitHub Actions",
+          "Security"
+        ],
+        "reasoning": "Missing secret \u2014 check secrets config before anything else"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_failure"
+    },
+    "GHA-003": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "GHA-004"
+      ],
+      "causes": [],
+      "keywords": [
+        "runner offline",
+        "no runners available"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": true,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "GitHub Actions"
+        ],
+        "reasoning": "Runner issue \u2014 check runner health and labels"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_failure"
+    },
+    "GHA-004": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "HELM-002"
+      ],
+      "causes": [],
+      "keywords": [
+        "yaml syntax",
+        "invalid workflow",
+        "indentation"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "GitHub Actions",
+          "Helm"
+        ],
+        "reasoning": "Syntax error \u2014 no runtime checks needed"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_failure"
+    },
+    "GHA-005": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "GHA-001",
+        "GHA-002"
+      ],
+      "causes": [],
+      "keywords": [
+        "deployment approval",
+        "environment protection"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "GitHub Actions"
+        ],
+        "reasoning": "Approval gate \u2014 check environment protection rules"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_blocked"
+    },
+    "GHA-006": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "CI-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "cache not found",
+        "cache miss"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "GitHub Actions",
+          "CI/CD General"
+        ],
+        "reasoning": "Cache miss \u2014 check cache key and restore-keys"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_slow"
+    },
+    "K8S-001": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-002",
+        "K8S-008",
+        "K8S-009",
+        "DOCKER-004"
+      ],
+      "causes": [
+        "K8S-006"
+      ],
+      "keywords": [
+        "CrashLoopBackOff",
+        "OOMKilled",
+        "container restart"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": true,
+        "check_resources": true,
+        "check_secrets": true,
+        "search_order": [
+          "Kubernetes",
+          "Docker"
+        ],
+        "reasoning": "CrashLoop \u2014 check recent deploy, resources, secrets, and image"
+      },
+      "affects_services": [
+        "affected-service",
+        "downstream-services"
+      ],
+      "impact_type": "service_down"
+    },
+    "K8S-002": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-001",
+        "GHA-001",
+        "REGISTRY-001",
+        "DOCKER-001"
+      ],
+      "causes": [
+        "K8S-001",
+        "K8S-006"
+      ],
+      "keywords": [
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "image not found"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "Kubernetes",
+          "Container Registry",
+          "GitHub Actions"
+        ],
+        "reasoning": "Image pull error \u2014 check registry auth and recent deploy"
+      },
+      "affects_services": [
+        "affected-service"
+      ],
+      "impact_type": "service_down"
+    },
+    "K8S-003": {
+      "layer": "Layer 5 - Runtime",
+      "related": [
+        "K8S-007",
+        "COMPOSE-001",
+        "INFRA-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "service not reachable",
+        "connection refused",
+        "no endpoints"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": true,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Kubernetes",
+          "Networking"
+        ],
+        "reasoning": "Service unreachable \u2014 check endpoints, selectors, and dependencies"
+      },
+      "affects_services": [
+        "affected-service",
+        "api-gateway",
+        "downstream-services"
+      ],
+      "impact_type": "service_unreachable"
+    },
+    "K8S-004": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "COMPOSE-002",
+        "INFRA-002"
+      ],
+      "causes": [],
+      "keywords": [
+        "PVC pending",
+        "PersistentVolumeClaim",
+        "StorageClass"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "Kubernetes"
+        ],
+        "reasoning": "Storage issue \u2014 check available PVs and StorageClass"
+      },
+      "affects_services": [
+        "affected-service"
+      ],
+      "impact_type": "service_degraded"
+    },
+    "K8S-005": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "GHA-001",
+        "SEC-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "forbidden",
+        "RBAC",
+        "ServiceAccount"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "Kubernetes",
+          "Security"
+        ],
+        "reasoning": "RBAC error \u2014 check ServiceAccount and Role bindings"
+      },
+      "affects_services": [
+        "affected-service"
+      ],
+      "impact_type": "service_unauthorized"
+    },
+    "K8S-006": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-001",
+        "K8S-002",
+        "K8S-008",
+        "HELM-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "deployment rollout stuck",
+        "ProgressDeadlineExceeded",
+        "unavailable replicas"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": true,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "Kubernetes",
+          "Helm"
+        ],
+        "reasoning": "Rollout stuck \u2014 check recent deploy, readiness probe, and resources"
+      },
+      "affects_services": [
+        "affected-service",
+        "downstream-services"
+      ],
+      "impact_type": "service_degraded"
+    },
+    "K8S-007": {
+      "layer": "Layer 5 - Runtime",
+      "related": [
+        "K8S-003",
+        "NET-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "502 Bad Gateway",
+        "503 Service Unavailable",
+        "Ingress"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": true,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Kubernetes",
+          "Networking"
+        ],
+        "reasoning": "Gateway error \u2014 check backend service health and recent deploy"
+      },
+      "affects_services": [
+        "affected-service",
+        "api-gateway",
+        "all-users"
+      ],
+      "impact_type": "service_unreachable"
+    },
+    "K8S-008": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-001",
+        "INFRA-002"
+      ],
+      "causes": [
+        "K8S-001",
+        "K8S-006"
+      ],
+      "keywords": [
+        "Insufficient CPU",
+        "Insufficient memory",
+        "Unschedulable"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "Kubernetes"
+        ],
+        "reasoning": "Resource shortage \u2014 check node capacity and quotas first"
+      },
+      "affects_services": [
+        "affected-service",
+        "co-located-services"
+      ],
+      "impact_type": "service_unschedulable"
+    },
+    "K8S-009": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-001",
+        "GHA-002",
+        "SEC-001"
+      ],
+      "causes": [
+        "K8S-001"
+      ],
+      "keywords": [
+        "ConfigMap not found",
+        "Secret not found",
+        "MountVolume failed"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "Kubernetes",
+          "Security"
+        ],
+        "reasoning": "Missing config \u2014 check secrets and recent deploy changes"
+      },
+      "affects_services": [
+        "affected-service"
+      ],
+      "impact_type": "service_down"
+    },
+    "K8S-010": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-008"
+      ],
+      "causes": [],
+      "keywords": [
+        "HPA",
+        "metrics not available",
+        "unable to fetch metrics"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": true,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "Kubernetes"
+        ],
+        "reasoning": "HPA metrics error \u2014 check metrics-server health"
+      },
+      "affects_services": [
+        "affected-service"
+      ],
+      "impact_type": "autoscaling_disabled"
+    },
+    "COMPOSE-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": [
+        "K8S-003",
+        "DOCKER-003",
+        "INFRA-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "service cannot connect",
+        "no such host",
+        "localhost refused"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": true,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Docker Compose",
+          "Networking"
+        ],
+        "reasoning": "DNS/network error \u2014 check service names and network config"
+      },
+      "affects_services": [
+        "affected-service",
+        "dependent-services"
+      ],
+      "impact_type": "service_unreachable"
+    },
+    "COMPOSE-002": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-004"
+      ],
+      "causes": [],
+      "keywords": [
+        "named volume not found",
+        "volume mount failed"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "Docker Compose"
+        ],
+        "reasoning": "Volume error \u2014 check volume declaration"
+      },
+      "affects_services": [
+        "affected-service"
+      ],
+      "impact_type": "service_degraded"
+    },
+    "HELM-001": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-006"
+      ],
+      "causes": [],
+      "keywords": [
+        "helm upgrade failed",
+        "immutable field",
+        "spec.selector"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Helm",
+          "Kubernetes"
+        ],
+        "reasoning": "Helm upgrade error \u2014 check previous deploy and immutable fields"
+      },
+      "affects_services": [
+        "affected-service",
+        "downstream-services"
+      ],
+      "impact_type": "deployment_failed"
+    },
+    "HELM-002": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "GHA-004"
+      ],
+      "causes": [],
+      "keywords": [
+        "helm template error",
+        "nil pointer",
+        "YAML parse error"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Helm"
+        ],
+        "reasoning": "Template error \u2014 no runtime checks needed"
+      },
+      "affects_services": [
+        "affected-service"
+      ],
+      "impact_type": "pipeline_failure"
+    },
+    "CI-001": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "GHA-006",
+        "CI-002"
+      ],
+      "causes": [],
+      "keywords": [
+        "module not found",
+        "Cannot find module",
+        "dependency missing"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "CI/CD General",
+          "GitHub Actions"
+        ],
+        "reasoning": "Dependency error \u2014 check package manifest and install step"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "build_failure"
+    },
+    "CI-002": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "CI-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "test suite failed",
+        "no tests ran",
+        "test not found"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "CI/CD General"
+        ],
+        "reasoning": "Test error \u2014 check test config and file patterns"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_failure"
+    },
+    "SEC-001": {
+      "layer": "Layer 3 - Pipeline",
+      "related": [
+        "GHA-002",
+        "K8S-005",
+        "K8S-009"
+      ],
+      "causes": [],
+      "keywords": [
+        "hardcoded secret",
+        "secret scanning",
+        "credential exposed"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "Security",
+          "GitHub Actions"
+        ],
+        "reasoning": "Security incident \u2014 check and rotate secrets immediately"
+      },
+      "affects_services": [
+        "all-services"
+      ],
+      "impact_type": "security_incident"
+    },
+    "NET-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": [
+        "K8S-007",
+        "INFRA-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "TLS certificate failed",
+        "SSL handshake",
+        "x509"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": true,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "Networking",
+          "Kubernetes"
+        ],
+        "reasoning": "TLS error \u2014 check cert expiry and recent deploy"
+      },
+      "affects_services": [
+        "affected-service",
+        "all-tls-services"
+      ],
+      "impact_type": "service_unreachable"
+    },
+    "DB-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": [
+        "K8S-001",
+        "K8S-009",
+        "COMPOSE-001"
+      ],
+      "causes": [
+        "K8S-001"
+      ],
+      "keywords": [
+        "migration failed",
+        "relation does not exist",
+        "table not found"
+      ],
+      "strategy": {
+        "check_deployments": true,
+        "check_service_health": true,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "Database",
+          "Kubernetes"
+        ],
+        "reasoning": "DB error \u2014 check recent deploy and connection config"
+      },
+      "affects_services": [
+        "affected-service",
+        "all-db-dependent-services"
+      ],
+      "impact_type": "service_down"
+    },
+    "REGISTRY-001": {
+      "layer": "Layer 2 - Registry",
+      "related": [
+        "K8S-002",
+        "GHA-001"
+      ],
+      "causes": [
+        "K8S-002"
+      ],
+      "keywords": [
+        "rate limit exceeded",
+        "toomanyrequests",
+        "docker hub"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": false,
+        "check_secrets": true,
+        "search_order": [
+          "Container Registry",
+          "GitHub Actions"
+        ],
+        "reasoning": "Rate limit \u2014 check registry auth credentials"
+      },
+      "affects_services": [
+        "any-service"
+      ],
+      "impact_type": "pipeline_failure"
+    },
+    "INFRA-001": {
+      "layer": "Layer 5 - Runtime",
+      "related": [
+        "K8S-003",
+        "COMPOSE-001"
+      ],
+      "causes": [],
+      "keywords": [
+        "DNS resolution failed",
+        "could not resolve host",
+        "EAI_AGAIN"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": true,
+        "check_resources": false,
+        "check_secrets": false,
+        "search_order": [
+          "Networking",
+          "Docker Compose",
+          "Kubernetes"
+        ],
+        "reasoning": "DNS error \u2014 check CoreDNS and network config"
+      },
+      "affects_services": [
+        "affected-service",
+        "all-services"
+      ],
+      "impact_type": "service_unreachable"
+    },
+    "INFRA-002": {
+      "layer": "Layer 4 - Orchestration",
+      "related": [
+        "K8S-008",
+        "K8S-004"
+      ],
+      "causes": [
+        "K8S-008"
+      ],
+      "keywords": [
+        "ResourceQuota exceeded",
+        "forbidden exceeded quota",
+        "pods forbidden"
+      ],
+      "strategy": {
+        "check_deployments": false,
+        "check_service_health": false,
+        "check_resources": true,
+        "check_secrets": false,
+        "search_order": [
+          "Kubernetes"
+        ],
+        "reasoning": "Quota exceeded \u2014 check namespace resource limits first"
+      },
+      "affects_services": [
+        "affected-service",
+        "namespace-services"
+      ],
+      "impact_type": "service_unschedulable"
+    }
+  }
+}
