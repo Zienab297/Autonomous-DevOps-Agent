@@ -40,6 +40,16 @@ class EventType(str, Enum):
     DEPLOYMENT_COMPLETE     = "cicd.deployment_complete"
     ROLLBACK_TRIGGERED      = "cicd.rollback_triggered"
 
+    # Scaffold Events
+    SCAFFOLD_STARTED        = "scaffold.started"
+    SCAFFOLD_COMPLETE       = "scaffold.complete"
+    SCAFFOLD_FAILED         = "scaffold.failed"
+
+    # Approval Events
+    APPROVAL_REQUESTED      = "approval.requested"
+    APPROVAL_GRANTED        = "approval.granted"
+    APPROVAL_DENIED         = "approval.denied"
+
     # Alerting Events
     ALERT_SENT              = "alerting.alert_sent"
     REPORT_SENT             = "alerting.report_sent"
