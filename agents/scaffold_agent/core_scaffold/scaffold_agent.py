@@ -45,6 +45,9 @@ class ScaffoldAgent:
         generated_files = parse_llm_response(response_text)
         print(f"[ScaffoldAgent] Parsed {len(generated_files)} files from LLM response")
 
+        # step 4b: fix common LLM mistakes in Dockerfile
+        generated_files = self._fix_generated_files(generated_files, context.project_name)
+
         # step 5: build result
         result = ScaffoldResult(
             project_path    = project_path,
@@ -80,6 +83,7 @@ IMPORTANT:
 - Do NOT use markdown headers like ### or numbered lists like 1.
 - Output ONLY file contents using the FILE: format below
 - Start your response immediately with: FILE: Dockerfile
+- In the Dockerfile, ALWAYS write "COPY . ." — never "COPY {project_name} ." or any other folder name
 
 Project name : {project_name}
 Language     : {context.language.value}
@@ -139,6 +143,16 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: false
+        default: production
+      triggered_by:
+        description: Who triggered this
+        required: false
+        default: devops-agent-cli
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -235,6 +249,33 @@ Now output the 7 files above with correct values.
 Use project name "{project_name}" and port "{context.port}" everywhere.
 START with FILE: Dockerfile
 """
+
+    # ── generated file fixes ──────────────────────────────────────────────────
+
+    def _fix_generated_files(self, files, project_name: str):
+        """
+        Fix common LLM mistakes in generated files.
+        Runs after parse, before write — acts as a safety net.
+        """
+        import re
+        for gf in files:
+            if gf.filename == "Dockerfile":
+                original = gf.content
+                # Fix: LLM sometimes writes "COPY <project_name> ." instead of "COPY . ."
+                gf.content = re.sub(
+                    rf'COPY\s+{re.escape(project_name)}\s+\.',
+                    'COPY . .',
+                    gf.content,
+                )
+                # Fix: also catch any other "COPY <single-word-no-dot> ." that isn't requirements.txt
+                gf.content = re.sub(
+                    r'COPY\s+(?!requirements\.txt)(?!\.\s)([a-zA-Z0-9_-]+)\s+\.',
+                    'COPY . .',
+                    gf.content,
+                )
+                if gf.content != original:
+                    print(f"[ScaffoldAgent] Fixed Dockerfile COPY command (LLM used project name instead of '.')")
+        return files
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
