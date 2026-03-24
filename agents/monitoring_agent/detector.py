@@ -104,6 +104,7 @@ class Detector:
 
         # --- Metric checks ---
         anomalies += self._check_error_rate(service, metric_map)
+        anomalies += self._check_traceback_count(service, metric_map)  # file backend
         anomalies += self._check_latency(service, metric_map)
         anomalies += self._check_cpu(service, metric_map)
         anomalies += self._check_memory(service, metric_map)
@@ -144,6 +145,48 @@ class Detector:
         if v >= t.error_rate_medium:
             return [self._anomaly(service, "error_rate", v, t.error_rate_medium, Severity.MEDIUM)]
         return []
+
+    def _check_traceback_count(
+        self, service: str, metrics: dict[str, Metric]
+    ) -> List[Anomaly]:
+        """
+        Check the traceback_count metric produced by FileCollector.
+        Any CI run with ≥ threshold tracebacks is an incident.
+
+        Even 1 traceback is enough to fire at MEDIUM severity — this is a
+        real code bug, not a noisy log line.
+        """
+        m = metrics.get("traceback_count")
+        if m is None:
+            return []
+
+        count = int(m.value)
+        threshold = self._t.traceback_count_threshold
+
+        if count < threshold:
+            return []
+
+        # Scale severity with count
+        if count >= 10:
+            severity = Severity.CRITICAL
+        elif count >= 5:
+            severity = Severity.HIGH
+        elif count >= 2:
+            severity = Severity.MEDIUM
+        else:
+            severity = Severity.MEDIUM  # even 1 traceback = MEDIUM
+
+        return [Anomaly(
+            service       = service,
+            metric_name   = "traceback_count",
+            current_value = float(count),
+            threshold     = float(threshold),
+            severity      = severity,
+            message       = (
+                f"{count} traceback(s) detected in CI/CD logs "
+                f"(threshold: {threshold}) [{severity.value}]"
+            ),
+        )]
 
     def _check_latency(
         self, service: str, metrics: dict[str, Metric]
@@ -204,7 +247,10 @@ class Detector:
     ) -> List[Anomaly]:
         """
         Flag an anomaly if too many ERROR lines appear in the log batch.
-        Uses a lower severity than metric checks (logs are noisy).
+
+        For FileCollector, every Log is already a traceback — so this acts
+        as a secondary confirmation check. For MockCollector / live backends
+        it's the primary log-level check.
         """
         error_logs = [l for l in logs if l.level == "ERROR"]
         count = len(error_logs)

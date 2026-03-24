@@ -20,6 +20,10 @@ Event flow
         groq_analyzer.analyze(...)         → IncidentAnalysis  ← LLM step
             patches Incident.severity, description, metadata
         EventBus.publish(INCIDENT_CREATED)
+
+    INCIDENT_CREATED event data includes:
+        "files_to_fix" : [{"file": "deploy.py", "line": 47, ...}, ...]
+        ← populated from CI/CD log tracebacks when collector_backend="file"
 """
 
 import asyncio
@@ -45,11 +49,12 @@ class MonitoringAgent(BaseAgent):
     Polls all configured services and fires INCIDENT_CREATED events
     when anomalies are detected.
 
-    Example:
+    File backend example (CI/CD log monitoring):
         config = MonitoringConfig(
             services=["auth-api", "payments-api"],
             poll_interval=30.0,
-            collector_backend="mock",
+            collector_backend="file",
+            log_dir="logs",           # logs/auth-api/*.log, logs/payments-api/*.log
         )
         agent = MonitoringAgent(
             event_bus=bus,
@@ -57,6 +62,12 @@ class MonitoringAgent(BaseAgent):
             config=config,
         )
         await agent.start()
+
+    Mock backend example (development):
+        config = MonitoringConfig(
+            services=["auth-api"],
+            collector_backend="mock",
+        )
     """
 
     def __init__(
@@ -142,8 +153,6 @@ class MonitoringAgent(BaseAgent):
         Runs until the agent is stopped.
 
         Sleep-first design: waits one full interval before the first poll.
-        This prevents a double-poll when tests call _poll_service() manually
-        right after start(), and gives the agent time to settle in production.
         """
         self.logger.info(
             "[MonitoringAgent] Poll loop running — first poll in %.0fs",
@@ -222,7 +231,7 @@ class MonitoringAgent(BaseAgent):
             )
 
             # 5. Enrich with Groq LLM — replaces severity, description,
-            #    adds full report to metadata. Falls back gracefully.
+            #    adds full report + files_to_fix to metadata.
             analysis = await self._analyzer.analyze(
                 service   = service,
                 anomalies = anomalies,
@@ -232,18 +241,23 @@ class MonitoringAgent(BaseAgent):
             incident.severity    = analysis.severity
             incident.description = analysis.root_cause
             incident.metadata["llm_analysis"] = {
-                "model":       analysis.model,
-                "severity":    analysis.severity.value,
-                "root_cause":  analysis.root_cause,
-                "impact":      analysis.impact,
-                "recommended": analysis.recommended,
-                "confidence":  analysis.confidence,
-                "report":      analysis.report,
-                "fallback":    analysis.fallback,
+                "model"       : analysis.model,
+                "severity"    : analysis.severity.value,
+                "root_cause"  : analysis.root_cause,
+                "impact"      : analysis.impact,
+                "recommended" : analysis.recommended,
+                "confidence"  : analysis.confidence,
+                "report"      : analysis.report,
+                "files_to_fix": analysis.files_to_fix,
+                "fallback"    : analysis.fallback,
             }
             self.logger.info(
-                "[MonitoringAgent] Groq: severity=%s confidence=%.0f%% fallback=%s",
-                analysis.severity.value, analysis.confidence * 100, analysis.fallback,
+                "[MonitoringAgent] Groq: severity=%s confidence=%.0f%% "
+                "files_to_fix=%d fallback=%s",
+                analysis.severity.value,
+                analysis.confidence * 100,
+                len(analysis.files_to_fix),
+                analysis.fallback,
             )
 
             # 6. Track it
@@ -260,6 +274,7 @@ class MonitoringAgent(BaseAgent):
                 self._context_manager.add_logs(incident.incident_id, logs)
 
             # 9. Publish event → Orchestrator picks it up
+            #    "files_to_fix" is the key new field — exact locations to fix
             await self.publish(Event(
                 type        = EventType.INCIDENT_CREATED,
                 source      = self.name,
@@ -275,6 +290,8 @@ class MonitoringAgent(BaseAgent):
                     "report"       : analysis.report,
                     "anomaly_count": len(anomalies),
                     "llm_fallback" : analysis.fallback,
+                    # ← THE KEY OUTPUT: exact source locations to fix
+                    "files_to_fix" : analysis.files_to_fix,
                 },
             ))
 
@@ -287,6 +304,21 @@ class MonitoringAgent(BaseAgent):
             self.logger.warning(
                 "[MonitoringAgent] INCIDENT REPORT:\n%s", analysis.report
             )
+
+            # Log the files that need fixing — the primary developer-facing output
+            if analysis.files_to_fix:
+                self.logger.warning(
+                    "[MonitoringAgent] FILES TO FIX (%d):", len(analysis.files_to_fix)
+                )
+                for i, f in enumerate(analysis.files_to_fix, 1):
+                    self.logger.warning(
+                        "[MonitoringAgent]   [%d] %s line %s in %s() — %s",
+                        i,
+                        f.get("file", "?"),
+                        f.get("line", "?"),
+                        f.get("function", "?"),
+                        f.get("exception", ""),
+                    )
 
         except Exception as e:
             self.logger.error(
@@ -305,10 +337,17 @@ class MonitoringAgent(BaseAgent):
         if backend == "mock":
             return MockCollector()
 
-        # Future backends — raise clearly so the developer knows what to add
+        if backend == "file":
+            # Import here to avoid circular imports at module load time
+            from file_collector import FileCollector
+            return FileCollector(
+                log_dir     = self._config.log_dir,
+                log_pattern = self._config.log_pattern,
+            )
+
         raise ValueError(
             f"Unknown collector backend: '{backend}'. "
-            f"Supported: 'mock'. "
+            f"Supported: 'mock', 'file'. "
             f"Add PrometheusCollector / DatadogCollector in collector.py."
         )
 
@@ -327,6 +366,7 @@ class MonitoringAgent(BaseAgent):
             "services"        : self._config.services,
             "poll_interval"   : self._config.poll_interval,
             "backend"         : self._config.collector_backend,
+            "log_dir"         : self._config.log_dir if self._config.collector_backend == "file" else None,
             "active_incidents": self._active_incidents,
             "groq_enabled"    : self._analyzer.available,
             "groq_model"      : self._analyzer._model,

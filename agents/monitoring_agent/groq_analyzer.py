@@ -1,7 +1,7 @@
 """
 agents/monitoring_agent/groq_analyzer.py
 -----------------------------------------
-Sends detected anomalies to Groq (llama3-70b-8192) and returns a
+Sends detected anomalies to Groq (llama-3.3-70b-versatile) and returns a
 structured IncidentAnalysis containing:
 
     - severity       : re-assessed from all anomaly signals together
@@ -10,6 +10,8 @@ structured IncidentAnalysis containing:
     - recommended    : one sentence — the best immediate action
     - confidence     : 0.0 – 1.0 float
     - report         : 4-6 sentence human-readable incident report
+    - files_to_fix   : list of {file, line, function, exception} dicts
+                       — present when CI/CD log tracebacks are available
 
 Called by MonitoringAgent._poll_service() AFTER anomalies are detected
 and AFTER the IncidentFactory creates the base Incident, but BEFORE the
@@ -23,30 +25,15 @@ If GROQ_API_KEY is missing or the API call fails for any reason,
 GroqAnalyzer.analyze() returns a FallbackAnalysis built from the
 Detector's rule-based output — no exception is raised, the agent
 continues normally.
-
-Usage
------
-    analyzer = GroqAnalyzer(api_key=os.getenv("GROQ_API_KEY"))
-
-    analysis = await analyzer.analyze(
-        service   = "auth-api",
-        anomalies = anomalies,   # List[Anomaly] from Detector
-        metrics   = metrics,     # List[Metric]  from Collector
-        logs      = logs,        # List[Log]     from Collector
-    )
-
-    print(analysis.severity)    # Severity.CRITICAL
-    print(analysis.report)      # full paragraph
-    print(analysis.confidence)  # 0.91
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import aiohttp
 
@@ -74,21 +61,29 @@ class IncidentAnalysis:
     Structured output from the Groq LLM.
     Replaces the rule-based severity and description on the Incident.
     Stored in Incident.metadata["llm_analysis"] for downstream agents.
+
+    New field: files_to_fix
+        When the FileCollector is in use, the LLM extracts a prioritised
+        list of source files to fix from the traceback evidence in the logs.
+        Each entry: {"file": "deploy.py", "line": 47, "function": "run_pipeline",
+                     "exception": "KeyError: 'AWS_REGION'"}
     """
-    severity:    Severity
-    root_cause:  str
-    impact:      str
-    recommended: str
-    confidence:  float
-    report:      str
-    model:       str = GROQ_MODEL
-    fallback:    bool = False   # True when rule-based fallback was used
+    severity     : Severity
+    root_cause   : str
+    impact       : str
+    recommended  : str
+    confidence   : float
+    report       : str
+    files_to_fix : List[dict] = field(default_factory=list)
+    model        : str = GROQ_MODEL
+    fallback     : bool = False   # True when rule-based fallback was used
 
     def __str__(self):
         return (
             f"IncidentAnalysis("
             f"severity={self.severity.value}, "
             f"confidence={self.confidence:.0%}, "
+            f"files_to_fix={len(self.files_to_fix)}, "
             f"fallback={self.fallback})"
         )
 
@@ -113,11 +108,62 @@ def _build_prompt(
         for m in metrics
     )
 
-    error_logs = [l for l in logs if l.level == "ERROR"][:8]
-    log_lines = "\n".join(
-        f"  - [{l.level}] {l.message}"
-        for l in error_logs
-    ) or "  No ERROR log lines in this batch"
+    # Split logs into traceback-enriched (from FileCollector) and plain ERROR logs
+    traceback_logs = [l for l in logs if l.level == "ERROR" and "fix_here" in (l.metadata or {})]
+    plain_error_logs = [l for l in logs if l.level == "ERROR" and "fix_here" not in (l.metadata or {})]
+
+    has_tracebacks = bool(traceback_logs)
+
+    # Build traceback section — this is the primary "files to fix" signal
+    if traceback_logs:
+        tb_section_lines = []
+        for i, log in enumerate(traceback_logs[:8], 1):
+            m = log.metadata or {}
+            tb_section_lines.append(
+                f"  [{i}] {m.get('exception', 'Exception')} in "
+                f"{m.get('file', '?')} line {m.get('line', '?')} "
+                f"in {m.get('function', '?')}()"
+            )
+            tb_section_lines.append(f"      Message  : {log.message}")
+            tb_section_lines.append(f"      Fix here : {m.get('fix_here', '?')}")
+            if m.get("full_traceback"):
+                # Include just the last 3 lines of the traceback for context
+                tb_tail = "\n".join(m["full_traceback"].splitlines()[-3:])
+                tb_section_lines.append(f"      Traceback tail:\n{tb_tail}")
+            tb_section_lines.append("")
+        tb_section = "\n".join(tb_section_lines)
+    else:
+        error_logs = plain_error_logs[:8]
+        tb_section = "\n".join(
+            f"  - [{l.level}] {l.message}" for l in error_logs
+        ) or "  No ERROR log lines in this batch"
+
+    traceback_instruction = (
+        """
+TRACEBACK ANALYSIS REQUIRED:
+The logs above contain real Python tracebacks from a CI/CD pipeline failure.
+For each traceback, identify the exact file and line to fix.
+Populate the "files_to_fix" array in your response with ALL unique fix locations.
+Order them by priority (most likely root cause first).
+"""
+        if has_tracebacks
+        else ""
+    )
+
+    files_to_fix_schema = (
+        """
+  "files_to_fix": [
+    {
+      "file": "deploy.py",
+      "line": 47,
+      "function": "run_pipeline",
+      "exception": "KeyError: 'AWS_REGION'",
+      "fix_description": "One sentence — what needs to change in this file"
+    }
+  ],"""
+        if has_tracebacks
+        else '  "files_to_fix": [],'
+    )
 
     return f"""You are an expert SRE analyzing a live production incident.
 
@@ -130,9 +176,9 @@ DETECTED ANOMALIES:
 CURRENT METRICS:
 {metric_lines}
 
-RECENT ERROR LOGS ({len(error_logs)} lines):
-{log_lines}
-
+{"TRACEBACKS FROM CI/CD LOGS (" + str(len(traceback_logs)) + " found):" if has_tracebacks else "RECENT ERROR LOGS:"}
+{tb_section}
+{traceback_instruction}
 Analyze this incident. Respond with ONLY a valid JSON object — no markdown fences, no explanation outside the JSON.
 
 {{
@@ -141,13 +187,14 @@ Analyze this incident. Respond with ONLY a valid JSON object — no markdown fen
   "impact": "One sentence — what users or systems are affected right now",
   "recommended_action": "One sentence — the single best immediate action",
   "confidence": 0.0,
-  "incident_report": "4-6 sentence human-readable report. Cover: what happened, likely cause, blast radius, and recommended action. Write for an on-call engineer woken at 3am."
+  "incident_report": "4-6 sentence human-readable report. Cover: what happened, likely cause, blast radius, and recommended action. Write for an on-call engineer woken at 3am. Reference specific file names and line numbers if tracebacks are present.",{files_to_fix_schema}
 }}
 
 Rules:
 - severity must be exactly: low | medium | high | critical
 - confidence must be a float 0.0–1.0
 - Be specific — reference the actual metric values and service name above
+- If tracebacks are present, always reference the exact file:line in root_cause and recommended_action
 - incident_report must be readable without any context beyond this JSON
 """
 
@@ -166,8 +213,6 @@ class GroqAnalyzer:
         model:    str = GROQ_MODEL,
         timeout:  int = 30,
     ):
-        # Use api_key if explicitly provided (even empty string means "no key").
-        # Only fall back to env var when api_key is None (not provided at all).
         if api_key is None:
             self._api_key = os.getenv("GROQ_API_KEY", "")
         else:
@@ -197,7 +242,7 @@ class GroqAnalyzer:
         Never raises — falls back gracefully if Groq is unavailable.
         """
         if not self.available:
-            return self._fallback(anomalies, service)
+            return self._fallback(anomalies, logs, service)
 
         try:
             return await self._call_groq(service, anomalies, metrics, logs)
@@ -205,7 +250,7 @@ class GroqAnalyzer:
             logger.error(
                 "[GroqAnalyzer] API call failed (%s) — using fallback", exc
             )
-            return self._fallback(anomalies, service)
+            return self._fallback(anomalies, logs, service)
 
     # ── private ───────────────────────────────────────────────────────────────
 
@@ -247,7 +292,6 @@ class GroqAnalyzer:
         return self._parse(raw)
 
     def _parse(self, raw: str) -> IncidentAnalysis:
-        # Strip accidental markdown fences
         clean = raw
         if clean.startswith("```"):
             clean = "\n".join(
@@ -263,23 +307,38 @@ class GroqAnalyzer:
         confidence = float(parsed.get("confidence", 0.7))
         confidence = max(0.0, min(1.0, confidence))
 
+        # files_to_fix: validate and normalise each entry
+        raw_files = parsed.get("files_to_fix", [])
+        files_to_fix = []
+        for entry in raw_files:
+            if isinstance(entry, dict) and entry.get("file"):
+                files_to_fix.append({
+                    "file"            : entry.get("file", ""),
+                    "line"            : int(entry.get("line", 0)),
+                    "function"        : entry.get("function", ""),
+                    "exception"       : entry.get("exception", ""),
+                    "fix_description" : entry.get("fix_description", ""),
+                })
+
         return IncidentAnalysis(
-            severity    = severity,
-            root_cause  = parsed.get("root_cause",        "Unknown root cause"),
-            impact      = parsed.get("impact",            "Impact unknown"),
-            recommended = parsed.get("recommended_action","Manual investigation required"),
-            confidence  = confidence,
-            report      = parsed.get("incident_report",   raw),
-            model       = self._model,
-            fallback    = False,
+            severity     = severity,
+            root_cause   = parsed.get("root_cause",        "Unknown root cause"),
+            impact       = parsed.get("impact",            "Impact unknown"),
+            recommended  = parsed.get("recommended_action","Manual investigation required"),
+            confidence   = confidence,
+            report       = parsed.get("incident_report",   raw),
+            files_to_fix = files_to_fix,
+            model        = self._model,
+            fallback     = False,
         )
 
     def _fallback(
         self,
         anomalies: list[Anomaly],
+        logs:      list[Any],
         service:   str,
     ) -> IncidentAnalysis:
-        """Rule-based fallback — mirrors what IncidentFactory already does."""
+        """Rule-based fallback — extracts fix locations from log metadata."""
         from agents.monitoring_agent.incident_factory import _SEVERITY_ORDER
 
         worst = max(
@@ -289,20 +348,48 @@ class GroqAnalyzer:
         sev = worst.severity
         msg = worst.message
 
+        # Extract files_to_fix from Log.metadata (populated by FileCollector)
+        files_to_fix = []
+        seen = set()
+        for log in logs:
+            if log.level == "ERROR" and log.metadata and "fix_here" in log.metadata:
+                key = log.metadata["fix_here"]
+                if key not in seen:
+                    seen.add(key)
+                    files_to_fix.append({
+                        "file"            : log.metadata.get("file", ""),
+                        "line"            : log.metadata.get("line", 0),
+                        "function"        : log.metadata.get("function", ""),
+                        "exception"       : log.metadata.get("exception", ""),
+                        "fix_description" : f"Exception raised at {key}",
+                    })
+
+        fix_summary = (
+            " Files to fix: " + ", ".join(
+                f"{f['file']}:{f['line']}" for f in files_to_fix[:5]
+            ) + "."
+            if files_to_fix else ""
+        )
+
         return IncidentAnalysis(
-            severity    = sev,
-            root_cause  = msg,
-            impact      = f"{service} is degraded — users may be affected",
-            recommended = "Investigate recent deployments and check downstream dependencies",
-            confidence  = 0.6,
-            report      = (
+            severity     = sev,
+            root_cause   = msg,
+            impact       = f"{service} is degraded — users may be affected",
+            recommended  = (
+                "Investigate recent deployments and check downstream dependencies."
+                + fix_summary
+            ),
+            confidence   = 0.6,
+            report       = (
                 f"{service} is experiencing an incident. "
-                f"{msg}. "
+                f"{msg}."
+                f"{fix_summary} "
                 f"Severity has been assessed as {sev.value}. "
                 f"Investigate recent deployments and check downstream dependencies. "
                 f"This assessment was generated by rule-based fallback "
                 f"(GROQ_API_KEY not set or API unavailable)."
             ),
-            model    = "fallback",
-            fallback = True,
+            files_to_fix = files_to_fix,
+            model        = "fallback",
+            fallback     = True,
         )
