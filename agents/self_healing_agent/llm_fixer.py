@@ -30,17 +30,18 @@ MODEL = "openai/gpt-oss-120b"
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _build_files_block(files_to_modify: List[Dict]) -> str:
-    """Render each file entry into a readable block for the prompt."""
+    """Render each file entry with its disk-read content for the prompt."""
     if not files_to_modify:
         return "No files provided."
 
     blocks = []
     for i, f in enumerate(files_to_modify, 1):
+        current = f.get("current_content", "").strip()
+        content_display = current if current else "(file does not exist yet — create it)"
         blocks.append(
             f"FILE {i}:\n"
-            f"  path   : {f.get('path', 'unknown')}\n"
-            f"  action : {f.get('action', 'unknown')}\n"
-            f"  content:\n{f.get('content', '').strip()}"
+            f"  path           : {f.get('path', 'unknown')}\n"
+            f"  current content:\n{content_display}"
         )
     return "\n\n".join(blocks)
 
@@ -193,9 +194,12 @@ def fix_files(incident_id: str, root_cause: str, healing_prompt: str,
 
     # ── step 2: build prompt ──────────────────────────────────────────────
     prompt = f"""You are a senior DevOps engineer operating as an autonomous self-healing agent.
-You have already diagnosed an incident. Your job now is to produce the exact new content
-for every file that must be changed to resolve the issue, AND the exact shell commands
-that must be executed AFTER the files are written to fully remediate the incident.
+You have already diagnosed an incident. Your job now is to:
+  1. Examine the CURRENT content of each file listed below (read directly from disk).
+  2. Decide the correct ACTION for each file: "overwrite" (replace entire file),
+     "append" (add to end of file), or "replace_line" (targeted line swap).
+  3. Produce the EXACT new content for every file, AND the shell commands
+     that must be executed AFTER the files are written to fully remediate the incident.
 
 ━━━━━━━━━━━━━━━━━━  ENVIRONMENT  ━━━━━━━━━━━━━━━━━━
 OPERATING SYSTEM : {os_name}
@@ -214,11 +218,17 @@ SUGGESTED COMMANDS (hints — refine or extend as needed):
 {commands_block}
 
 ━━━━━━━━━━━━━━━━━━  FILES TO MODIFY  ━━━━━━━━━━━━━━━━━━
+The current on-disk content of each file is shown below.
+Analyse it carefully to decide what change is required.
+
 {files_block}
 
 ━━━━━━━━━━━━━━━━━━  YOUR TASK  ━━━━━━━━━━━━━━━━━━
 For EVERY file listed above:
-  • Apply the required action (replace_line / append / overwrite).
+  • Choose the most appropriate action:
+      - "overwrite"     — replace the entire file (use when restructuring or rewriting)
+      - "append"        — add lines to the end (use when only adding new content)
+      - "replace_line"  — swap specific lines (use for small, targeted fixes)
   • Produce the COMPLETE new file content — no placeholders, no ellipsis.
   • Preserve all lines that do not need to change.
 
@@ -246,7 +256,7 @@ MODIFIED_FILES:
 [
   {{
     "path": "<same path as above>",
-    "action": "<same action as above>",
+    "action": "<overwrite | append | replace_line>",
     "new_content": "<full file text with \\n for newlines>"
   }}
 ]

@@ -26,8 +26,8 @@ class Solution:
     created_at: datetime = field(default_factory=datetime.utcnow)
      # ── NEW FIELDS ──────────────────────────────────────
     files_to_modify: List[Dict] = field(default_factory=list)
-        # Each entry:  {"path": str, "action": str, "content": str}
-        # action = "replace_line" | "append" | "overwrite"
+        # Each entry:  {"path": str}
+        # The agent reads file content from disk; the LLM decides the action.
         
     def __str__(self):
         return (

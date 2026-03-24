@@ -210,6 +210,8 @@ class SelfHealingAgent:
     def _guard_solution(self, solution: Solution) -> List[str]:
         """
         Ensure the Solution is actionable before hitting the LLM.
+        Only a valid 'path' is required per entry — content is read from
+        disk and action is decided by the LLM Fixer.
 
         Returns a list of error strings (empty = all good).
         """
@@ -221,15 +223,8 @@ class SelfHealingAgent:
 
         for i, f in enumerate(solution.files_to_modify):
             tag = f"files_to_modify[{i}]"
-
             if not f.get("path", "").strip():
                 errors.append(f"{tag} missing 'path'.")
-
-            if not f.get("action", "").strip():
-                errors.append(f"{tag} missing 'action'.")
-
-            if not f.get("content", "").strip():
-                errors.append(f"{tag} missing 'content' — no context for the LLM.")
 
         return errors
 
@@ -239,13 +234,13 @@ class SelfHealingAgent:
 
     def _snapshot_files(self, files_to_modify: List[Dict]) -> Dict[str, str]:
         """
-        Read each file from disk and store its current content.
-        If a file does not exist yet (action=overwrite / new file),
-        old_content is stored as an empty string.
+        Read each file from disk, store its current content as the snapshot,
+        and attach it back onto the entry dict under 'current_content' so the
+        LLM Fixer can see the full file before deciding what action to take.
 
         Returns
         -------
-        dict mapping path → old_content
+        dict mapping path → current_content (empty string if file not found)
         """
         snapshots: Dict[str, str] = {}
 
@@ -254,18 +249,22 @@ class SelfHealingAgent:
             if os.path.isfile(path):
                 try:
                     with open(path, "r", encoding="utf-8") as fh:
-                        snapshots[path] = fh.read()
+                        content = fh.read()
+                    snapshots[path] = content
+                    f["current_content"] = content          # feed to LLM Fixer
                     logger.debug(f"[SelfHealingAgent] Snapshot OK: {path}")
                 except OSError as e:
                     logger.warning(
                         f"[SelfHealingAgent] Could not read {path}: {e}"
                     )
                     snapshots[path] = ""
+                    f["current_content"] = ""
             else:
                 logger.debug(
                     f"[SelfHealingAgent] File not found (new file?): {path}"
                 )
                 snapshots[path] = ""
+                f["current_content"] = ""                   # new file — nothing yet
 
         return snapshots
 
@@ -330,14 +329,8 @@ class SelfHealingAgent:
 
         old_content comes from the disk snapshot.
         new_content comes from the LLM response.
-        action comes from the original Solution entry.
+        action comes from the LLM response (it decided based on the file content).
         """
-        # Build a quick lookup: path → action from the original Solution
-        action_map: Dict[str, str] = {
-            f["path"]: f.get("action", "overwrite")
-            for f in original_files
-        }
-
         results = []
         for entry in modified_files:
             path = entry["path"].strip()
@@ -346,7 +339,7 @@ class SelfHealingAgent:
                     path=path,
                     old_content=snapshots.get(path, ""),
                     new_content=entry.get("new_content", ""),
-                    action=action_map.get(path, entry.get("action", "overwrite")),
+                    action=entry.get("action", "overwrite"),   # LLM-decided action
                 )
             )
 
