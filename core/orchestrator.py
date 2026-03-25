@@ -45,6 +45,8 @@ from core.approval_manager import ApprovalManager
 # FileToFix lives in self_healing/models.py — imported here to convert
 # monitoring dicts → typed objects before passing to self-healing agent
 from agents.self_healing_agent.models import FileToFix, Solution as SHSolution
+from agents.monitoring_agent.agent import MonitoringAgent
+from agents.monitoring_agent.config import MonitoringConfig
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,7 @@ class Orchestrator:
         self._running        = False
 
         self._subscribe_to_events()
+        self._register_monitoring_agent()
         logger.info("Orchestrator initialized")
     
     def _subscribe_to_events(self) -> None:
@@ -75,6 +78,51 @@ class Orchestrator:
         self.registry.register(name, agent, metadata)
         self.state_manager.set_agent_status(name, AgentStatus.IDLE)
         logger.info(f"[Orchestrator] Agent registered: '{name}'")
+
+    def _register_monitoring_agent(self) -> None:
+        """
+        Instantiate and register the MonitoringAgent if it has not already
+        been registered externally (e.g. from main.py).
+
+        The agent is started lazily the first time it is needed so that the
+        event loop is already running at that point.  Call
+        ``await orchestrator.start_monitoring_agent()`` from your async
+        entrypoint (or from main.py) to begin the poll loop immediately.
+        """
+        if self.registry.get_agent("monitoring_agent"):
+            return  # already registered externally — do not overwrite
+
+        config = MonitoringConfig(
+            collector_backend="file",
+            log_dir="logs",
+        )
+        agent = MonitoringAgent(
+            event_bus       = self.event_bus,
+            registry        = self.registry,
+            config          = config,
+            context_manager = self.context_manager,
+            state_manager   = self.state_manager,
+        )
+        self.registry.register("monitoring_agent", agent)
+        self.state_manager.set_agent_status("monitoring_agent", AgentStatus.IDLE)
+        logger.info("[Orchestrator] MonitoringAgent registered automatically")
+
+    async def start_monitoring_agent(self) -> None:
+        """
+        Start the MonitoringAgent's background poll loop and dashboard.
+        Call this once from your async entrypoint after ``await orchestrator.start()``.
+
+        If the agent has already been started this is a no-op.
+        """
+        agent = self.registry.get_agent("monitoring_agent")
+        if agent is None:
+            logger.error("[Orchestrator] MonitoringAgent not found in registry")
+            return
+        if getattr(agent, "_poll_task", None) and not agent._poll_task.done():
+            logger.debug("[Orchestrator] MonitoringAgent already running — skipping start")
+            return
+        await agent.start()
+        logger.info("[Orchestrator] MonitoringAgent started")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -257,8 +305,11 @@ class Orchestrator:
 
                 monitoring_agent = self.registry.get_agent("monitoring_agent")
                 if not monitoring_agent:
-                    logger.warning("[Orchestrator] Monitoring Agent not registered")
+                    logger.error("[Orchestrator] MonitoringAgent not registered — cannot analyze logs")
                     return
+
+                # Ensure the poll loop is running (idempotent)
+                await self.start_monitoring_agent()
 
                 self.state_manager.set_agent_status("monitoring_agent", AgentStatus.RUNNING)
                 try:
@@ -270,6 +321,9 @@ class Orchestrator:
                         print(f"    service  : {incident.service}")
                         print(f"    severity : {incident.severity.value}")
                         print(f"    desc     : {incident.description}")
+                        files_to_fix = incident.metadata.get("llm_analysis", {}).get("files_to_fix", [])
+                        if files_to_fix:
+                            print(f"    files    : {[f['file']+':'+str(f['line']) for f in files_to_fix[:5]]}")
                         print(f"  ----------------------\n")
                         await self.handle_incident(incident)
                     else:
@@ -334,6 +388,9 @@ class Orchestrator:
 
         print(f"\n  Pushing to: {repo_url}")
 
+        # Labels listed here are allowed to fail without stopping the pipeline
+        _OPTIONAL = {"remove old remote (ok if fails)", "git commit"}
+
         steps = [
             (["git", "init"],                                    "git init"),
             (["git", "add", "."],                                "git add"),
@@ -346,7 +403,7 @@ class Orchestrator:
 
         for cmd, label in steps:
             code, out = run(cmd, project_path)
-            if code != 0 and "remove old remote" not in label:
+            if code != 0 and label not in _OPTIONAL:
                 print(f"  Failed at [{label}]: {out.strip()[:200]}")
                 return False
             else:
@@ -360,17 +417,25 @@ class Orchestrator:
     async def handle_incident(self, incident: Incident) -> None:
         """
         Entry point when an Incident object is already built
-        (e.g. called directly from CI/CD scaffold flow).
+        (e.g. called directly from CI/CD scaffold flow via analyze_logs()).
 
-        For the normal event-driven path (MonitoringAgent → EventBus),
-        incidents arrive via _on_incident_created instead.
+        Preserves any context the MonitoringAgent already created so we
+        don't overwrite metrics/logs that were already stored.
         """
         logger.info(f"[Orchestrator] Handling: {incident}")
 
         self.state_manager.add_incident(incident)
         self.state_manager.update_incident_status(incident.incident_id, IncidentStatus.INVESTIGATING)
-        self.context_manager.create_context(incident)
 
+        # Only create context if monitoring agent hasn't already done so
+        if not self.context_manager.get_context(incident.incident_id):
+            self.context_manager.create_context(incident)
+            self.context_manager.add_metrics(incident.incident_id, incident.metrics)
+            self.context_manager.add_logs(incident.incident_id, incident.logs)
+
+        # Forward the full LLM payload so _on_incident_created can use
+        # files_to_fix, impact, report without a second round-trip
+        llm = incident.metadata.get("llm_analysis", {})
         await self.event_bus.publish(Event(
             type=EventType.INCIDENT_CREATED,
             source="orchestrator",
@@ -380,9 +445,11 @@ class Orchestrator:
                 "service"     : incident.service,
                 "severity"    : incident.severity.value,
                 "description" : incident.description,
-                # No files_to_fix here — this path comes from pre-built Incident objects.
-                # When MonitoringAgent publishes directly, files_to_fix is in event.data.
-                "files_to_fix": [],
+                "files_to_fix": llm.get("files_to_fix", []),
+                "report"      : llm.get("report", ""),
+                "impact"      : llm.get("impact", ""),
+                "recommended" : llm.get("recommended", ""),
+                "confidence"  : llm.get("confidence", 0.0),
             }
         ))
 
@@ -434,8 +501,21 @@ class Orchestrator:
 
         self.state_manager.set_agent_status("knowledge_agent", AgentStatus.RUNNING)
 
-        # error_message is what the Knowledge Agent uses for RAG lookup
-        error_message = event.data.get("description", "")
+        # error_message is what the Knowledge Agent uses for RAG lookup.
+        # Enrich with the Groq report and impact so Qdrant gets richer context.
+        description = event.data.get("description", "")
+        report      = event.data.get("report", "")
+        impact      = event.data.get("impact", "")
+        recommended = event.data.get("recommended", "")
+
+        error_parts = [description]
+        if report:
+            error_parts.append(f"Incident report: {report}")
+        if impact:
+            error_parts.append(f"Impact: {impact}")
+        if recommended:
+            error_parts.append(f"Recommended: {recommended}")
+        error_message = "\n".join(error_parts)
 
         try:
             # ── call KnowledgeAgent — pure RAG, no event bus ───────────
