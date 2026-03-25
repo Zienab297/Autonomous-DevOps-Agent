@@ -171,6 +171,13 @@ class AgentRegistry:
         """Check if an Agent is registered."""
         return name in self._agents
 
+    def heartbeat(self, name: str) -> None:
+        """Update last_active timestamp for a registered Agent."""
+        record = self._agents.get(name)
+        if record:
+            from datetime import datetime
+            record.last_active = datetime.utcnow()
+
     # ============================================================
     # Summary
     # ============================================================

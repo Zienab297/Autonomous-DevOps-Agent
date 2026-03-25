@@ -111,6 +111,7 @@ class Detector:
 
         # --- Log checks ---
         anomalies += self._check_log_errors(service, logs)
+        anomalies += self._check_cicd_conclusion(service, logs)
 
         if anomalies:
             logger.warning(
@@ -280,6 +281,65 @@ class Detector:
             evidence_logs = error_logs[:10],  # keep first 10 as evidence
         )
         return [anomaly]
+
+    def _check_cicd_conclusion(
+        self, service: str, logs: List[Log]
+    ) -> List[Anomaly]:
+        """
+        Detects CI/CD pipeline failures from structured step summary lines.
+
+        GitHub Actions / CI agents emit lines like:
+            conclusion=failure
+            conclusion=skipped   (skipped because a prior step failed)
+            status=completed conclusion=failure
+
+        These don't look like ERROR log lines but DO indicate a real failure.
+        This check fires even with just 1 failure line — CI/CD failures are
+        always worth an incident regardless of total log volume.
+        """
+        failure_logs  = []
+        skipped_logs  = []
+        pipeline_failed = False
+
+        for log in logs:
+            msg_lower = log.message.lower()
+            # Top-level pipeline failure
+            if "status=completed" in msg_lower and "conclusion=failure" in msg_lower:
+                pipeline_failed = True
+                failure_logs.append(log)
+            # Individual step failure
+            elif "conclusion=failure" in msg_lower:
+                failure_logs.append(log)
+            # Skipped steps are a secondary signal (caused by the failure)
+            elif "conclusion=skipped" in msg_lower:
+                skipped_logs.append(log)
+
+        if not failure_logs:
+            return []
+
+        # Severity: pipeline-level failure is HIGH, step-level is MEDIUM
+        severity = Severity.HIGH if pipeline_failed else Severity.MEDIUM
+
+        failed_steps = [
+            l.message.strip() for l in failure_logs[:5]
+        ]
+        skipped_count = len(skipped_logs)
+
+        message = (
+            f"CI/CD pipeline failure: {len(failure_logs)} step(s) failed"
+            + (f", {skipped_count} skipped" if skipped_count else "")
+            + f" [{severity.value}]"
+        )
+
+        return [Anomaly(
+            service       = service,
+            metric_name   = "cicd_conclusion",
+            current_value = float(len(failure_logs)),
+            threshold     = 1.0,
+            severity      = severity,
+            message       = message,
+            evidence_logs = (failure_logs + skipped_logs)[:10],
+        )]
 
     # --------------------------------------------------------
     # Helper

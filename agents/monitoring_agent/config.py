@@ -42,8 +42,10 @@ class ThresholdConfig:
     # Raise this if you have noisy logs with expected non-fatal exceptions.
     traceback_count_threshold: int = 1
 
-    # Minimum number of anomalous log lines to trigger an incident (mock/live backends)
-    log_error_count_threshold: int = 5
+    # Minimum number of anomalous log lines to trigger an incident (mock/live backends).
+    # Kept at 1 so that even a single CI/CD failure step triggers an incident.
+    # Raise this value if your live services produce noisy non-fatal ERROR logs.
+    log_error_count_threshold: int = 1
 
 
 @dataclass
