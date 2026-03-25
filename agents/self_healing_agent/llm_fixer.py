@@ -4,8 +4,8 @@ self_healing/llm_fixer.py
 Called by the Self-Healing Agent after a Solution is produced.
 Receives root_cause, healing_prompt, suggested_commands, and files_to_modify.
 
-Step 1: Build a structured prompt for Ollama (senior DevOps persona)
-Step 2: Call Ollama to generate new file contents + remediation steps + remediation commands
+Step 1: Build a structured prompt for the LLM (senior DevOps persona)
+Step 2: Call the LLM to generate new file contents + remediation steps + remediation commands
 Step 3: Parse the response and return LLMFixResponse
 """
 import sys, os
@@ -16,32 +16,54 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Optional
 
-from models import LLMFixResponse
+from models import LLMFixResponse, FileToFix
 from groq import Groq
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))  # or set GROQ_API_KEY env variable
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
 # ── constant ──────────────────────────────────────────────────────────────────
 MODEL = "openai/gpt-oss-120b"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _build_files_block(files_to_modify: List[Dict]) -> str:
-    """Render each file entry with its disk-read content for the prompt."""
+def _build_files_block(files_to_modify: List[FileToFix]) -> str:
+    """
+    Render each FileToFix entry with its full enrichment for the prompt.
+
+    Shows the LLM:
+      - exact path to modify
+      - line number, function, and exception from the traceback
+      - one-line fix hint from the monitoring agent
+      - current on-disk content so the LLM can decide the correct action
+    """
     if not files_to_modify:
         return "No files provided."
 
     blocks = []
     for i, f in enumerate(files_to_modify, 1):
-        current = f.get("current_content", "").strip()
+        current = f.current_content.strip()
         content_display = current if current else "(file does not exist yet — create it)"
+
+        # Build the enrichment lines — only include fields that have a value
+        enrichment_lines = []
+        if f.line:
+            enrichment_lines.append(f"  fix at         : line {f.line}" + (f"  in {f.function}()" if f.function else ""))
+        if f.exception:
+            enrichment_lines.append(f"  exception      : {f.exception}")
+        if f.fix_description:
+            enrichment_lines.append(f"  hint           : {f.fix_description}")
+
+        enrichment_block = "\n".join(enrichment_lines)
+
         blocks.append(
             f"FILE {i}:\n"
-            f"  path           : {f.get('path', 'unknown')}\n"
-            f"  current content:\n{content_display}"
+            f"  path           : {f.path}\n"
+            + (enrichment_block + "\n" if enrichment_block else "")
+            + f"  current content:\n{content_display}"
         )
     return "\n\n".join(blocks)
 
@@ -85,7 +107,6 @@ def _parse_steps(text: str) -> List[str]:
             if any(stripped.startswith(h) for h in ("MODIFIED_FILES:", "CONFIDENCE:", "REMEDIATION_COMMANDS:")):
                 break
             if stripped and stripped[0].isdigit():
-                # strip leading "1. " / "1) "
                 step = stripped.lstrip("0123456789").lstrip(".) ").strip()
                 if step:
                     steps.append(step)
@@ -105,14 +126,12 @@ def _parse_confidence(text: str) -> float:
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("CONFIDENCE:"):
-            # try same line first: "CONFIDENCE: 0.85"
             inline = stripped.split(":", 1)[1].strip()
             if inline:
                 try:
                     return max(0.0, min(1.0, float(inline)))
                 except ValueError:
                     pass
-            # try next non-empty line: "CONFIDENCE:\n0.85"
             for j in range(i + 1, len(lines)):
                 next_val = lines[j].strip()
                 if next_val:
@@ -148,7 +167,6 @@ def _parse_remediation_commands(text: str) -> List[Dict]:
     if not isinstance(commands, list):
         return []
 
-    # Normalise: ensure every entry has the expected keys with safe defaults
     normalised = []
     for i, cmd in enumerate(commands):
         if not isinstance(cmd, dict) or not cmd.get("command"):
@@ -160,15 +178,19 @@ def _parse_remediation_commands(text: str) -> List[Dict]:
             "on_failure":  cmd.get("on_failure", "abort"),
         })
 
-    # Return in execution order
     normalised.sort(key=lambda c: c["order"])
     return normalised
 
 
 # ── main entry ────────────────────────────────────────────────────────────────
 
-def fix_files(incident_id: str, root_cause: str, healing_prompt: str,
-              suggested_commands: List[str], files_to_modify: List[Dict]) -> LLMFixResponse:
+def fix_files(
+    incident_id        : str,
+    root_cause         : str,
+    healing_prompt     : str,
+    suggested_commands : List[str],
+    files_to_modify    : List[FileToFix],
+) -> LLMFixResponse:
     """
     Core fixer function.
 
@@ -178,7 +200,10 @@ def fix_files(incident_id: str, root_cause: str, healing_prompt: str,
     root_cause         : one-line diagnosis from the Knowledge Agent
     healing_prompt     : full narrative produced by the Knowledge Agent
     suggested_commands : shell/kubectl/docker commands already identified
-    files_to_modify    : list of {"path", "action", "content"} dicts
+    files_to_modify    : List[FileToFix] — each carries path, line, function,
+                         exception, fix_description, and current_content
+                         (current_content is populated from disk by
+                         SelfHealingAgent._snapshot_files() before this call)
 
     Returns
     -------
@@ -196,9 +221,11 @@ def fix_files(incident_id: str, root_cause: str, healing_prompt: str,
     prompt = f"""You are a senior DevOps engineer operating as an autonomous self-healing agent.
 You have already diagnosed an incident. Your job now is to:
   1. Examine the CURRENT content of each file listed below (read directly from disk).
-  2. Decide the correct ACTION for each file: "overwrite" (replace entire file),
+  2. Use the exact line number, function name, and exception type provided per file
+     to locate the precise change needed — do not guess.
+  3. Decide the correct ACTION for each file: "overwrite" (replace entire file),
      "append" (add to end of file), or "replace_line" (targeted line swap).
-  3. Produce the EXACT new content for every file, AND the shell commands
+  4. Produce the EXACT new content for every file, AND the shell commands
      that must be executed AFTER the files are written to fully remediate the incident.
 
 ━━━━━━━━━━━━━━━━━━  ENVIRONMENT  ━━━━━━━━━━━━━━━━━━
@@ -218,13 +245,20 @@ SUGGESTED COMMANDS (hints — refine or extend as needed):
 {commands_block}
 
 ━━━━━━━━━━━━━━━━━━  FILES TO MODIFY  ━━━━━━━━━━━━━━━━━━
-The current on-disk content of each file is shown below.
-Analyse it carefully to decide what change is required.
+Each file entry shows:
+  • path           — the file to modify
+  • fix at         — exact line number and function where the exception occurred
+  • exception      — the exception type and message raised at that location
+  • hint           — one-line description of what needs to change
+  • current content — the full on-disk content of the file right now
+
+Use "fix at", "exception", and "hint" together to make a precise, targeted fix.
 
 {files_block}
 
 ━━━━━━━━━━━━━━━━━━  YOUR TASK  ━━━━━━━━━━━━━━━━━━
 For EVERY file listed above:
+  • Use the line number and exception to find exactly what is broken.
   • Choose the most appropriate action:
       - "overwrite"     — replace the entire file (use when restructuring or rewriting)
       - "append"        — add lines to the end (use when only adding new content)
@@ -287,10 +321,10 @@ CONFIDENCE:
     raw = response.choices[0].message.content
 
     # ── step 4: parse response ────────────────────────────────────────────
-    modified_files        = _parse_json_block(raw, "MODIFIED_FILES") or []
-    steps                 = _parse_steps(raw)
-    remediation_commands  = _parse_remediation_commands(raw)
-    confidence            = _parse_confidence(raw)
+    modified_files       = _parse_json_block(raw, "MODIFIED_FILES") or []
+    steps                = _parse_steps(raw)
+    remediation_commands = _parse_remediation_commands(raw)
+    confidence           = _parse_confidence(raw)
 
     print(
         f"[LLMFixer] Done — "
@@ -301,10 +335,10 @@ CONFIDENCE:
     )
 
     return LLMFixResponse(
-        incident_id=incident_id,
-        modified_files=modified_files,
-        steps=steps,
-        remediation_commands=remediation_commands,
-        confidence=confidence,
-        raw_response=raw,
+        incident_id          = incident_id,
+        modified_files       = modified_files,
+        steps                = steps,
+        remediation_commands = remediation_commands,
+        confidence           = confidence,
+        raw_response         = raw,
     )

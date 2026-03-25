@@ -53,7 +53,6 @@ Usage (Layer 2 — fed into FileCollector → MonitoringAgent)
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -401,7 +400,7 @@ class LogParser:
             frame_match = _FRAME_RE.match(raw)
             if frame_match:
                 frames.append({
-                    "file": os.path.basename(frame_match.group("file")),
+                    "file": frame_match.group("file"),
                     "line": int(frame_match.group("line")),
                     "func": frame_match.group("func"),
                 })
