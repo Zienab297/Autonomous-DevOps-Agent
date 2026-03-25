@@ -27,6 +27,9 @@ Incident flow (Monitor → Knowledge → Self-Healing):
 
 import asyncio
 import logging
+import sys
+import pathlib
+from datetime import datetime
 from typing import Optional
 
 from core.models import (
@@ -63,6 +66,22 @@ class Orchestrator:
 
         self._subscribe_to_events()
         self._register_monitoring_agent()
+        self._register_knowledge_agent()
+
+        # ── Dashboard state ───────────────────────────────────────────────────
+        # Tracks pipeline stages and incidents so print_dashboard() can render
+        # a live summary at every major step without touching agent internals.
+        self._dashboard: dict = {
+            "started_at"  : datetime.utcnow(),
+            "stage"       : "idle",          # idle | scaffold | cicd | monitoring | incident | healing | done
+            "project"     : "",
+            "repo_url"    : "",
+            "cicd_status" : "",
+            "incidents"   : [],              # list of dicts added by _track_incident()
+            "agents"      : {},              # name → status string
+            "last_event"  : "",
+        }
+
         logger.info("Orchestrator initialized")
     
     def _subscribe_to_events(self) -> None:
@@ -124,6 +143,214 @@ class Orchestrator:
         await agent.start()
         logger.info("[Orchestrator] MonitoringAgent started")
 
+    def _register_knowledge_agent(self) -> None:
+        """
+        Instantiate and register the KnowledgeAgentAdapter if it has not
+        already been registered externally (e.g. from main.py).
+
+        Import is lazy so setup_path.py inside the knowledge_agent package
+        runs after the orchestrator module is fully loaded — avoiding the
+        sys.path race with other agents that also have a 'shared' package.
+
+        Also runs the ingestion pipeline on first boot if Qdrant is empty,
+        so the vector store is populated before the first incident is handled.
+        """
+        if self.registry.get_agent("knowledge_agent"):
+            return  # already registered externally — do not overwrite
+
+        try:
+            _ka_root = pathlib.Path(__file__).resolve().parent / "agents" / "knowledge_agent"
+            if str(_ka_root) not in sys.path:
+                sys.path.insert(0, str(_ka_root))
+
+            # ── populate Qdrant if needed (idempotent) ─────────────────────
+            try:
+                from agents.knowledge_agent.shared.config import load_config as _ka_cfg
+                from agents.knowledge_agent.ingestion.pipeline import run_pipeline
+                from qdrant_client import QdrantClient
+
+                _cfg    = _ka_cfg()
+                _client = QdrantClient(host=_cfg.qdrant_host, port=_cfg.qdrant_port)
+                _needs  = True
+                try:
+                    if _client.count(collection_name=_cfg.collection_name).count > 0:
+                        _needs = False
+                        logger.info("[Orchestrator] Qdrant already populated — skipping ingestion")
+                except Exception:
+                    pass
+                if _needs:
+                    logger.info("[Orchestrator] Populating Qdrant knowledge base (first run)...")
+                    run_pipeline()
+                    logger.info("[Orchestrator] Qdrant ingestion complete")
+            except Exception as ie:
+                logger.warning(
+                    "[Orchestrator] Knowledge base ingestion skipped: %s "
+                    "— queries will fall back to LLM + web search", ie
+                )
+
+            # ── register adapter ───────────────────────────────────────────
+            from agents.knowledge_agent.knowledge_core.knowledge_agent_adapter import KnowledgeAgentAdapter
+            agent = KnowledgeAgentAdapter()
+            self.registry.register("knowledge_agent", agent)
+            self.state_manager.set_agent_status("knowledge_agent", AgentStatus.IDLE)
+            logger.info("[Orchestrator] KnowledgeAgentAdapter registered successfully")
+
+        except Exception as exc:
+            logger.error(
+                "[Orchestrator] Failed to register KnowledgeAgentAdapter: %s — "
+                "check Qdrant (localhost:6333) and Ollama (localhost:11434) are running", exc
+            )
+
+    # ── Dashboard ─────────────────────────────────────────────────────────────
+
+    # ANSI helpers
+    _R  = "\033[0m"
+    _B  = "\033[1m"
+    _DM = "\033[2m"
+    _CY = "\033[36m"
+    _GR = "\033[32m"
+    _YL = "\033[33m"
+    _RD = "\033[31m"
+    _WH = "\033[97m"
+
+    _SEV_COL = {
+        "critical": "\033[31m", "high": "\033[31m",
+        "medium":   "\033[33m", "low":  "\033[32m",
+    }
+
+    def _dash(self, key: str, value) -> None:
+        """Update a single dashboard key."""
+        self._dashboard[key] = value
+
+    def _track_incident(self, incident_id: str, service: str, severity: str,
+                        description: str, status: str = "OPEN") -> None:
+        """Upsert an incident entry in the dashboard."""
+        for rec in self._dashboard["incidents"]:
+            if rec["id"] == incident_id:
+                rec["status"]   = status
+                rec["severity"] = severity
+                return
+        self._dashboard["incidents"].append({
+            "id"         : incident_id,
+            "service"    : service,
+            "severity"   : severity,
+            "description": description,
+            "status"     : status,
+            "at"         : datetime.utcnow().strftime("%H:%M:%S"),
+        })
+
+    def print_dashboard(self, event_line: str = "") -> None:
+        """
+        Print a full pipeline dashboard to stdout.
+        Called at every major stage transition so the developer always
+        knows where the system is without reading raw log lines.
+
+        Layout
+        ------
+        ╔══ AUTONOMOUS DEVOPS AGENT ══════════════════════════════════╗
+          Stage | Project | Repo | CI/CD | Uptime
+        ── AGENTS ──────────────────────────────────────────────────
+          monitoring_agent   IDLE
+          knowledge_agent    IDLE
+          ...
+        ── INCIDENTS ────────────────────────────────────────────────
+          INC-xxx  [CRITICAL]  auth-api  INVESTIGATING  ...
+        ── LAST EVENT ───────────────────────────────────────────────
+          ...
+        ╚════════════════════════════════════════════════════════════╝
+        """
+        B, R, DM, CY, GR, YL, RD, WH = (
+            self._B, self._R, self._DM, self._CY,
+            self._GR, self._YL, self._RD, self._WH,
+        )
+        W = 66
+
+        uptime_s = int((datetime.utcnow() - self._dashboard["started_at"]).total_seconds())
+        um, us   = divmod(uptime_s, 60)
+        uh, um   = divmod(um, 60)
+        uptime   = f"{uh:02d}:{um:02d}:{us:02d}"
+
+        stage_col = {
+            "idle": DM, "scaffold": CY, "cicd": CY,
+            "monitoring": YL, "incident": RD, "healing": YL, "done": GR,
+        }.get(self._dashboard["stage"], WH)
+
+        lines = []
+        sep = lambda c="─": f"  {c * W}"
+
+        # ── header ────────────────────────────────────────────────────────
+        lines.append(f"\n{B}{CY}  {'═' * W}{R}")
+        lines.append(
+            f"{B}{CY}  {'AUTONOMOUS DEVOPS AGENT':^{W}}{R}"
+        )
+        lines.append(f"{B}{CY}  {'═' * W}{R}")
+
+        # ── pipeline summary ──────────────────────────────────────────────
+        lines.append(
+            f"  {B}Stage   {R}: {stage_col}{self._dashboard['stage'].upper():<12}{R}"
+            f"  {DM}uptime {uptime}{R}"
+        )
+        if self._dashboard["project"]:
+            lines.append(f"  {B}Project {R}: {self._dashboard['project']}")
+        if self._dashboard["repo_url"]:
+            lines.append(f"  {B}Repo    {R}: {self._dashboard['repo_url']}")
+        if self._dashboard["cicd_status"]:
+            col = GR if "success" in self._dashboard["cicd_status"] else RD if "fail" in self._dashboard["cicd_status"] else YL
+            lines.append(f"  {B}CI/CD   {R}: {col}{self._dashboard['cicd_status']}{R}")
+
+        # ── agents ────────────────────────────────────────────────────────
+        lines.append(sep())
+        lines.append(f"  {B}AGENTS{R}")
+        all_agents = [
+            "scaffold_agent", "cicd_agent", "monitoring_agent",
+            "knowledge_agent", "self_healing_agent", "alerting_agent",
+        ]
+        for name in all_agents:
+            registered = self.registry.get_agent(name) is not None
+            raw_status = self._dashboard["agents"].get(name, "IDLE" if registered else "—")
+            if not registered:
+                col, sym = DM, "○"
+            elif raw_status in ("RUNNING",):
+                col, sym = YL, "▶"
+            elif raw_status in ("IDLE",):
+                col, sym = GR, "●"
+            else:
+                col, sym = DM, "○"
+            lines.append(
+                f"  {sym} {name:<24} {col}{raw_status}{R}"
+            )
+
+        # ── incidents ─────────────────────────────────────────────────────
+        lines.append(sep())
+        lines.append(f"  {B}INCIDENTS ({len(self._dashboard['incidents'])}){R}")
+        if not self._dashboard["incidents"]:
+            lines.append(f"  {GR}  No incidents{R}")
+        else:
+            for inc in self._dashboard["incidents"][-5:]:   # show last 5
+                sev = inc["severity"].lower()
+                sc  = self._SEV_COL.get(sev, WH)
+                st  = inc["status"]
+                st_col = GR if st == "RESOLVED" else RD if st == "FAILED" else YL
+                lines.append(
+                    f"  {DM}{inc['at']}{R}  "
+                    f"{sc}{B}[{inc['severity'].upper():<8}]{R}  "
+                    f"{inc['service']:<20}  "
+                    f"{st_col}{st:<14}{R}  "
+                    f"{DM}{inc['description'][:35]}{R}"
+                )
+
+        # ── last event ────────────────────────────────────────────────────
+        if event_line or self._dashboard["last_event"]:
+            msg = event_line or self._dashboard["last_event"]
+            lines.append(sep())
+            lines.append(f"  {B}LAST EVENT{R}")
+            lines.append(f"  {DM}{msg}{R}")
+
+        lines.append(f"  {B}{CY}{'═' * W}{R}\n")
+        print("\n".join(lines))
+        if event_line:
+            self._dash("last_event", event_line)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -147,6 +374,9 @@ class Orchestrator:
         ))
 
     async def _on_scaffold_started(self, event: Event) -> None:
+        self._dash("stage",   "scaffold")
+        self._dash("project", event.data.get("project_path", ""))
+        self.print_dashboard("ScaffoldAgent started")
         logger.info("[Orchestrator] SCAFFOLD_STARTED → ScaffoldAgent")
 
         scaffold_agent = self.registry.get_agent("scaffold_agent")
@@ -160,6 +390,7 @@ class Orchestrator:
             return
 
         self.state_manager.set_agent_status("scaffold_agent", AgentStatus.RUNNING)
+        self._dashboard["agents"]["scaffold_agent"] = "RUNNING"
         project_path = event.data.get("project_path")
         dry_run      = event.data.get("dry_run", False)
 
@@ -176,8 +407,10 @@ class Orchestrator:
                     "generated_files": [f.filename for f in result.generated_files],
                 },
             ))
+            self.print_dashboard(f"Scaffold complete — {result.framework.value} ({result.language.value}), {len(result.generated_files)} files generated")
         except Exception as e:
             logger.error(f"[Orchestrator] ScaffoldAgent failed: {e}")
+            self.print_dashboard(f"Scaffold FAILED: {e}")
             await self.event_bus.publish(Event(
                 type=EventType.SCAFFOLD_FAILED,
                 source="scaffold_agent",
@@ -185,6 +418,7 @@ class Orchestrator:
             ))
         finally:
             self.state_manager.set_agent_status("scaffold_agent", AgentStatus.IDLE)
+            self._dashboard["agents"]["scaffold_agent"] = "IDLE"
 
     async def _on_scaffold_complete(self, event: Event) -> None:
         files        = event.data.get("generated_files", [])
@@ -196,6 +430,8 @@ class Orchestrator:
         logger.info(f"[Orchestrator] SCAFFOLD_COMPLETE ({len(files)} files)")
 
         if dry_run:
+            self._dash("stage", "done")
+            self.print_dashboard("Dry-run complete — no CI/CD triggered")
             return
 
         approved = await self.approval.request_approval(
@@ -229,14 +465,17 @@ class Orchestrator:
             token=token,
         )
         if not pushed:
-            print("  Git push failed — stopping.\n")
+            self.print_dashboard("Git push failed — stopping")
             return
+
+        self._dash("repo_url", repo_url)
 
         cicd_agent = self.registry.get_agent("cicd_agent")
         if not cicd_agent:
             logger.info("[Orchestrator] CI/CD Agent not registered — pipeline running on GitHub")
-            print("\n  GitHub Actions workflow triggered by git push.")
-            print("  Register CI/CD Agent to collect logs.\n")
+            self._dash("stage", "cicd")
+            self._dash("cicd_status", "triggered (no log collection)")
+            self.print_dashboard("GitHub Actions triggered by push — register CI/CD Agent to collect logs")
             await self.event_bus.publish(Event(
                 type=EventType.DEPLOYMENT_COMPLETE,
                 source="orchestrator",
@@ -244,10 +483,11 @@ class Orchestrator:
             ))
             return
 
+        self._dash("stage", "cicd")
+        self._dash("cicd_status", "running")
+        self._dashboard["agents"]["cicd_agent"] = "RUNNING"
         self.state_manager.set_agent_status("cicd_agent", AgentStatus.RUNNING)
-        print("\n----------------------------------------------------------------")
-        print("  CI/CD — collecting logs from GitHub Actions")
-        print("----------------------------------------------------------------")
+        self.print_dashboard("CI/CD Agent collecting logs from GitHub Actions")
 
         try:
             repo = repo_url.replace("https://github.com/", "").replace(".git", "")
@@ -258,12 +498,12 @@ class Orchestrator:
             run = await self._get_latest_run(cicd_agent, repo, token)
 
             if not run:
-                print("  Could not find pipeline run — workflow may not have started yet")
+                self._dash("cicd_status", "no run found")
+                self.print_dashboard("Could not find pipeline run — workflow may not have started yet")
                 logs = []
             else:
-                print(f"  Run ID    : {run.id}")
-                print(f"  Status    : {run.status}")
-                print(f"  URL       : {run.url}")
+                print(f"  Run ID : {run.id}")
+                print(f"  URL    : {run.url}")
 
                 deadline = 120
                 elapsed  = 0
@@ -271,11 +511,12 @@ class Orchestrator:
                     await asyncio.sleep(8)
                     elapsed += 8
                     run = await cicd_agent.get_pipeline_status(run.id, repo)
+                    self._dash("cicd_status", f"{run.status} ({elapsed}s)")
                     print(f"  [{elapsed}s] status: {run.status}")
 
-                print(f"\n  Final status: {run.status}")
-
+                self._dash("cicd_status", run.status)
                 logs = await cicd_agent.collect_deployment_logs(run.id, repo)
+                self.print_dashboard(f"CI/CD finished — {run.status.upper()}, {len(logs)} log lines collected")
                 print(f"\n  -- CI/CD Logs ({len(logs)} lines) --")
                 for line in logs:
                     print(f"    {line}")
@@ -311,35 +552,47 @@ class Orchestrator:
                 # Ensure the poll loop is running (idempotent)
                 await self.start_monitoring_agent()
 
+                self._dash("stage", "monitoring")
+                self._dashboard["agents"]["monitoring_agent"] = "RUNNING"
                 self.state_manager.set_agent_status("monitoring_agent", AgentStatus.RUNNING)
+                self.print_dashboard("Monitoring Agent analyzing CI/CD logs")
                 try:
-                    print("\n  -- Monitoring Agent Analyzing Logs --")
                     incident = await monitoring_agent.analyze_logs(logs)
 
                     if incident:
-                        print(f"\n  -- Incident Detected --")
-                        print(f"    service  : {incident.service}")
-                        print(f"    severity : {incident.severity.value}")
-                        print(f"    desc     : {incident.description}")
+                        self._dash("stage", "incident")
+                        self._track_incident(
+                            incident_id = incident.incident_id,
+                            service     = incident.service,
+                            severity    = incident.severity.value,
+                            description = incident.description,
+                            status      = "OPEN",
+                        )
                         files_to_fix = incident.metadata.get("llm_analysis", {}).get("files_to_fix", [])
-                        if files_to_fix:
-                            print(f"    files    : {[f['file']+':'+str(f['line']) for f in files_to_fix[:5]]}")
-                        print(f"  ----------------------\n")
+                        fix_note = f" — {len(files_to_fix)} file(s) to fix" if files_to_fix else ""
+                        self.print_dashboard(
+                            f"Incident detected [{incident.severity.value.upper()}] "
+                            f"on {incident.service}{fix_note}"
+                        )
                         await self.handle_incident(incident)
                     else:
-                        print("\n  No incidents detected — system healthy.\n")
+                        self._dash("stage", "done")
+                        self.print_dashboard("Monitoring complete — no incidents detected, system healthy")
                 finally:
+                    self._dashboard["agents"]["monitoring_agent"] = "IDLE"
                     self.state_manager.set_agent_status("monitoring_agent", AgentStatus.IDLE)
 
         except Exception as e:
             logger.error(f"[Orchestrator] CI/CD Agent failed: {e}")
-            print(f"\n  [FAIL] CI/CD Agent error: {e}")
+            self._dash("cicd_status", f"error: {e}")
+            self.print_dashboard(f"CI/CD Agent error: {e}")
             await self.event_bus.publish(Event(
                 type=EventType.DEPLOYMENT_COMPLETE,
                 source="cicd_agent",
                 data={"project_path": project_path, "logs": [], "repo_url": repo_url},
             ))
         finally:
+            self._dashboard["agents"]["cicd_agent"] = "IDLE"
             self.state_manager.set_agent_status("cicd_agent", AgentStatus.IDLE)
 
     async def _get_latest_run(self, cicd_agent, repo: str, token: str):
@@ -372,7 +625,10 @@ class Orchestrator:
         return None
 
     async def _on_scaffold_failed(self, event: Event) -> None:
-        logger.error(f"[Orchestrator] Scaffold failed: {event.data.get('error')}")
+        err = event.data.get("error", "unknown")
+        logger.error(f"[Orchestrator] Scaffold failed: {err}")
+        self._dash("stage", "done")
+        self.print_dashboard(f"Scaffold FAILED: {err}")
 
     async def _push_to_github(self, project_path: str, repo_url: str, token: str) -> bool:
         import subprocess
@@ -499,7 +755,9 @@ class Orchestrator:
             logger.error("[Orchestrator] Knowledge Agent not registered!")
             return
 
+        self._dashboard["agents"]["knowledge_agent"] = "RUNNING"
         self.state_manager.set_agent_status("knowledge_agent", AgentStatus.RUNNING)
+        self.print_dashboard(f"Knowledge Agent investigating incident {event.incident_id}")
 
         # error_message is what the Knowledge Agent uses for RAG lookup.
         # Enrich with the Groq report and impact so Qdrant gets richer context.
@@ -520,8 +778,15 @@ class Orchestrator:
         try:
             # ── call KnowledgeAgent — pure RAG, no event bus ───────────
             # knowledge_agent.run() returns AgentResponse (not a Solution).
-            # It has no awareness of files_to_fix — that's the orchestrator's job.
-            agent_response = knowledge_agent.run(error_message)
+            # Pass extra so the adapter forwards files_to_fix + Groq context
+            # to the inner KnowledgeAgent for richer prompting.
+            extra = {
+                "files_to_fix": files_to_fix,
+                "impact":       impact,
+                "recommended":  recommended,
+                "report":       report,
+            }
+            agent_response = knowledge_agent.run(error_message, extra=extra)
 
             # ── build Solution from AgentResponse ─────────────────────
             # Convert monitoring dicts → FileToFix typed objects.
@@ -553,6 +818,10 @@ class Orchestrator:
                 solution.confidence * 100,
                 len(solution.files_to_modify),
             )
+            self.print_dashboard(
+                f"Knowledge Agent complete — source={solution.source} "
+                f"confidence={solution.confidence:.0%} files={len(solution.files_to_modify)}"
+            )
 
             self.state_manager.add_solution(solution)
 
@@ -565,7 +834,9 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"[Orchestrator] Knowledge Agent failed: {e}", exc_info=True)
+            self.print_dashboard(f"Knowledge Agent failed: {e}")
         finally:
+            self._dashboard["agents"]["knowledge_agent"] = "IDLE"
             self.state_manager.set_agent_status("knowledge_agent", AgentStatus.IDLE)
 
     async def _on_investigation_complete(self, event: Event) -> None:
@@ -611,8 +882,11 @@ class Orchestrator:
             logger.error("[Orchestrator] Self-Healing Agent not registered!")
             return
 
+        self._dash("stage", "healing")
+        self._dashboard["agents"]["self_healing_agent"] = "RUNNING"
         self.state_manager.set_agent_status("self_healing_agent", AgentStatus.RUNNING)
         self.state_manager.update_incident_status(event.incident_id, IncidentStatus.REMEDIATING)
+        self.print_dashboard(f"Self-Healing Agent applying fix — {len(solution.files_to_modify)} file(s)")
 
         try:
             # ── remediate — returns SelfHealingResult ─────────────────
@@ -661,7 +935,7 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"[Orchestrator] Self-Healing Agent failed: {e}", exc_info=True)
-            # Publish failure so incident status is updated even on exception
+            self.print_dashboard(f"Self-Healing Agent exception: {e}")
             await self.event_bus.publish(Event(
                 type=EventType.REMEDIATION_FAILED,
                 source="orchestrator",
@@ -672,40 +946,63 @@ class Orchestrator:
                 },
             ))
         finally:
+            self._dashboard["agents"]["self_healing_agent"] = "IDLE"
             self.state_manager.set_agent_status("self_healing_agent", AgentStatus.IDLE)
 
     async def _on_remediation_complete(self, event: Event) -> None:
+        files_fixed = event.data.get("files_fixed", [])
+        verification = event.data.get("verification", "not_run")
         logger.info(
             "[Orchestrator] REMEDIATION_COMPLETE — incident=%s files=%s verification=%s",
-            event.incident_id,
-            event.data.get("files_fixed", []),
-            event.data.get("verification", "not_run"),
+            event.incident_id, files_fixed, verification,
         )
         self.state_manager.update_incident_status(event.incident_id, IncidentStatus.RESOLVED)
+        self._track_incident(
+            incident_id = event.incident_id,
+            service     = "",
+            severity    = "",
+            description = "",
+            status      = "RESOLVED",
+        )
+        self._dash("stage", "done")
+        self.print_dashboard(
+            f"RESOLVED — {len(files_fixed)} file(s) fixed, verification={verification}"
+        )
         await self._send_alert(
             incident_id=event.incident_id,
             title="Incident Resolved",
             message=(
                 f"Incident {event.incident_id} resolved automatically. "
-                f"Fixed {len(event.data.get('files_fixed', []))} file(s). "
-                f"Verification: {event.data.get('verification', 'not_run')}."
+                f"Fixed {len(files_fixed)} file(s). "
+                f"Verification: {verification}."
             ),
         )
         self.context_manager.drop_context(event.incident_id)
 
     async def _on_remediation_failed(self, event: Event) -> None:
+        errors = event.data.get("errors", [])
         logger.warning(
             "[Orchestrator] REMEDIATION_FAILED — incident=%s errors=%s",
-            event.incident_id,
-            event.data.get("errors", []),
+            event.incident_id, errors,
         )
         self.state_manager.update_incident_status(event.incident_id, IncidentStatus.FAILED)
+        self._track_incident(
+            incident_id = event.incident_id,
+            service     = "",
+            severity    = "",
+            description = "",
+            status      = "FAILED",
+        )
+        self._dash("stage", "done")
+        self.print_dashboard(
+            f"REMEDIATION FAILED — {errors[0] if errors else 'unknown error'}"
+        )
         await self._send_alert(
             incident_id=event.incident_id,
             title="Remediation Failed",
             message=(
                 f"Incident {event.incident_id} could not be resolved automatically. "
-                f"Errors: {event.data.get('errors', [])}. Manual intervention required."
+                f"Errors: {errors}. Manual intervention required."
             ),
         )
 

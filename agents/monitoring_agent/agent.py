@@ -13,11 +13,11 @@ Lifecycle
 Event flow
 ----------
     [poll loop]
-        collector.collect_metrics(service) → List[Metric]
-        collector.collect_logs(service)    → List[Log]
-        detector.analyze(...)              → List[Anomaly]
-        incident_factory.create(...)       → Incident
-        groq_analyzer.analyze(...)         → IncidentAnalysis  <- LLM step
+        collector.collect_metrics(service) -> List[Metric]
+        collector.collect_logs(service)    -> List[Log]
+        detector.analyze(...)              -> List[Anomaly]
+        incident_factory.create(...)       -> Incident
+        groq_analyzer.analyze(...)         -> IncidentAnalysis  <- LLM step
             patches Incident.severity, description, metadata
         EventBus.publish(INCIDENT_CREATED)
 
@@ -67,7 +67,7 @@ _YELLOW = "\033[33m"
 _GREEN  = "\033[32m"
 _CYAN   = "\033[36m"
 _WHITE  = "\033[97m"
-_CLEAR  = "\033[2J\033[H"   # clear screen + home cursor
+_CLEAR  = "\033[2J\033[H"
 
 _SEV_COLOR = {"critical": _RED, "high": _RED, "medium": _YELLOW, "low": _GREEN}
 
@@ -125,31 +125,22 @@ class MonitoringAgent(BaseAgent):
         self._state_manager   = state_manager
         self._live_dashboard  = live_dashboard
 
-        # Collector: use the injected one, or build from config
         self._collector = collector or self._build_collector()
+        self._detector  = Detector(self._config.thresholds)
+        self._factory   = IncidentFactory()
+        self._analyzer  = GroqAnalyzer(api_key=groq_api_key)
 
-        # Stateless helpers — created once, reused every poll
-        self._detector = Detector(self._config.thresholds)
-        self._factory  = IncidentFactory()
-
-        # Groq LLM analyzer — enriches incidents before they are published
-        self._analyzer = GroqAnalyzer(api_key=groq_api_key)
-
-        # Background tasks
         self._poll_task      : Optional[asyncio.Task] = None
         self._dashboard_task : Optional[asyncio.Task] = None
-        self._started        : bool = False
 
-        # Track which incidents we've already created this session
-        # (service -> incident_id) to avoid duplicate incidents for the same ongoing anomaly
         self._active_incidents: dict[str, str] = {}
 
-        # ── Dashboard state (updated live by _poll_service) ───────────────
+        # Dashboard state
         self._service_state: dict[str, dict] = {
             s: {"status": "pending", "metrics": {}, "last_poll": None, "anomaly_count": 0}
             for s in self._config.services
         }
-        self._event_log  : list[tuple[datetime, str]] = []  # rolling terminal log
+        self._event_log  : list[tuple[datetime, str]] = []
         self._poll_count : int = 0
         self._agent_start: datetime = datetime.utcnow()
 
@@ -158,12 +149,6 @@ class MonitoringAgent(BaseAgent):
     # --------------------------------------------------------
 
     async def _setup(self) -> None:
-        """Start the background polling loop, dashboard, and event subscription."""
-        if self._started:
-            self.logger.debug("[MonitoringAgent] _setup called again — already running, skipping")
-            return
-        self._started = True
-        # Subscribe so the agent reacts automatically when CI/CD finishes
         self.subscribe(EventType.DEPLOYMENT_COMPLETE, self._on_deployment_complete)
 
         self._poll_task = asyncio.create_task(
@@ -187,8 +172,6 @@ class MonitoringAgent(BaseAgent):
         )
 
     async def _teardown(self) -> None:
-        """Cancel the polling loop and dashboard gracefully."""
-        self._started = False
         for task in (self._poll_task, self._dashboard_task):
             if task and not task.done():
                 task.cancel()
@@ -201,17 +184,13 @@ class MonitoringAgent(BaseAgent):
         self.logger.info("[MonitoringAgent] Stopped")
 
     async def handle_event(self, event: AgentEvent) -> None:
-        """
-        The MonitoringAgent is primarily a producer.
-        DEPLOYMENT_COMPLETE is handled via _on_deployment_complete.
-        """
+        pass
 
     # --------------------------------------------------------
-    # CI/CD integration — triggered by DEPLOYMENT_COMPLETE event
+    # CI/CD integration
     # --------------------------------------------------------
 
     async def _on_deployment_complete(self, event: Event) -> None:
-        """React automatically when the CI/CD agent finishes a run."""
         logs_raw: List[str] = event.data.get("logs", [])
         if not logs_raw:
             return
@@ -249,7 +228,7 @@ class MonitoringAgent(BaseAgent):
         return await self._run_analysis_pipeline(service=service, logs=log_objects)
 
     # --------------------------------------------------------
-    # Shared analysis pipeline (poll loop + one-shot path)
+    # Shared analysis pipeline
     # --------------------------------------------------------
 
     async def _run_analysis_pipeline(
@@ -258,11 +237,6 @@ class MonitoringAgent(BaseAgent):
         logs    : list,
         metrics : Optional[list] = None,
     ) -> Optional[Incident]:
-        """
-        Detect -> IncidentFactory -> GroqAnalyzer.
-        Shared by _poll_service() and analyze_logs().
-        Returns enriched Incident or None. Does NOT publish events.
-        """
         metrics = metrics or []
         anomalies = self._detector.analyze(service, metrics, logs)
         if not anomalies:
@@ -302,18 +276,36 @@ class MonitoringAgent(BaseAgent):
 
     @staticmethod
     def _strings_to_logs(raw_lines: List[str], service: str) -> list:
-        """Convert raw CI/CD log strings to Log objects the Detector can process."""
+        """
+        Convert raw CI/CD log strings to Log objects the Detector can process.
+
+        Handles two formats:
+          1. Free-text logs — keyword match for ERROR/FAIL/TRACEBACK etc.
+          2. Structured CI/CD step summaries — conclusion=failure/skipped
+             (produced by GitHub Actions / CICDAgent step collector).
+             These are tagged ERROR so both _check_log_errors AND
+             _check_cicd_conclusion in the Detector can fire on them.
+        """
         logs = []
         for line in raw_lines:
-            upper = line.upper()
-            if any(k in upper for k in ("ERROR", "FAIL", "TRACEBACK", "EXCEPTION", "CRITICAL")):
+            msg   = line.strip()
+            lower = msg.lower()
+            upper = msg.upper()
+
+            # Structured CI/CD conclusion lines — check BEFORE generic keywords
+            # so "conclusion=failure" isn't missed when "FAIL" also matches
+            if "conclusion=failure" in lower or "conclusion=skipped" in lower:
+                level = "ERROR"
+            # Generic free-text keyword detection
+            elif any(k in upper for k in ("ERROR", "FAIL", "TRACEBACK", "EXCEPTION", "CRITICAL")):
                 level = "ERROR"
             elif any(k in upper for k in ("WARNING", "WARN")):
                 level = "WARN"
             else:
                 level = "INFO"
+
             logs.append(Log(
-                message   = line,
+                message   = msg,
                 level     = level,
                 service   = service,
                 timestamp = datetime.utcnow(),
@@ -323,7 +315,6 @@ class MonitoringAgent(BaseAgent):
 
     @staticmethod
     def _incident_payload(incident: Incident) -> dict:
-        """Serialize Incident to the standard INCIDENT_CREATED event payload."""
         llm = incident.metadata.get("llm_analysis", {})
         return {
             "incident_id"  : incident.incident_id,
@@ -340,7 +331,6 @@ class MonitoringAgent(BaseAgent):
         }
 
     def _log_event(self, msg: str) -> None:
-        """Append a timestamped entry to the rolling dashboard event log."""
         self._event_log.append((datetime.utcnow(), msg))
         if len(self._event_log) > 50:
             self._event_log.pop(0)
@@ -350,10 +340,6 @@ class MonitoringAgent(BaseAgent):
     # --------------------------------------------------------
 
     async def _poll_loop(self) -> None:
-        """
-        Main loop: poll every service, detect anomalies, publish incidents.
-        Sleep-first design: waits one full interval before the first poll.
-        """
         self.logger.info(
             "[MonitoringAgent] Poll loop running — first poll in %.0fs",
             self._config.poll_interval,
@@ -369,23 +355,15 @@ class MonitoringAgent(BaseAgent):
                 raise
             except Exception as e:
                 self.logger.error(
-                    "[MonitoringAgent] Unexpected error in poll loop: %s",
-                    e, exc_info=True,
+                    "[MonitoringAgent] Unexpected error in poll loop: %s", e, exc_info=True,
                 )
 
     async def _poll_all_services(self) -> None:
-        """Poll all configured services concurrently."""
         tasks = [self._poll_service(s) for s in self._config.services]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _poll_service(self, service: str) -> None:
-        """
-        Full poll cycle for a single service:
-            collect -> detect -> maybe create incident -> maybe publish event.
-        Updates live dashboard state on every call.
-        """
         try:
-            # 1. Collect
             metrics = await self._collector.collect_metrics(service)
             logs    = await self._collector.collect_logs(
                 service, max_lines=self._config.max_log_lines
@@ -395,7 +373,6 @@ class MonitoringAgent(BaseAgent):
             self._service_state[service]["last_poll"] = datetime.utcnow()
             self._service_state[service]["metrics"]   = {m.name: m.value for m in metrics}
 
-            # 2. Detect anomalies
             anomalies = self._detector.analyze(service, metrics, logs)
 
             if not anomalies:
@@ -406,20 +383,15 @@ class MonitoringAgent(BaseAgent):
                 self._service_state[service]["anomaly_count"] = 0
                 return
 
-            # 3. Avoid flooding — one active incident per service at a time
             if service in self._active_incidents:
                 return
 
-            # 4+5. Build + enrich via shared pipeline
             incident = await self._run_analysis_pipeline(
-                service = service,
-                logs    = logs,
-                metrics = metrics,
+                service = service, logs = logs, metrics = metrics,
             )
             if not incident:
                 return
 
-            # 6. Track + update dashboard
             self._active_incidents[service] = incident.incident_id
             self._service_state[service]["status"]        = "incident"
             self._service_state[service]["anomaly_count"] = len(anomalies)
@@ -428,7 +400,6 @@ class MonitoringAgent(BaseAgent):
                 f"[{incident.severity.value.upper()}] — {service}"
             )
 
-            # 7. Store in StateManager / ContextManager
             if self._state_manager:
                 self._state_manager.add_incident(incident)
             if self._context_manager:
@@ -436,7 +407,6 @@ class MonitoringAgent(BaseAgent):
                 self._context_manager.add_metrics(incident.incident_id, metrics)
                 self._context_manager.add_logs(incident.incident_id, logs)
 
-            # 8. Publish event -> Orchestrator picks it up
             await self.publish(Event(
                 type        = EventType.INCIDENT_CREATED,
                 source      = self.name,
@@ -446,20 +416,17 @@ class MonitoringAgent(BaseAgent):
 
             self.logger.warning(
                 "[MonitoringAgent] INCIDENT CREATED: %s [%s] — %s",
-                incident.incident_id,
-                incident.severity.value.upper(),
-                incident.service,
+                incident.incident_id, incident.severity.value.upper(), incident.service,
             )
 
-            # Log files to fix
             files_to_fix = incident.metadata.get("llm_analysis", {}).get("files_to_fix", [])
             if files_to_fix:
                 self.logger.warning("[MonitoringAgent] FILES TO FIX (%d):", len(files_to_fix))
                 for i, f in enumerate(files_to_fix, 1):
                     self.logger.warning(
                         "[MonitoringAgent]   [%d] %s line %s in %s() — %s",
-                        i, f.get("file", "?"), f.get("line", "?"),
-                        f.get("function", "?"), f.get("exception", ""),
+                        i, f.get("file","?"), f.get("line","?"),
+                        f.get("function","?"), f.get("exception",""),
                     )
 
         except Exception as e:
@@ -474,7 +441,6 @@ class MonitoringAgent(BaseAgent):
     # --------------------------------------------------------
 
     async def _dashboard_loop(self) -> None:
-        """Redraws the terminal dashboard every 2 seconds."""
         while True:
             try:
                 await asyncio.sleep(2)
@@ -482,19 +448,16 @@ class MonitoringAgent(BaseAgent):
             except asyncio.CancelledError:
                 break
             except Exception:
-                pass  # never let a render error kill the loop
+                pass
 
     def _redraw_dashboard(self) -> None:
-        """Build and atomically print the full dashboard frame."""
         now    = datetime.utcnow()
         uptime = int((now - self._agent_start).total_seconds())
         um, us = divmod(uptime, 60)
         uh, um = divmod(um, 60)
         W = 72
-
         lines: list[str] = []
 
-        # ── Header ────────────────────────────────────────────────────────
         lines.append(f"{_BOLD}{_CYAN}{'─' * W}{_RESET}")
         lines.append(
             f"{_BOLD}{_CYAN}  AUTONOMOUS DEVOPS — MONITORING AGENT{_RESET}"
@@ -508,7 +471,6 @@ class MonitoringAgent(BaseAgent):
         )
         lines.append(f"{_BOLD}{_CYAN}{'─' * W}{_RESET}")
 
-        # ── Service health table ──────────────────────────────────────────
         lines.append(
             f"{_BOLD}  {'SERVICE':<22} {'STATUS':<12} "
             f"{'ERR%':<8} {'LAT ms':<10} {'CPU%':<8} {'MEM%'}{_RESET}"
@@ -549,7 +511,6 @@ class MonitoringAgent(BaseAgent):
                 f"  {age_str}"
             )
 
-        # ── Active incidents ──────────────────────────────────────────────
         lines.append(f"\n{_BOLD}{_CYAN}{'─' * W}{_RESET}")
         lines.append(f"{_BOLD}  ACTIVE INCIDENTS ({len(self._active_incidents)}){_RESET}")
         if self._active_incidents:
@@ -569,7 +530,6 @@ class MonitoringAgent(BaseAgent):
         else:
             lines.append(f"  {_GREEN}No active incidents{_RESET}")
 
-        # ── Event log ─────────────────────────────────────────────────────
         lines.append(f"\n{_BOLD}{_CYAN}{'─' * W}{_RESET}")
         lines.append(f"{_BOLD}  RECENT EVENTS{_RESET}")
         recent = self._event_log[-8:]
@@ -593,7 +553,6 @@ class MonitoringAgent(BaseAgent):
     # --------------------------------------------------------
 
     def _build_collector(self) -> BaseCollector:
-        """Instantiate the correct collector from config."""
         backend = self._config.collector_backend
 
         if backend == "mock":
@@ -618,7 +577,6 @@ class MonitoringAgent(BaseAgent):
 
     @property
     def active_incidents(self) -> dict[str, str]:
-        """Return the current service -> incident_id mapping."""
         return dict(self._active_incidents)
 
     def get_info(self) -> dict:
