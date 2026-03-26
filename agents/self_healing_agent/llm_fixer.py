@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Optional
 
-from models import LLMFixResponse, FileToFix
+from agents.self_healing_agent.models import LLMFixResponse, FileToFix
 from groq import Groq
 from dotenv import load_dotenv
 import os

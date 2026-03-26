@@ -20,7 +20,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 from groq import Groq
-from models import VerificationStatus, CommandResult, VerificationReport
+from agents.self_healing_agent.models import VerificationStatus, CommandResult, VerificationReport
 import os
 from dotenv import load_dotenv
 
