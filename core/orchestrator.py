@@ -75,6 +75,7 @@ class Orchestrator:
         self._subscribe_to_events()
         self._register_monitoring_agent()
         self._register_knowledge_agent()
+        self._register_self_healing_agent()
 
         self._dashboard: dict = {
             "started_at"  : datetime.utcnow(),
@@ -191,6 +192,33 @@ class Orchestrator:
             logger.error(
                 "[Orchestrator] Failed to register KnowledgeAgentAdapter: %s — "
                 "check Qdrant (localhost:6333) and Ollama (localhost:11434) are running", exc
+            )
+
+    def _register_self_healing_agent(self) -> None:
+        """
+        Instantiate and register the SelfHealingAgent if it has not already
+        been registered externally (e.g. from main.py).
+
+        The agent requires an EventBus, AgentRegistry, and the Groq client
+        configured via GROQ_API_KEY in the environment.  It is registered
+        with status IDLE and activated on-demand by _on_investigation_complete.
+        """
+        if self.registry.get_agent("self_healing_agent"):
+            return  # already registered externally — do not overwrite
+
+        try:
+            from agents.self_healing_agent.self_healing_agent import SelfHealingAgent
+            agent = SelfHealingAgent(
+                apply_changes=True
+            )
+            self.registry.register("self_healing_agent", agent)
+            self.state_manager.set_agent_status("self_healing_agent", AgentStatus.IDLE)
+            logger.info("[Orchestrator] SelfHealingAgent registered successfully")
+
+        except Exception as exc:
+            logger.error(
+                "[Orchestrator] Failed to register SelfHealingAgent: %s — "
+                "check GROQ_API_KEY is set and self_healing_agent package is on the path", exc
             )
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
