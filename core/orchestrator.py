@@ -217,8 +217,7 @@ class Orchestrator:
         try:
             from agents.self_healing_agent.self_healing_agent import SelfHealingAgent
             agent = SelfHealingAgent(
-                event_bus = self.event_bus,
-                registry  = self.registry,
+                apply_changes=True
             )
             self.registry.register("self_healing_agent", agent)
             self.state_manager.set_agent_status("self_healing_agent", AgentStatus.IDLE)
