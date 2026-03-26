@@ -5,8 +5,8 @@ knowledge_core/knowledge_agent_adapter.py
 Adapter between the Core Orchestrator and the Knowledge Agent.
 """
 
-from shared.models          import AgentResponse, RAGSource
-from shared.config          import load_config
+from knowledge_agent.shared.models          import AgentResponse, RAGSource
+from knowledge_agent.shared.config          import load_config
 from knowledge_core.knowledge_agent import KnowledgeAgent
 
 

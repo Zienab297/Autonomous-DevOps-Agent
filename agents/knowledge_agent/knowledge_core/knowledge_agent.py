@@ -26,8 +26,8 @@ import re
 import ollama
 from qdrant_client import QdrantClient
 
-from shared.models import AgentResponse, RAGResult, RAGSource, ErrorCategory
-from shared.config import Config
+from knowledge_agent.shared.models import AgentResponse, RAGResult, RAGSource, ErrorCategory
+from knowledge_agent.shared.config import Config
 from knowledge_core.retriever       import retrieve
 from knowledge_core.research_agent  import generate_solution
 from knowledge_core.knowledge_graph import KnowledgeGraph   # ← جديد
