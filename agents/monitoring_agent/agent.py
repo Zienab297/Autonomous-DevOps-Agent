@@ -130,8 +130,9 @@ class MonitoringAgent(BaseAgent):
         self._factory   = IncidentFactory()
         self._analyzer  = GroqAnalyzer(api_key=groq_api_key)
 
-        self._poll_task      : Optional[asyncio.Task] = None
-        self._dashboard_task : Optional[asyncio.Task] = None
+        self._poll_task        : Optional[asyncio.Task] = None
+        self._dashboard_task   : Optional[asyncio.Task] = None
+        self._dashboard_paused : bool = False   # set True by ApprovalManager during input
 
         self._active_incidents: dict[str, str] = {}
 
@@ -444,11 +445,24 @@ class MonitoringAgent(BaseAgent):
         while True:
             try:
                 await asyncio.sleep(2)
-                self._redraw_dashboard()
+                if not self._dashboard_paused:
+                    self._redraw_dashboard()
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass
+
+    def pause_dashboard(self) -> None:
+        """
+        Stop the live dashboard from printing.
+        Called by ApprovalManager before showing the CLI input prompt
+        so background prints don't overwrite what the user is typing.
+        """
+        self._dashboard_paused = True
+
+    def resume_dashboard(self) -> None:
+        """Resume the live dashboard after the user has answered."""
+        self._dashboard_paused = False
 
     def _redraw_dashboard(self) -> None:
         now    = datetime.utcnow()

@@ -1,13 +1,27 @@
-from setup_path import *
 """
 knowledge_core/knowledge_agent_adapter.py
 -----------------------------------------
 Adapter between the Core Orchestrator and the Knowledge Agent.
+
+IMPORTANT — sys.path note:
+    This file must NOT import from bare "shared.*" because other agents
+    (scaffold_agent) also have a "shared" package and whichever gets into
+    sys.path first wins.  All imports here use the full absolute package
+    path: agents.knowledge_agent.shared.*
 """
 
-from shared.models          import AgentResponse, RAGSource
-from shared.config          import load_config
-from knowledge_core.knowledge_agent import KnowledgeAgent
+import sys
+import pathlib
+
+# ── Ensure project root is in sys.path (not knowledge_agent root) ─────────
+_project_root = str(pathlib.Path(__file__).resolve().parents[3])  # …/Autonomous-DevOps-Agent
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+# ── Absolute imports — never bare "shared.*" ──────────────────────────────
+from agents.knowledge_agent.shared.models  import AgentResponse, RAGSource
+from agents.knowledge_agent.shared.config  import load_config
+from agents.knowledge_agent.knowledge_core.knowledge_agent import KnowledgeAgent
 
 
 def _print_response(response: AgentResponse):
@@ -62,18 +76,22 @@ class KnowledgeAgentAdapter:
     def __init__(self):
         self.agent = KnowledgeAgent(load_config())
 
-    async def investigate(self, context) -> object:
-        # ── step 1: build error message ───────────────────────────────────
-        error_message = self._build_error_message(context)
-
-        # ── step 2: run Knowledge Agent ───────────────────────────────────
+    def run(self, error_message: str, extra: dict = None) -> AgentResponse:
+        """
+        Called by the Orchestrator's _on_incident_created.
+        Runs the Knowledge Agent and returns AgentResponse directly.
+        """
+        extra = extra or {}
         print(f"[KnowledgeAgentAdapter] Running for: {error_message[:80]}...")
         response: AgentResponse = self.agent.run(error_message)
-
-        # ── step 3: print response details ───────────────────────────────
         _print_response(response)
+        return response
 
-        # ── step 4: convert AgentResponse → Solution ──────────────────────
+    async def investigate(self, context) -> object:
+        error_message = self._build_error_message(context)
+        print(f"[KnowledgeAgentAdapter] Running for: {error_message[:80]}...")
+        response: AgentResponse = self.agent.run(error_message)
+        _print_response(response)
         return self._to_solution(context.incident.incident_id, response)
 
     @staticmethod
@@ -90,7 +108,7 @@ class KnowledgeAgentAdapter:
 
     @staticmethod
     def _to_solution(incident_id: str, response: AgentResponse) -> object:
-        from core import Solution
+        from core.models import Solution
         return Solution(
             incident_id=incident_id,
             root_cause=response.healing_prompt,

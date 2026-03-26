@@ -4,8 +4,14 @@ core/approval_manager.py
 Manages approvals across CLI, Slack, and Email.
 First channel to respond wins — others are ignored.
 
+KEY FIX: The MonitoringAgent prints a live dashboard on a background task.
+This overwrites the CLI input prompt and the user can't type.
+Solution: ApprovalManager accepts an optional `registry` reference.
+Before showing the CLI prompt it calls monitoring_agent.pause_dashboard(),
+and resumes it after the answer is received.
+
 Usage:
-    manager = ApprovalManager(slack, email)
+    manager = ApprovalManager(slack, email, registry=orchestrator.registry)
     approved = await manager.request_approval(
         title="Scaffold complete — proceed to CI/CD?",
         details=["Dockerfile", "k8s/deployment.yaml", ...],
@@ -32,10 +38,41 @@ class ApprovalManager:
         slack=None,
         email=None,
         timeout_seconds: int = 300,
+        registry=None,          # ← AgentRegistry; used to pause monitoring dashboard
     ):
         self.slack           = slack
         self.email           = email
         self.timeout_seconds = timeout_seconds
+        self.registry        = registry   # set via orchestrator after init
+
+    # ── pause / resume monitoring dashboard ──────────────────────────────────
+
+    def _pause_monitoring(self) -> None:
+        """
+        Stop the MonitoringAgent's live dashboard print loop so it doesn't
+        overwrite the CLI approval prompt while the user is typing.
+        """
+        if not self.registry:
+            return
+        agent = self.registry.get_agent("monitoring_agent")
+        if agent and hasattr(agent, "pause_dashboard"):
+            try:
+                agent.pause_dashboard()
+            except Exception:
+                pass
+
+    def _resume_monitoring(self) -> None:
+        """Resume the MonitoringAgent dashboard after the user has answered."""
+        if not self.registry:
+            return
+        agent = self.registry.get_agent("monitoring_agent")
+        if agent and hasattr(agent, "resume_dashboard"):
+            try:
+                agent.resume_dashboard()
+            except Exception:
+                pass
+
+    # ── main entry point ──────────────────────────────────────────────────────
 
     async def request_approval(
         self,
@@ -61,7 +98,10 @@ class ApprovalManager:
                 decision["approved"] = approved
                 decision["source"]   = source
                 resolved.set()
-                logger.info(f"[ApprovalManager] Decision from {source}: {'APPROVED' if approved else 'DENIED'}")
+                logger.info(
+                    f"[ApprovalManager] Decision from {source}: "
+                    f"{'APPROVED' if approved else 'DENIED'}"
+                )
 
         # Build all tasks
         tasks = []
@@ -98,7 +138,10 @@ class ApprovalManager:
 
         approved = decision.get("approved", False)
         source   = decision.get("source", "unknown")
-        print(f"\n  [Approval] Decision: {'✅ APPROVED' if approved else '❌ DENIED'} (via {source})\n")
+        print(
+            f"\n  [Approval] Decision: "
+            f"{'✅ APPROVED' if approved else '❌ DENIED'} (via {source})\n"
+        )
 
         return approved
 
@@ -110,8 +153,17 @@ class ApprovalManager:
         details: list[str],
         resolve,
     ):
-        """Ask for approval directly in the terminal."""
+        """
+        Ask for approval directly in the terminal.
+
+        Pauses the MonitoringAgent dashboard before showing the prompt so
+        background prints don't overwrite what the user is typing.
+        Resumes the dashboard after the answer is received.
+        """
         try:
+            # ── pause monitoring dashboard ────────────────────────────────
+            self._pause_monitoring()
+
             print(f"\n{'═' * 55}")
             print(f"  APPROVAL REQUIRED")
             print(f"{'─' * 55}")
@@ -121,8 +173,9 @@ class ApprovalManager:
                 for item in details:
                     print(f"    + {item}")
             print(f"{'─' * 55}")
-            print(f"  Waiting for Slack / Email response too...")
-            print(f"{'─' * 55}")
+            if self.slack or self.email:
+                print(f"  Waiting for Slack / Email response too...")
+                print(f"{'─' * 55}")
 
             # Run input in thread so it doesn't block the event loop
             answer = await asyncio.get_event_loop().run_in_executor(
@@ -137,6 +190,9 @@ class ApprovalManager:
             pass
         except Exception as e:
             logger.error(f"[ApprovalManager] CLI error: {e}")
+        finally:
+            # ── always resume monitoring dashboard ────────────────────────
+            self._resume_monitoring()
 
     # ── Slack approval ────────────────────────────────────────────────────────
 
@@ -158,7 +214,6 @@ class ApprovalManager:
                 context=context,
             )
 
-            # Wait for webhook callback to set the result
             result = await self.slack.wait_for_response(approval_id)
             await resolve(result, "Slack")
 
@@ -187,7 +242,6 @@ class ApprovalManager:
                 context=context,
             )
 
-            # Wait for webhook callback to set the result
             result = await self.email.wait_for_response(approval_id)
             await resolve(result, "Email")
 
