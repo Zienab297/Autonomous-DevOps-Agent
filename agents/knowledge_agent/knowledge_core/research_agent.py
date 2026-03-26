@@ -10,9 +10,9 @@ Returns GeneratedSolution.
 """
 
 import ollama
-from knowledge_agent.shared.models import GeneratedSolution, RAGSource
-from knowledge_agent.shared.config import Config
-from knowledge_agent.tools.web_search_tool import web_search, format_results_for_prompt
+from agents.knowledge_agent.shared.models import GeneratedSolution, RAGSource
+from agents.knowledge_agent.shared.config import Config
+from agents.knowledge_agent.tools.web_search_tool import web_search, format_results_for_prompt
 
 
 def _generate_search_query(error_message: str, config: Config) -> str:
