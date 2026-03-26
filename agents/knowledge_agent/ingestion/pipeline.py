@@ -8,12 +8,12 @@ Usage:
     GEMINI_API_KEY=your_key python -m ingestion.pipeline
 """
 
-from shared.config import load_config
-from ingestion.loader       import load_knowledge_base
-from ingestion.parser       import parse_entries
-from ingestion.chunker      import chunk_entries
-from ingestion.embedder     import embed_chunks
-from ingestion.vector_store import build_vector_store
+from agents.knowledge_agent.shared.config import load_config
+from agents.knowledge_agent.ingestion.loader       import load_knowledge_base
+from agents.knowledge_agent.ingestion.parser       import parse_entries
+from agents.knowledge_agent.ingestion.chunker      import chunk_entries
+from agents.knowledge_agent.ingestion.embedder     import embed_chunks
+from agents.knowledge_agent.ingestion.vector_store import build_vector_store
 
 
 def run_pipeline():

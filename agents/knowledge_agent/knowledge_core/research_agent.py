@@ -1,4 +1,3 @@
-from setup_path import *
 """
 knowledge_core/research_agent.py
 ---------------------------------
@@ -18,17 +17,25 @@ from agents.knowledge_agent.tools.web_search_tool import web_search, format_resu
 def _generate_search_query(error_message: str, config: Config) -> str:
     """Step 1 — Ollama improves the search query from the raw error."""
     prompt = f"""You are a senior DevOps engineer.
-Given this error, generate a short, precise web search query to find the fix.
-Return ONLY the search query, nothing else.
+Generate a short, precise web search query to find the fix for this error.
+
+Rules:
+- Return ONLY the search query — no explanation, no quotes, no punctuation
+- Focus on the TECHNICAL error, not the symptoms
+- Use keywords like: fix, solution, error, GitHub Actions, Docker, Kubernetes
+- Maximum 10 words
 
 ERROR:
-{error_message}
-"""
+{error_message[:300]}
+
+Search query:"""
     response = ollama.chat(
         model=config.generation_model,
         messages=[{"role": "user", "content": prompt}]
     )
-    query = response["message"]["content"].strip()
+    query = response["message"]["content"].strip().strip('"').strip("'")
+    # تأكد إن الـ query معقول — مش أطول من 100 حرف
+    query = query.split("\n")[0][:100]
     print(f"[LLMGenerator] Generated search query: {query}")
     return query
 
@@ -49,37 +56,40 @@ def generate_solution(error_message: str, config: Config) -> GeneratedSolution:
     )
 
     # ── step 4: build prompt ──────────────────────────────────────────────
-    prompt = f"""You are a senior DevOps engineer and AI healing agent.
+    has_results = bool(search_results)
 
-A system has encountered the following error:
-{error_message}
+    prompt = f"""You are a senior DevOps engineer analyzing a real production incident.
 
-Here are relevant web search results:
-{web_context}
+INCIDENT:
+{error_message[:500]}
 
-Your task:
-1. Identify the root cause of this error
-2. Provide a step-by-step healing prompt that an automated agent can follow
-3. Include specific commands to fix the issue
-4. Mention which source(s) helped you find the solution
+{"WEB SEARCH RESULTS:" if has_results else "NOTE: No web search results found."}
+{web_context if has_results else ""}
 
-Respond in this exact format:
+STRICT RULES — you MUST follow these:
+1. Base your answer ONLY on the error message and web results above
+2. If web results are irrelevant or empty — say so and base answer on error message only
+3. NEVER invent URLs, commands, or solutions you are not confident about
+4. If you are not sure about a command — do NOT include it
+5. Commands must be real, runnable shell/kubectl/docker commands
+6. Confidence must reflect how sure you are based on AVAILABLE evidence
+
+Respond in this EXACT format:
 
 ROOT CAUSE:
-<one sentence explaining why this error occurs>
+<one sentence — what caused this error based on the evidence>
 
 HEALING STEPS:
-<numbered list of steps to fix>
+<numbered list — only steps you are confident about>
 
 COMMANDS:
-<shell/kubectl/docker commands, one per line>
+<only real, runnable commands — leave empty if unsure>
 
 REFERENCES:
-{references}
+{references if has_results else "No references — solution based on error analysis only"}
 
 CONFIDENCE:
-<a number between 0.0 and 1.0 indicating how confident you are>
-"""
+<0.0 to 1.0 — be honest, lower is better than hallucinating>"""
 
     # ── step 5: call Ollama ───────────────────────────────────────────────
     print(f"[LLMGenerator] Calling Ollama {config.generation_model}...")

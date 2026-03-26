@@ -1,4 +1,3 @@
-from setup_path import *
 """
 tools/web_search_tool.py
 ------------------------
@@ -7,7 +6,10 @@ Uses DuckDuckGo (free, no API key needed).
 """
 
 from dataclasses import dataclass
-from ddgs import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
 
 
 @dataclass

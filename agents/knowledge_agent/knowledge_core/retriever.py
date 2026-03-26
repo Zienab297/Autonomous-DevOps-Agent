@@ -1,4 +1,4 @@
-from setup_path import *
+
 """
 knowledge_core/retriever.py
 ---------------------------
@@ -10,7 +10,6 @@ System-aware retrieval:
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
-
 from agents.knowledge_agent.shared.models import RetrievalResult
 from agents.knowledge_agent.shared.config import Config
 

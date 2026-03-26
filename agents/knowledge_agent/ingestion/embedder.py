@@ -1,4 +1,4 @@
-from setup_path import *
+f
 """
 ingestion/embedder.py
 ---------------------
@@ -7,8 +7,8 @@ Step 4 — Chunk → EmbeddedChunk(vector, text, metadata).
 
 #from google import genai # for use gemini embedding 
 from sentence_transformers import SentenceTransformer
-from shared.models import Chunk, EmbeddedChunk
-from shared.config import Config
+from agents.knowledge_agent.shared.models import Chunk, EmbeddedChunk
+from agents.knowledge_agent.shared.config import Config
 
 
 
