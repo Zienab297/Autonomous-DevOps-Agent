@@ -38,9 +38,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from models import LLMFixResponse, RemediationStatus, Solution, SelfHealingResult, CommandExecutionResult, FileModificationResult, FileToFix
-from llm_fixer import fix_files
-from llm_verifier import verify_fix, VerificationReport, VerificationStatus
+from agents.self_healing_agent.models import LLMFixResponse, Solution, SelfHealingResult, CommandExecutionResult, FileModificationResult, FileToFix
+from core.models import RemediationStatus
+from agents.self_healing_agent.llm_fixer import fix_files
+from agents.self_healing_agent.llm_verifier import verify_fix, VerificationReport, VerificationStatus
 
 logger = logging.getLogger(__name__)
 

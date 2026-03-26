@@ -11,8 +11,8 @@ System-aware retrieval:
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 
-from shared.models import RetrievalResult
-from shared.config import Config
+from agents.knowledge_agent.shared.models import RetrievalResult
+from agents.knowledge_agent.shared.config import Config
 
 
 def retrieve(
