@@ -7,7 +7,7 @@ Adapter between the Core Orchestrator and the Knowledge Agent.
 
 from agents.knowledge_agent.shared.models          import AgentResponse, RAGSource
 from agents.knowledge_agent.shared.config          import load_config
-from knowledge_core.knowledge_agent import KnowledgeAgent
+from agents.knowledge_agent.knowledge_core.knowledge_agent import KnowledgeAgent
 
 
 def _print_response(response: AgentResponse):

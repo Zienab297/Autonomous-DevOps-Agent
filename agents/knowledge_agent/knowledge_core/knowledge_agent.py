@@ -28,9 +28,9 @@ from qdrant_client import QdrantClient
 
 from agents.knowledge_agent.shared.models import AgentResponse, RAGResult, RAGSource, ErrorCategory
 from agents.knowledge_agent.shared.config import Config
-from knowledge_core.retriever       import retrieve
-from knowledge_core.research_agent  import generate_solution
-from knowledge_core.knowledge_graph import KnowledgeGraph   # ← جديد
+from agents.knowledge_agent.knowledge_core.retriever       import retrieve
+from agents.knowledge_agent.knowledge_core.research_agent  import generate_solution
+from agents.knowledge_agent.knowledge_core.knowledge_graph import KnowledgeGraph   # ← جديد
 
 
 class KnowledgeAgent:
