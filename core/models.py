@@ -46,12 +46,15 @@ class DeploymentStatus(str, Enum):
 
 
 class RemediationStatus(str, Enum):
-    PENDING  = "pending"
-    APPROVED = "approved"
-    RUNNING  = "running"
-    SUCCESS  = "success"
-    FAILED   = "failed"
-    REJECTED = "rejected"
+    PENDING           = "pending"
+    APPROVED          = "approved"
+    RUNNING           = "running"
+    SUCCESS           = "success"
+    FAILED            = "failed"
+    REJECTED          = "rejected"
+    # ── NEW ──────────────────────────────────────────────────────────────
+    INSTRUCTIONS_ONLY = "instructions_only"   # No files to fix — human action required
+    ROLLED_BACK       = "rolled_back"          # Fix applied but verification failed → reverted
 
 
 # ============================================================
@@ -90,13 +93,6 @@ class Incident:
     """
     An Incident is created by the Monitoring Agent
     and passed to the Knowledge Agent for investigation.
-
-    Example:
-        Incident(
-            service="auth-api",
-            severity=Severity.HIGH,
-            description="API error rate > 40%"
-        )
     """
     service: str
     severity: Severity
@@ -145,13 +141,6 @@ class Solution:
 class RemediationAction:
     """
     A single remediation action executed by the Self-Healing Agent.
-
-    Example:
-        RemediationAction(
-            incident_id="INC-001",
-            command="kubectl rollout restart deployment/auth-api",
-            description="Restart auth-api deployment"
-        )
     """
     incident_id: str
     command: str
@@ -173,9 +162,7 @@ class RemediationAction:
 
 @dataclass
 class Alert:
-    """
-    Sent by the Alerting Agent to notify engineers.
-    """
+    """Sent by the Alerting Agent to notify engineers."""
     incident_id: str
     title: str
     message: str
@@ -196,9 +183,7 @@ class Alert:
 
 @dataclass
 class Deployment:
-    """
-    Tracks a deployment triggered by the CI/CD Agent.
-    """
+    """Tracks a deployment triggered by the CI/CD Agent."""
     service: str
     branch: str
     version: str

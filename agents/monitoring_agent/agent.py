@@ -133,6 +133,7 @@ class MonitoringAgent(BaseAgent):
         self._poll_task        : Optional[asyncio.Task] = None
         self._dashboard_task   : Optional[asyncio.Task] = None
         self._dashboard_paused : bool = False   # set True by ApprovalManager during input
+        self._poll_paused      : bool = False   # set True during approval to stop polling spam
 
         self._active_incidents: dict[str, str] = {}
 
@@ -350,6 +351,8 @@ class MonitoringAgent(BaseAgent):
                 await asyncio.sleep(self._config.poll_interval)
             except asyncio.CancelledError:
                 break
+            if self._poll_paused:
+                continue
             try:
                 await self._poll_all_services()
             except asyncio.CancelledError:
@@ -463,6 +466,23 @@ class MonitoringAgent(BaseAgent):
     def resume_dashboard(self) -> None:
         """Resume the live dashboard after the user has answered."""
         self._dashboard_paused = False
+
+    def pause(self) -> None:
+        """
+        Pause both polling and dashboard during approval prompts.
+        Stops the monitoring spam while waiting for user input.
+        """
+        self._poll_paused = True
+        self._dashboard_paused = True
+        self.logger.debug("[MonitoringAgent] Paused (approval in progress)")
+
+    def resume(self) -> None:
+        """
+        Resume both polling and dashboard after approval is answered.
+        """
+        self._poll_paused = False
+        self._dashboard_paused = False
+        self.logger.debug("[MonitoringAgent] Resumed")
 
     def _redraw_dashboard(self) -> None:
         now    = datetime.utcnow()

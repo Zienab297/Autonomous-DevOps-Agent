@@ -15,53 +15,17 @@ class VerificationStatus(str, Enum):
 @dataclass
 class FileToFix:
     """
-    Represents a single file that needs to be fixed, populated from the
-    monitoring agent's files_to_fix output (INCIDENT_CREATED event).
-
-    Populated by the Orchestrator / Knowledge Agent when building a Solution.
-    current_content is filled in by SelfHealingAgent._snapshot_files()
-    before the LLM Fixer is called.
-
-    Example (from monitoring agent event data):
-        FileToFix(
-            path="services/deploy.py",
-            line=47,
-            function="run_pipeline",
-            exception="KeyError: 'AWS_REGION'",
-            fix_description="Add AWS_REGION to environment config",
-        )
+    Represents a single file that needs to be fixed.
     """
-    path            : str                    # e.g. "services/deploy.py"
-    line            : int        = 0         # exact line number to fix
-    function        : str        = ""        # function where exception occurred
-    exception       : str        = ""        # exception type + message
-    fix_description : str        = ""        # one-line hint from the LLM analyzer
-    current_content : str        = ""        # filled by _snapshot_files() from disk
+    path            : str
+    line            : int        = 0
+    function        : str        = ""
+    exception       : str        = ""
+    fix_description : str        = ""
+    current_content : str        = ""
 
     @classmethod
     def from_monitoring(cls, entry: Dict) -> "FileToFix":
-        """
-        Build a FileToFix from a files_to_fix dict entry produced by
-        the monitoring agent's GroqAnalyzer / fallback.
-
-        The monitoring agent stores the full file path under the key "file"
-        (e.g. "services/deploy.py" — already a full path, not just a filename).
-        We store it under "path" to match the rest of the self-healing pipeline.
-
-        Called by the Knowledge Agent when building a Solution after it
-        receives the INCIDENT_CREATED event and completes its RAG investigation.
-
-        Example:
-            # entry comes from event.data["files_to_fix"]
-            entry = {
-                "file"           : "services/deploy.py",  # full path from log_parser
-                "line"           : 47,
-                "function"       : "run_pipeline",
-                "exception"      : "KeyError: 'AWS_REGION'",
-                "fix_description": "Add AWS_REGION to environment config",
-            }
-            ftf = FileToFix.from_monitoring(entry)
-        """
         return cls(
             path            = entry.get("file", entry.get("path", "")),
             line            = int(entry.get("line", 0)),
@@ -93,11 +57,6 @@ class Solution:
     references         : List[str]       = field(default_factory=list)
     source             : str             = "knowledge_base"
     created_at         : datetime        = field(default_factory=datetime.utcnow)
-
-    # Each FileToFix carries path, line, function, exception, fix_description.
-    # current_content is populated from disk by SelfHealingAgent._snapshot_files().
-    # files_to_modify is assigned by the Knowledge Agent after RAG investigation,
-    # by converting event.data["files_to_fix"] entries via FileToFix.from_monitoring().
     files_to_modify    : List[FileToFix] = field(default_factory=list)
 
     def __str__(self):
@@ -110,22 +69,9 @@ class Solution:
 
 @dataclass
 class LLMFixResponse:
-    """
-    Response from the LLM Fixer Agent after analyzing a Solution
-    and applying file-level modifications.
-
-    Example:
-        LLMFixResponse(
-            incident_id="INC-001",
-            modified_files=[{"path": "deploy.yaml", "new_content": "..."}],
-            steps=["Identified misconfigured replica count", "Updated replicas to 3"],
-            confidence=0.91
-        )
-    """
+    """Response from the LLM Fixer Agent after analyzing a Solution."""
     incident_id          : str
     modified_files       : List[Dict]
-    # Each entry: {"path": str, "new_content": str, "action": str}
-
     steps                : List[str]
     confidence           : float
     remediation_commands : List[Dict]    = field(default_factory=list)
@@ -142,23 +88,12 @@ class LLMFixResponse:
 
 @dataclass
 class FileModificationResult:
-    """
-    Holds the before/after state of a single file touched by the fixer.
-
-    Example:
-        FileModificationResult(
-            path="k8s/deployment.yaml",
-            old_content="replicas: 1\n...",
-            new_content="replicas: 3\n...",
-            action="overwrite",
-            applied=True,
-        )
-    """
+    """Holds the before/after state of a single file touched by the fixer."""
     path        : str
-    old_content : str            # content read from disk BEFORE the fix
-    new_content : str            # content produced by the LLM
-    action      : str            # overwrite | append | replace_line
-    applied     : bool = False   # True once written to disk
+    old_content : str
+    new_content : str
+    action      : str
+    applied     : bool = False
     backup_path : Optional[str] = None
     error       : Optional[str] = None
 
@@ -175,29 +110,16 @@ class FileModificationResult:
 
 @dataclass
 class CommandExecutionResult:
-    """
-    Outcome of a single remediation command executed after file changes.
-
-    Example:
-        CommandExecutionResult(
-            command="systemctl restart nginx",
-            description="Reload nginx after config update",
-            order=1,
-            on_failure="abort",
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-    """
+    """Outcome of a single remediation command executed after file changes."""
     command     : str
     description : str
     order       : int
-    on_failure  : str                    # "abort" | "continue" | "retry"
-    returncode  : Optional[int] = None   # None if not yet run / skipped
+    on_failure  : str
+    returncode  : Optional[int] = None
     stdout      : str = ""
     stderr      : str = ""
-    skipped     : bool = False           # True if an earlier abort stopped execution
-    error       : Optional[str] = None   # Python-level exception message, if any
+    skipped     : bool = False
+    error       : Optional[str] = None
 
     @property
     def succeeded(self) -> bool:
@@ -222,24 +144,13 @@ class CommandExecutionResult:
 
 @dataclass
 class CommandResult:
-    """
-    Result of a single verification command execution.
-
-    Example:
-        CommandResult(
-            command="pip check",
-            exit_code=0,
-            stdout="No broken requirements found.",
-            stderr="",
-            passed=True,
-        )
-    """
+    """Result of a single verification command execution."""
     command   : str
     exit_code : int
     stdout    : str
     stderr    : str
-    passed    : bool            # exit_code == 0
-    error     : Optional[str] = None   # set if subprocess itself failed
+    passed    : bool
+    error     : Optional[str] = None
 
     def __str__(self):
         status = "✓" if self.passed else "✗"
@@ -251,19 +162,7 @@ class CommandResult:
 
 @dataclass
 class VerificationReport:
-    """
-    Final report produced by the LLM Verifier.
-
-    Example:
-        VerificationReport(
-            incident_id="INC-001",
-            status=VerificationStatus.PASS,
-            commands_run=["pip check", "python -c 'import httpx'"],
-            results=[...],
-            reason="All packages resolved. httpx imported successfully.",
-            confidence=0.97,
-        )
-    """
+    """Final report produced by the LLM Verifier."""
     incident_id  : str
     status       : VerificationStatus
     commands_run : List[str]
@@ -288,14 +187,10 @@ class SelfHealingResult:
     """
     Final result returned by the Self-Healing Agent after processing a Solution.
 
-    Example:
-        SelfHealingResult(
-            incident_id="INC-001",
-            status=RemediationStatus.SUCCESS,
-            file_modifications=[...],
-            steps=["Updated replicas", "Fixed env var"],
-            confidence=0.91,
-        )
+    NEW FIELDS:
+        instructions : Human-readable numbered steps for INSTRUCTIONS_ONLY results
+                       (when there are no files to fix automatically).
+        retry_count  : How many times the self-healing loop has retried this incident.
     """
     incident_id                 : str
     status                      : RemediationStatus
@@ -306,6 +201,9 @@ class SelfHealingResult:
     remediation_command_results : List[CommandExecutionResult]  = field(default_factory=list)
     llm_response                : Optional[LLMFixResponse]      = None
     verification                : Optional[VerificationReport]  = None
+    # ── NEW ──────────────────────────────────────────────────────────────────
+    instructions                : str                           = ""
+    retry_count                 : int                           = 0
     created_at                  : datetime                      = field(default_factory=datetime.utcnow)
 
     def __str__(self):
@@ -319,5 +217,6 @@ class SelfHealingResult:
             f"files={len(self.file_modifications)}, "
             f"cmds={cmd_ok}/{cmd_tot}, "
             f"verification={ver}, "
-            f"confidence={self.confidence:.2f})"
+            f"confidence={self.confidence:.2f}, "
+            f"retry={self.retry_count})"
         )
