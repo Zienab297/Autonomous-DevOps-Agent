@@ -7,7 +7,11 @@ Workflow:
     Solution received
          │
          ▼
-    Step 1 — Guard: ensure every files_to_modify entry has a path + content
+    Step 0 — Instructions path: if files_to_modify is empty →
+             call LLMInstructor → return INSTRUCTIONS_ONLY result
+         │
+         ▼
+    Step 1 — Guard: ensure every files_to_modify entry has a path
          │
          ▼
     Step 2 — Snapshot: read each file from disk → store old_content
@@ -16,150 +20,193 @@ Workflow:
     Step 3 — LLM Fixer: call fix_files() → LLMFixResponse
          │
          ▼
-    Step 4 — Validate: every modified_files entry must have
-             path, new_content, and path must match a known file
+    Step 4 — Validate LLM response
          │
          ▼
     Step 5 — Build FileModificationResult list
-             (path, old_content, new_content) for the caller
          │
          ▼
-    Step 6 — Apply changes to disk (optional, gated by apply=True)
+    Step 6 — Apply changes to disk (backed up first)
          │
          ▼
-    Returns SelfHealingResult
+    Step 7 — Execute remediation commands
+         │
+         ▼
+    Step 8 — Verify the fix
+              │
+         PASS ├──────────────────────────────► return SUCCESS
+              │
+         FAIL ├──► _rollback_files()
+                   │
+                   └──► return ROLLED_BACK
+                         (orchestrator retries with Knowledge Agent)
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import logging
-import os
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from agents.self_healing_agent.models import LLMFixResponse, Solution, SelfHealingResult, CommandExecutionResult, FileModificationResult, FileToFix
+from agents.self_healing_agent.models import (
+    LLMFixResponse, Solution, SelfHealingResult,
+    CommandExecutionResult, FileModificationResult, FileToFix,
+)
 from core.models import RemediationStatus
-from agents.self_healing_agent.llm_fixer import fix_files
-from agents.self_healing_agent.llm_verifier import verify_fix, VerificationReport, VerificationStatus
+from agents.self_healing_agent.llm_fixer      import fix_files
+from agents.self_healing_agent.llm_instructor import generate_instructions
+from agents.self_healing_agent.llm_verifier   import verify_fix, VerificationReport, VerificationStatus
 
 logger = logging.getLogger(__name__)
 
-# ── constant ──────────────────────────────────────────────────────────────────
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".self_healing_backups")
 
+# ── Backup directory ──────────────────────────────────────────────────────────
+# Stored NEXT TO the project being monitored, NOT inside the devops-agent repo.
+# project_root is injected by the Orchestrator when it creates the agent.
+# Falls back to a sibling of the self_healing_agent directory if not set.
+_DEFAULT_BACKUP_BASE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", ".self_healing_backups"
+)
 
-# ============================================================
-# Self-Healing Agent
-# ============================================================
 
 class SelfHealingAgent:
     """
     Receives a Solution, runs the LLM Fixer, validates the output,
-    and optionally applies the file changes to disk.
+    applies file changes, verifies the fix, and rolls back if verification fails.
 
-    Example:
-        agent = SelfHealingAgent(apply_changes=True)
-        result = await agent.remediate(solution)
-
-        for mod in result.file_modifications:
-            print(mod.path)
-            print(mod.old_content)
-            print(mod.new_content)
+    Parameters
+    ----------
+    apply_changes : if True, write new_content to disk after validation.
+    project_root  : absolute path to the project being healed.
+                    Backups are stored at <project_root>/.self_healing_backups/
+                    If None, falls back to the devops-agent directory.
     """
 
-    def __init__(self, apply_changes: bool = False):
-        """
-        Parameters
-        ----------
-        apply_changes : if True, write new_content to disk after validation.
-                        Defaults to False (dry-run / audit mode).
-        """
+    def __init__(self, apply_changes: bool = False, project_root: Optional[str] = None):
         self.apply_changes = apply_changes
+        self.project_root  = project_root
+
+        # Backup dir lives inside the TARGET project, not the agent repo.
+        if project_root:
+            self._backup_base = os.path.join(project_root, ".self_healing_backups")
+        else:
+            self._backup_base = os.path.normpath(_DEFAULT_BACKUP_BASE)
+
         logger.info(
             f"[SelfHealingAgent] Initialized — "
-            f"apply_changes={self.apply_changes}"
+            f"apply_changes={self.apply_changes}, "
+            f"backup_dir={self._backup_base}"
         )
 
     # ============================================================
     # Main Entry Point
     # ============================================================
 
-    async def remediate(self, solution: Solution) -> SelfHealingResult:
+    async def remediate(
+        self,
+        solution    : Solution,
+        retry_count : int = 0,
+    ) -> SelfHealingResult:
         """
         Full remediation pipeline for one Solution.
 
         Parameters
         ----------
-        solution : Solution produced by the Knowledge Agent
+        solution    : Solution produced by the Knowledge Agent.
+        retry_count : How many previous attempts have been made for this
+                      incident (passed through to SelfHealingResult so the
+                      orchestrator can track the loop).
 
         Returns
         -------
-        SelfHealingResult with per-file before/after content
+        SelfHealingResult — status is one of:
+            SUCCESS           → fix applied and verified
+            INSTRUCTIONS_ONLY → no files to fix; human instructions printed
+            ROLLED_BACK       → fix applied but verification failed; files restored
+            FAILED            → guard / validation / LLM fixer error
         """
-        logger.info(f"[SelfHealingAgent] Starting remediation for {solution.incident_id}")
+        logger.info(
+            f"[SelfHealingAgent] Starting remediation for {solution.incident_id} "
+            f"(retry #{retry_count})"
+        )
 
-        # ── step 1: guard — solution must have files ──────────────────────
-        guard_errors = self._guard_solution(solution)
-        if guard_errors:
-            logger.warning(
-                f"[SelfHealingAgent] Solution guard failed: {guard_errors}"
+        # ── step 0: instructions path — no files to auto-fix ─────────────
+        if not solution.files_to_modify:
+            logger.info(
+                "[SelfHealingAgent] No files_to_modify — generating human instructions."
+            )
+            instructions = generate_instructions(
+                incident_id        = solution.incident_id,
+                root_cause         = solution.root_cause,
+                healing_prompt     = solution.healing_prompt,
+                suggested_commands = solution.suggested_commands,
             )
             return SelfHealingResult(
-                incident_id=solution.incident_id,
-                status=RemediationStatus.FAILED,
-                validation_errors=guard_errors,
+                incident_id   = solution.incident_id,
+                status        = RemediationStatus.INSTRUCTIONS_ONLY,
+                instructions  = instructions,
+                retry_count   = retry_count,
+            )
+
+        # ── step 1: guard — every file entry must have a path ─────────────
+        guard_errors = self._guard_solution(solution)
+        if guard_errors:
+            logger.warning(f"[SelfHealingAgent] Solution guard failed: {guard_errors}")
+            return SelfHealingResult(
+                incident_id     = solution.incident_id,
+                status          = RemediationStatus.FAILED,
+                validation_errors = guard_errors,
+                retry_count     = retry_count,
             )
 
         # ── step 2: snapshot — read old content from disk ─────────────────
         self._snapshot_files(solution.files_to_modify)
 
         # ── step 3: call LLM fixer ────────────────────────────────────────
-        logger.info(f"[SelfHealingAgent] Calling LLM Fixer...")
+        logger.info("[SelfHealingAgent] Calling LLM Fixer...")
         try:
             llm_response: LLMFixResponse = fix_files(
                 incident_id        = solution.incident_id,
                 root_cause         = solution.root_cause,
                 healing_prompt     = solution.healing_prompt,
                 suggested_commands = solution.suggested_commands,
-                files_to_modify    = solution.files_to_modify,  # List[FileToFix]
+                files_to_modify    = solution.files_to_modify,
             )
         except Exception as e:
             logger.error(f"[SelfHealingAgent] LLM Fixer raised: {e}", exc_info=True)
             return SelfHealingResult(
-                incident_id=solution.incident_id,
-                status=RemediationStatus.FAILED,
-                validation_errors=[f"LLM Fixer exception: {e}"],
+                incident_id     = solution.incident_id,
+                status          = RemediationStatus.FAILED,
+                validation_errors = [f"LLM Fixer exception: {e}"],
+                retry_count     = retry_count,
             )
 
         # ── step 4: validate LLM response ─────────────────────────────────
         known_paths = {f.path for f in solution.files_to_modify}
         validation_errors = self._validate_llm_response(llm_response, known_paths)
-
         if validation_errors:
-            logger.warning(
-                f"[SelfHealingAgent] Validation errors: {validation_errors}"
-            )
+            logger.warning(f"[SelfHealingAgent] Validation errors: {validation_errors}")
             return SelfHealingResult(
-                incident_id=solution.incident_id,
-                status=RemediationStatus.FAILED,
-                validation_errors=validation_errors,
-                llm_response=llm_response,
+                incident_id     = solution.incident_id,
+                status          = RemediationStatus.FAILED,
+                validation_errors = validation_errors,
+                llm_response    = llm_response,
+                retry_count     = retry_count,
             )
 
         # ── step 5: build FileModificationResult list ─────────────────────
-        # Build a snapshots dict from the FileToFix objects for _build_modifications
         snapshots = {f.path: f.current_content for f in solution.files_to_modify}
         file_modifications = self._build_modifications(
             llm_response.modified_files,
             snapshots,
         )
 
-        # ── step 6: apply to disk (if enabled) ───────────────────────
+        # ── step 6: apply to disk ─────────────────────────────────────────
         if self.apply_changes:
-            self._apply_to_disk(file_modifications)
+            self._apply_to_disk(file_modifications, solution.incident_id)
 
-        # ── step 7: execute remediation commands (if enabled) ─────────────
+        # ── step 7: execute remediation commands ──────────────────────────
         command_results: List[CommandExecutionResult] = []
         if self.apply_changes and llm_response.remediation_commands:
             logger.info(
@@ -170,10 +217,9 @@ class SelfHealingAgent:
                 llm_response.remediation_commands
             )
 
-        # ── step 8: verify the fix ────────────────────────────────────
+        # ── step 8: verify the fix ────────────────────────────────────────
         verification = None
         if self.apply_changes:
-            # only verify after real changes are written to disk
             verification = verify_fix(
                 incident_id    = solution.incident_id,
                 root_cause     = solution.root_cause,
@@ -182,8 +228,26 @@ class SelfHealingAgent:
             )
             logger.info(f"[SelfHealingAgent] Verification: {verification}")
 
-        # A run is successful only if all files applied AND no abort-level
-        # command failed (skipped commands count as failures too)
+            # ── step 8a: rollback if verification failed ──────────────────
+            if verification.status == VerificationStatus.FAIL:
+                logger.warning(
+                    "[SelfHealingAgent] Verification FAILED — rolling back all file changes."
+                )
+                self._rollback_files(file_modifications)
+
+                return SelfHealingResult(
+                    incident_id                 = solution.incident_id,
+                    status                      = RemediationStatus.ROLLED_BACK,
+                    file_modifications          = file_modifications,
+                    steps                       = llm_response.steps,
+                    confidence                  = llm_response.confidence,
+                    remediation_command_results = command_results,
+                    llm_response                = llm_response,
+                    verification                = verification,
+                    retry_count                 = retry_count,
+                )
+
+        # ── determine final status ────────────────────────────────────────
         files_ok = all(m.applied or not self.apply_changes for m in file_modifications)
         cmds_ok  = all(
             c.succeeded or c.on_failure != "abort"
@@ -203,6 +267,7 @@ class SelfHealingAgent:
             remediation_command_results = command_results,
             llm_response                = llm_response,
             verification                = verification,
+            retry_count                 = retry_count,
         )
 
     # ============================================================
@@ -210,24 +275,11 @@ class SelfHealingAgent:
     # ============================================================
 
     def _guard_solution(self, solution: Solution) -> List[str]:
-        """
-        Ensure the Solution is actionable before hitting the LLM.
-        Only a valid 'path' is required per entry — content is read from
-        disk and action is decided by the LLM Fixer.
-
-        Returns a list of error strings (empty = all good).
-        """
         errors = []
-
-        if not solution.files_to_modify:
-            errors.append("Solution.files_to_modify is empty — nothing to fix.")
-            return errors
-
         for i, f in enumerate(solution.files_to_modify):
             tag = f"files_to_modify[{i}]"
             if not f.path.strip():
                 errors.append(f"{tag} missing 'path'.")
-
         return errors
 
     # ============================================================
@@ -235,14 +287,6 @@ class SelfHealingAgent:
     # ============================================================
 
     def _snapshot_files(self, files_to_modify: List[FileToFix]) -> None:
-        """
-        Read each file from disk and store its current content directly
-        on the FileToFix object under current_content so the LLM Fixer
-        can see the full file before deciding what action to take.
-
-        Mutates each FileToFix in-place — no return value needed since
-        Solution.files_to_modify holds the same objects.
-        """
         for f in files_to_modify:
             if os.path.isfile(f.path):
                 try:
@@ -250,15 +294,11 @@ class SelfHealingAgent:
                         f.current_content = fh.read()
                     logger.debug(f"[SelfHealingAgent] Snapshot OK: {f.path}")
                 except OSError as e:
-                    logger.warning(
-                        f"[SelfHealingAgent] Could not read {f.path}: {e}"
-                    )
+                    logger.warning(f"[SelfHealingAgent] Could not read {f.path}: {e}")
                     f.current_content = ""
             else:
-                logger.debug(
-                    f"[SelfHealingAgent] File not found (new file?): {f.path}"
-                )
-                f.current_content = ""     # new file — nothing yet
+                logger.debug(f"[SelfHealingAgent] File not found (new file?): {f.path}")
+                f.current_content = ""
 
     # ============================================================
     # Step 4 — Validate
@@ -269,41 +309,24 @@ class SelfHealingAgent:
         llm_response : LLMFixResponse,
         known_paths  : set,
     ) -> List[str]:
-        """
-        Validate every entry in llm_response.modified_files.
-
-        Rules
-        -----
-        1. modified_files must not be empty.
-        2. Every entry must have a non-empty 'path'.
-        3. Every entry must have a non-empty 'new_content'.
-        4. Every path must match one of the paths in the original Solution.
-
-        Returns a list of error strings (empty = valid).
-        """
         errors = []
-
         if not llm_response.modified_files:
             errors.append("LLM returned zero modified_files entries.")
             return errors
 
         for i, entry in enumerate(llm_response.modified_files):
-            tag = f"modified_files[{i}]"
-
+            tag  = f"modified_files[{i}]"
             path = entry.get("path", "").strip()
             if not path:
                 errors.append(f"{tag} missing 'path'.")
                 continue
-
             if not entry.get("new_content", "").strip():
                 errors.append(f"{tag} (path={path}) missing 'new_content'.")
-
             if path not in known_paths:
                 errors.append(
                     f"{tag} path='{path}' was not in the original "
                     f"files_to_modify. Known paths: {sorted(known_paths)}"
                 )
-
         return errors
 
     # ============================================================
@@ -315,13 +338,6 @@ class SelfHealingAgent:
         modified_files : List[Dict],
         snapshots      : Dict[str, str],
     ) -> List[FileModificationResult]:
-        """
-        Merge LLM output + disk snapshots into FileModificationResult objects.
-
-        old_content comes from the disk snapshot (via FileToFix.current_content).
-        new_content comes from the LLM response.
-        action comes from the LLM response (it decided based on the file content).
-        """
         results = []
         for entry in modified_files:
             path = entry["path"].strip()
@@ -339,22 +355,27 @@ class SelfHealingAgent:
     # Step 6 — Apply to Disk
     # ============================================================
 
-    def _apply_to_disk(self, modifications: List[FileModificationResult]) -> None:
+    def _apply_to_disk(
+        self,
+        modifications : List[FileModificationResult],
+        incident_id   : str = "INC",
+    ) -> None:
         """
-        Write new_content to each file according to its action.
-        A timestamped backup of the original is saved before every write.
+        Write new_content to each file.
 
-        Backup location:
-            .self_healing_backups/
-                INC-001_20240318_120600/
+        Backup location (always INSIDE the target project):
+            <project_root>/.self_healing_backups/
+                INC-ABCD1234_20240318_120600/
                     requirements.txt.bak
                     docker-compose.yml.bak
+
+        The incident_id is embedded in the folder name so multiple incidents
+        never overwrite each other's backups.
         """
         timestamp  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         backup_dir = os.path.join(
-            BACKUP_DIR,
-            f"{modifications[0].path.split(os.sep)[-1]}_{timestamp}"
-            if modifications else timestamp
+            self._backup_base,
+            f"{incident_id}_{timestamp}",
         )
 
         for mod in modifications:
@@ -369,9 +390,7 @@ class SelfHealingAgent:
                         fh.write(mod.old_content)
 
                     mod.backup_path = backup_path
-                    logger.info(
-                        f"[SelfHealingAgent] Backup saved: {backup_path}"
-                    )
+                    logger.info(f"[SelfHealingAgent] Backup saved: {backup_path}")
 
                 # ── write new content ─────────────────────────────────────
                 os.makedirs(os.path.dirname(mod.path) or ".", exist_ok=True)
@@ -381,15 +400,78 @@ class SelfHealingAgent:
                     fh.write(mod.new_content)
 
                 mod.applied = True
-                logger.info(
-                    f"[SelfHealingAgent] Applied ({mod.action}): {mod.path}"
-                )
+                logger.info(f"[SelfHealingAgent] Applied ({mod.action}): {mod.path}")
 
             except OSError as e:
                 mod.error = str(e)
-                logger.error(
-                    f"[SelfHealingAgent] Failed to write {mod.path}: {e}"
+                logger.error(f"[SelfHealingAgent] Failed to write {mod.path}: {e}")
+
+    # ============================================================
+    # Rollback — restore files from backup after failed verification
+    # ============================================================
+
+    def _rollback_files(self, modifications: List[FileModificationResult]) -> None:
+        """
+        Restore each file that was successfully applied to its original state
+        by reading its .bak file and writing it back over the modified version.
+
+        Called immediately after verify_fix() returns FAIL.
+
+        For each FileModificationResult where applied=True and backup_path exists:
+            1. Read backup_path  (the original content saved before the fix)
+            2. Overwrite mod.path with that content
+            3. Log the result
+
+        Files that were NOT applied (mod.applied=False) are skipped — there is
+        nothing to restore because the original was never overwritten.
+        """
+        logger.info("[SelfHealingAgent] Starting rollback...")
+
+        for mod in modifications:
+            if not mod.applied:
+                logger.debug(f"[SelfHealingAgent] Skipping rollback for {mod.path} (not applied)")
+                continue
+
+            if not mod.backup_path or not os.path.isfile(mod.backup_path):
+                # No backup file — restore from the in-memory old_content snapshot
+                if mod.old_content:
+                    try:
+                        with open(mod.path, "w", encoding="utf-8") as fh:
+                            fh.write(mod.old_content)
+                        logger.info(
+                            f"[SelfHealingAgent] Rolled back (from memory): {mod.path}"
+                        )
+                    except OSError as e:
+                        logger.error(
+                            f"[SelfHealingAgent] Could not roll back {mod.path}: {e}"
+                        )
+                else:
+                    logger.warning(
+                        f"[SelfHealingAgent] No backup or old_content for {mod.path} — "
+                        f"cannot rollback, leaving as-is."
+                    )
+                continue
+
+            # Restore from the .bak file on disk
+            try:
+                with open(mod.backup_path, "r", encoding="utf-8") as fh:
+                    original_content = fh.read()
+
+                with open(mod.path, "w", encoding="utf-8") as fh:
+                    fh.write(original_content)
+
+                mod.applied = False   # mark as rolled back
+                logger.info(
+                    f"[SelfHealingAgent] Rolled back (from .bak): "
+                    f"{mod.path} ← {mod.backup_path}"
                 )
+
+            except OSError as e:
+                logger.error(
+                    f"[SelfHealingAgent] Rollback failed for {mod.path}: {e}"
+                )
+
+        logger.info("[SelfHealingAgent] Rollback complete.")
 
     # ============================================================
     # Step 7 — Execute Remediation Commands
@@ -400,21 +482,6 @@ class SelfHealingAgent:
         commands : List[Dict],
         timeout  : int = 120,
     ) -> List[CommandExecutionResult]:
-        """
-        Execute the remediation commands produced by the LLM in order.
-
-        Each command dict is expected to have:
-            command     : str   — the shell command to run
-            description : str   — human-readable explanation
-            order       : int   — execution sequence (already sorted by llm_fixer)
-            on_failure  : str   — "abort" | "continue" | "retry"
-
-        Behaviour
-        ---------
-        - "abort"    : log the failure and mark all remaining commands as skipped.
-        - "continue" : log the failure but keep executing subsequent commands.
-        - "retry"    : run the command once more; if it fails again, treat as "abort".
-        """
         results: List[CommandExecutionResult] = []
         abort_triggered = False
 
@@ -432,21 +499,16 @@ class SelfHealingAgent:
             )
             results.append(result)
 
-            # ── skip everything after an abort ────────────────────────────
             if abort_triggered:
                 result.skipped = True
-                logger.warning(
-                    f"[SelfHealingAgent] Skipping command (abort in effect): {command!r}"
-                )
+                logger.warning(f"[SelfHealingAgent] Skipping command (abort in effect): {command!r}")
                 continue
 
             if not command:
                 result.error   = "empty command string — skipped"
                 result.skipped = True
-                logger.warning(f"[SelfHealingAgent] Empty command at order={order}, skipping.")
                 continue
 
-            # ── run (with optional retry) ─────────────────────────────────
             attempts = 2 if on_failure == "retry" else 1
 
             for attempt in range(1, attempts + 1):
@@ -467,10 +529,7 @@ class SelfHealingAgent:
                     result.stderr     = proc.stderr.strip()
 
                     if result.succeeded:
-                        logger.info(
-                            f"[SelfHealingAgent] Command succeeded "
-                            f"(order={order}): {command!r}"
-                        )
+                        logger.info(f"[SelfHealingAgent] Command succeeded (order={order}): {command!r}")
                         break
 
                     logger.warning(
@@ -482,23 +541,13 @@ class SelfHealingAgent:
                 except subprocess.TimeoutExpired:
                     result.error      = f"timed out after {timeout}s"
                     result.returncode = -1
-                    logger.error(
-                        f"[SelfHealingAgent] Command timed out "
-                        f"(order={order}): {command!r}"
-                    )
                     break
 
                 except Exception as exc:
                     result.error      = str(exc)
                     result.returncode = -1
-                    logger.error(
-                        f"[SelfHealingAgent] Command raised exception "
-                        f"(order={order}): {exc}",
-                        exc_info=True,
-                    )
                     break
 
-            # ── decide whether to abort the remaining commands ─────────────
             if not result.succeeded and on_failure == "abort":
                 logger.error(
                     f"[SelfHealingAgent] on_failure=abort — "
