@@ -510,6 +510,20 @@ class Orchestrator:
             self.state_manager.set_agent_status(record.name, AgentStatus.STOPPED)
         logger.info("[Orchestrator] Stopped")
 
+    # ── Monitoring pause/resume helpers ───────────────────────────────────────
+
+    def _pause_monitoring(self) -> None:
+        """Pause monitoring agent polling and dashboard during approval prompts."""
+        agent = self.registry.get_agent("monitoring_agent")
+        if agent and hasattr(agent, "pause"):
+            agent.pause()
+
+    def _resume_monitoring(self) -> None:
+        """Resume monitoring agent polling and dashboard after approval is answered."""
+        agent = self.registry.get_agent("monitoring_agent")
+        if agent and hasattr(agent, "resume"):
+            agent.resume()
+
     # ── Scaffold ──────────────────────────────────────────────────────────────
 
     async def run_scaffold(self, project_path: str, dry_run: bool = False) -> None:
@@ -582,11 +596,13 @@ class Orchestrator:
             return
 
         # ── APPROVAL 1: proceed to CI/CD? ─────────────────────────────────
+        self._pause_monitoring()
         approved = await self.approval.request_approval(
             title=f"Scaffold complete — {framework} ({language}). Proceed to CI/CD?",
             details=files,
             context={"project_path": project_path},
         )
+        self._resume_monitoring()
         if not approved:
             print("\n  Pipeline stopped.\n")
             self._dash("stage", "done")
@@ -688,6 +704,7 @@ class Orchestrator:
 
             # ── APPROVAL 2: run Monitoring? ────────────────────────────────
             pipeline_status = run.status if run else "unknown"
+            self._pause_monitoring()
             approved = await self.approval.request_approval(
                 title=f"CI/CD {pipeline_status.upper()} — run Monitoring Agent to analyze?",
                 details=logs[:10] if logs else [
@@ -697,6 +714,7 @@ class Orchestrator:
                 ],
                 context={"project_path": project_path},
             )
+            self._resume_monitoring()
             if not approved:
                 print("\n  Monitoring skipped.\n")
                 self._dash("stage", "done")
@@ -835,6 +853,7 @@ class Orchestrator:
         file_preview = [f"  -> {f.get('file','?')}:{f.get('line','?')}" for f in files_to_fix[:3]]
 
         # ── APPROVAL 3: run Knowledge Agent? ──────────────────────────────
+        self._pause_monitoring()
         approved = await self.approval.request_approval(
             title="Incident detected — run Knowledge Agent to investigate?",
             details=[
@@ -846,6 +865,7 @@ class Orchestrator:
                 *file_preview,
             ],
         )
+        self._resume_monitoring()
         if not approved:
             self._dash("stage", "done")
             self.print_dashboard("Investigation cancelled")
@@ -892,6 +912,7 @@ class Orchestrator:
             if is_kb:
                 # ── APPROVAL 4a: KB match found ────────────────────────────
                 rag = agent_response.rag_result
+                self._pause_monitoring()
                 approved_solution = await self.approval.request_approval(
                     title="Knowledge Base match found — apply RAG solution?",
                     details=[
@@ -903,9 +924,11 @@ class Orchestrator:
                         *[f"Command    : {cmd}" for cmd in agent_response.suggested_commands[:3]],
                     ],
                 )
+                self._resume_monitoring()
             else:
                 # ── APPROVAL 4b: no KB match, LLM generated ────────────────
                 web_refs = [f"  [{i+1}] {url}" for i, url in enumerate(agent_response.web_sources[:3])]
+                self._pause_monitoring()
                 approved_solution = await self.approval.request_approval(
                     title="No KB match — use LLM-generated solution?",
                     details=[
@@ -916,6 +939,7 @@ class Orchestrator:
                         *(web_refs if web_refs else ["Web refs   : none"]),
                     ],
                 )
+                self._resume_monitoring()
 
             if not approved_solution:
                 self._dash("stage", "done")
@@ -970,6 +994,7 @@ class Orchestrator:
         ]
 
         # ── APPROVAL 5: apply self-healing fix? ───────────────────────────
+        self._pause_monitoring()
         approved = await self.approval.request_approval(
             title="Investigation complete — apply self-healing fix?",
             details=[
@@ -981,6 +1006,7 @@ class Orchestrator:
                 *[f"Command    : {cmd}" for cmd in solution.suggested_commands[:3]],
             ],
         )
+        self._resume_monitoring()
         if not approved:
             self._dash("stage", "done")
             self.print_dashboard("Self-healing cancelled")
