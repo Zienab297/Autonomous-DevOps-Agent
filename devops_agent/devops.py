@@ -9,9 +9,6 @@ from datetime import datetime
 DEVOPS_AGENT_DIR = Path(__file__).resolve().parent
 ROOT             = DEVOPS_AGENT_DIR.parent
 
-# scaffold_agent must be on sys.path so bare `import shared` → scaffold_agent/shared.
-# knowledge_agent is NEVER added bare — it has its own shared/ that collides.
-# We load it via a scoped importlib helper below.
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DEVOPS_AGENT_DIR))
 sys.path.insert(0, str(ROOT / "agents" / "scaffold_agent"))
@@ -25,6 +22,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+# ── Optional notification clients ──────────────────────────────────────────────
+try:
+    from core.slack_client import SlackClient
+    _SLACK_MODULE_AVAILABLE = True
+except ImportError:
+    _SLACK_MODULE_AVAILABLE = False
+
+try:
+    from core.email_client import EmailClient
+    _EMAIL_MODULE_AVAILABLE = True
+except ImportError:
+    _EMAIL_MODULE_AVAILABLE = False
 
 # ── Optional agents ────────────────────────────────────────────────────────────
 try:
@@ -46,9 +56,6 @@ def _load_knowledge_adapter():
     Load KnowledgeAgentAdapter without polluting sys.path with knowledge_agent/
     bare — which would cause `from shared.models import ProjectContext` inside
     ScaffoldAgent to resolve to knowledge_agent/shared instead of scaffold_agent/shared.
-
-    Strategy: use importlib to load from absolute path, pre-seeding sys.modules
-    with knowledge_agent/shared/* so setup_path's fallback never fires.
     """
     import importlib.util
 
@@ -65,8 +72,6 @@ def _load_knowledge_adapter():
         if inserted:
             sys.path.insert(0, ka_root_s)
 
-        # Pre-load knowledge_agent's shared package so any bare `import shared`
-        # inside the adapter resolves to the correct module.
         for mod_name, rel in [
             ("shared",        "shared/__init__.py"),
             ("shared.models", "shared/models.py"),
@@ -149,9 +154,75 @@ _LOGO = [
 
 
 def _print_logo():
-    """Print the logo exactly once at startup."""
     for line in _LOGO:
         print(line)
+
+
+# ── Notification client builders ───────────────────────────────────────────────
+
+def _build_slack_client():
+    """
+    Build SlackClient from .env vars.
+    Returns None silently if any required var is missing.
+    The user adds these to their project's .env file.
+    """
+    if not _SLACK_MODULE_AVAILABLE:
+        return None
+
+    token    = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    channel  = os.getenv("SLACK_CHANNEL", "").strip()
+    approval = os.getenv("SLACK_APPROVAL_CHANNEL", channel).strip()
+
+    if not token or not channel:
+        return None
+
+    try:
+        client = SlackClient(
+            bot_token        = token,
+            channel          = channel,
+            approval_channel = approval,
+        )
+        print(f"  [Slack] ✓ alerts → {channel}  |  approvals → {approval}")
+        return client
+    except Exception as exc:
+        print(f"  [Slack] ✗ failed to init: {exc}")
+        return None
+
+
+def _build_email_client():
+    """
+    Build EmailClient from .env vars.
+    Returns None silently if any required var is missing.
+    The user adds these to their project's .env file.
+    """
+    if not _EMAIL_MODULE_AVAILABLE:
+        return None
+
+    host     = os.getenv("SMTP_HOST", "").strip()
+    port_s   = os.getenv("SMTP_PORT", "587").strip()
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "").strip()
+    from_    = os.getenv("EMAIL_FROM", username).strip()
+    to_      = os.getenv("EMAIL_TO", "").strip()
+
+    if not (host and username and password and to_):
+        return None
+
+    try:
+        client = EmailClient(
+            smtp_host    = host,
+            smtp_port    = int(port_s),
+            username     = username,
+            password     = password,
+            from_address = from_,
+            to_address   = to_,
+            # approval_base_url is injected later by ApprovalServer after ngrok binds
+        )
+        print(f"  [Email] ✓ alerts + approvals → {to_}")
+        return client
+    except Exception as exc:
+        print(f"  [Email] ✗ failed to init: {exc}")
+        return None
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
@@ -163,7 +234,6 @@ class Dashboard:
     Pauses completely during approval prompts so input is never clobbered.
     """
 
-    # How many lines the status panel occupies (used to move cursor back up)
     _HEIGHT = 20
 
     def __init__(self, orchestrator: Orchestrator):
@@ -178,29 +248,23 @@ class Dashboard:
         self._first_draw  = True
         self._task: asyncio.Task | None = None
 
-    # ── lifecycle ──────────────────────────────────────────────────────────
-
     def start(self):
         self._task = asyncio.create_task(self._loop(), name="dashboard")
 
     def stop(self):
         if self._task and not self._task.done():
             self._task.cancel()
-        # Move cursor below the panel so subsequent prints don't overlap
         sys.stdout.write("\n")
         sys.stdout.flush()
 
     def pause(self):
-        """Freeze redraws — call before any print/input operation."""
         self._paused = True
-        # Move cursor to a clean line below the panel
         sys.stdout.write("\n")
         sys.stdout.flush()
 
     def resume(self):
-        """Unfreeze redraws and immediately redraw."""
         self._paused    = False
-        self._first_draw = True   # force full clear+redraw
+        self._first_draw = True
         self._draw()
 
     def set_stage(self, stage: str):
@@ -208,51 +272,49 @@ class Dashboard:
 
     def event(self, msg: str):
         self._last_event = msg
-
-    # ── background loop ────────────────────────────────────────────────────
+        if not self._paused:
+            self._draw()
 
     async def _loop(self):
         while True:
-            try:
-                await asyncio.sleep(2)
-                if not self._paused:
-                    self._draw()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
-
-    # ── rendering ──────────────────────────────────────────────────────────
+            await asyncio.sleep(2)
+            if not self._paused:
+                self._draw()
 
     def _draw(self):
-        now    = datetime.utcnow()
-        up     = int((now - self._start).total_seconds())
-        um, us = divmod(up, 60)
-        uh, um = divmod(um, 60)
-        W      = 60
+        if self._paused:
+            return
+
+        orch      = self._orch
+        incidents = list(orch.state_manager.get_all_incidents()) if hasattr(orch.state_manager, "get_all_incidents") else []
+
+        now      = datetime.utcnow()
+        elapsed  = int((now - self._start).total_seconds())
+        uh, rem  = divmod(elapsed, 3600)
+        um, us   = divmod(rem, 60)
+
+        W = 58
 
         sc = {
-            "SCAFFOLD" : _CY, "CICD"    : _CY,
+            "INIT": _D, "SCAFFOLD": _CY, "CICD": _CY,
             "MONITORING": _YL, "INCIDENT": _RD,
-            "DONE"     : _GR,  "INIT"   : _D,
-        }.get(self._stage, _CY)
+            "HEALING": _YL, "DONE": _GR,
+        }.get(self._stage, _R)
 
-        reg = self._orch.registry
-        sm  = self._orch.state_manager
+        def agent_row(name):
+            registered = orch.registry.get_agent(name) is not None
+            raw = orch._dashboard["agents"].get(name, "IDLE" if registered else "—")
+            if not registered:
+                sym, col = "○", _D
+            elif raw == "RUNNING":
+                sym, col = "▶", _YL
+            elif raw == "IDLE":
+                sym, col = "●", _GR
+            else:
+                sym, col = "○", _D
+            return f"  {sym} {name:<24} {col}{raw}{_R}"
 
-        def agent_row(name: str) -> str:
-            rec    = reg.get(name)
-            status = sm.get_agent_status(name) if rec else None
-            if not rec or status is None:
-                return f"  {_D}○ {name:<24}  —{_R}"
-            sv     = status.value
-            sc2    = _YL if sv == "running" else _GR if sv == "idle" else _RD
-            bullet = "▶" if sv == "running" else "●"
-            return f"  {_B}{bullet}{_R} {name:<24}  {_B}{sc2}{sv.upper()}{_R}"
-
-        incidents = sm.get_active_incidents() if hasattr(sm, "get_active_incidents") else []
-
-        def inc_row(inc) -> str:
+        def inc_row(inc):
             ts   = inc.created_at.strftime("%H:%M:%S") if hasattr(inc, "created_at") else ""
             sev  = inc.severity.value if hasattr(inc, "severity") else "?"
             sc3  = _RD if sev in ("critical", "high") else _YL
@@ -319,7 +381,7 @@ def _patch_approval(approval_manager, dashboard: Dashboard):
 
     async def patched(title, details=None, context=None):
         dashboard.pause()
-        await asyncio.sleep(0)     # let any in-flight redraw finish
+        await asyncio.sleep(0)
         try:
             return await original(title=title, details=details, context=context)
         finally:
@@ -333,12 +395,22 @@ def _patch_approval(approval_manager, dashboard: Dashboard):
 async def _run_scaffold():
     project_path    = str(Path.cwd())
     scaffold_config = load_scaffold_config()
-    orchestrator    = Orchestrator()
-    dashboard       = Dashboard(orchestrator)
+
+    # ── Build notification clients from .env ──────────────────────────────
+    print("\n  Checking notification channels...")
+    slack = _build_slack_client()
+    email = _build_email_client()
+    if not slack and not email:
+        print("  [Channels] CLI only — add SLACK_BOT_TOKEN or SMTP_* to .env for remote approvals")
+    print()
+
+    # ── Build orchestrator with notification clients ───────────────────────
+    orchestrator = Orchestrator(slack=slack, email=email)
+    dashboard    = Dashboard(orchestrator)
 
     _patch_approval(orchestrator.approval, dashboard)
 
-    # ── agents ────────────────────────────────────────────────────────────
+    # ── Register agents ───────────────────────────────────────────────────
     orchestrator.register_agent("scaffold_agent", ScaffoldAgent(scaffold_config))
     dashboard._project = project_path
     dashboard.event("scaffold ready")
@@ -370,7 +442,7 @@ async def _run_scaffold():
             context_manager = orchestrator.context_manager,
             state_manager   = orchestrator.state_manager,
             groq_api_key    = os.getenv("GROQ_API_KEY"),
-            live_dashboard  = False,    # we control the dashboard here
+            live_dashboard  = False,
         )
         await monitoring_agent.start()
         orchestrator.register_agent("monitoring_agent", monitoring_agent)
@@ -396,7 +468,12 @@ async def _run_scaffold():
 
     await orchestrator.start()
 
-    # ── event → dashboard tracker ──────────────────────────────────────────
+    # ── Start approval server (Slack callbacks + email links) ─────────────
+    # This must happen AFTER orchestrator.start() and BEFORE the pipeline runs.
+    # The server binds a port, opens ngrok if configured, and prints the URL.
+    await orchestrator.start_approval_server()
+
+    # ── Event → dashboard tracker ──────────────────────────────────────────
     orig_pub = orchestrator.event_bus.publish
 
     async def _tracked(event):
@@ -427,11 +504,11 @@ async def _run_scaffold():
 
     orchestrator.event_bus.publish = _tracked
 
-    # ── print logo once, then start live status panel ─────────────────────
+    # ── Print logo once, then start live status panel ─────────────────────
     _print_logo()
     dashboard.set_stage("SCAFFOLD")
     dashboard.start()
-    dashboard._draw()    # draw immediately so panel shows before first poll
+    dashboard._draw()
 
     await orchestrator.run_scaffold(project_path=project_path)
 
@@ -440,6 +517,9 @@ async def _run_scaffold():
     dashboard._draw()
     await asyncio.sleep(1)
     dashboard.stop()
+
+    # ── Stop approval server after pipeline ends ───────────────────────────
+    await orchestrator.stop_approval_server()
 
 
 def main():

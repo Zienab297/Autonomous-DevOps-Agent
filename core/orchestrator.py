@@ -1,14 +1,18 @@
 """
 core/orchestrator.py
 
-KEY CHANGES:
-  1. SelfHealingAgent receives project_root so backups go into the TARGET project.
-  2. _on_investigation_complete() contains the full retry loop:
-       - INSTRUCTIONS_ONLY → display instructions to user, stop.
-       - ROLLED_BACK       → re-invoke Knowledge Agent with failed_solutions excluded,
-                             repeat until fixed or user cancels.
-       - SUCCESS           → if retry_count > 0, write winning solution to KB.
-  3. failed_solutions list is tracked per-incident across retries.
+KEY CHANGES (vs original):
+  1. __init__ accepts optional slack / email clients.
+  2. ApprovalManager is initialized with those clients.
+  3. ApprovalServer (HTTP) is created and started/stopped via
+     start_approval_server() / stop_approval_server() — called by devops.py.
+  4. _send_alert() now fires on SlackClient + EmailClient in addition to
+     the legacy alerting_agent path.
+  5. _pause_monitoring / _resume_monitoring removed from orchestrator body —
+     they now live inside ApprovalManager, which calls them automatically.
+     Callers that used self._pause_monitoring() / self._resume_monitoring()
+     around approval calls still compile (the methods still exist as stubs
+     for backward compat) but are no longer needed.
 """
 
 import asyncio
@@ -25,15 +29,28 @@ from core.models import (
     RemediationStatus,
     Solution,
 )
-from core.event_bus import EventBus, Event, EventType
-from core.state_manager import StateManager
+from core.event_bus      import EventBus, Event, EventType
+from core.state_manager  import StateManager
 from core.context_manager import ContextManager
 from core.agent_registery import AgentRegistry
 from core.approval_manager import ApprovalManager
+from core.approval_server  import ApprovalServer
+
+# Optional — only imported if the client objects are provided
+# (avoids hard dependency when Slack/Email are not configured)
+try:
+    from core.slack_client import SlackClient as _SlackClient
+except ImportError:
+    _SlackClient = None
+
+try:
+    from core.email_client import EmailClient as _EmailClient
+except ImportError:
+    _EmailClient = None
 
 from agents.self_healing_agent.models import FileToFix, Solution as SHSolution
-from agents.monitoring_agent.agent import MonitoringAgent
-from agents.monitoring_agent.config import MonitoringConfig
+from agents.monitoring_agent.agent    import MonitoringAgent
+from agents.monitoring_agent.config   import MonitoringConfig
 
 try:
     from agents.knowledge_agent.shared.models import RAGSource
@@ -189,18 +206,45 @@ class Orchestrator:
         },
     ]
 
-    def __init__(self):
+    # ── Init ──────────────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        slack=None,    # core.slack_client.SlackClient  — optional
+        email=None,    # core.email_client.EmailClient  — optional
+    ):
         self.event_bus       = EventBus()
         self.state_manager   = StateManager()
         self.context_manager = ContextManager()
         self.registry        = AgentRegistry()
-        self.approval        = ApprovalManager()
-        self.approval.registry = self.registry
-        self._running        = False
 
-        # ── per-incident tracking for the retry loop ──────────────────────
-        # Maps incident_id → list of healing_prompt summaries that have
-        # already been tried and verified as FAILED.
+        # Store notification clients for _send_alert()
+        self._slack = slack
+        self._email = email
+
+        # ── Approval stack ────────────────────────────────────────────
+        self.approval = ApprovalManager(
+            slack           = slack,
+            email           = email,
+            timeout_seconds = 300,
+            registry        = self.registry,
+        )
+
+        # HTTP server for Slack button callbacks + email link clicks.
+        # Created here; started/stopped by devops.py around the pipeline.
+        self._approval_server: Optional[ApprovalServer] = (
+            ApprovalServer(
+                approval_manager = self.approval,
+                slack_client     = slack,
+                email_client     = email,
+            )
+            if (slack or email)
+            else None
+        )
+
+        self._running = False
+
+        # ── per-incident retry tracking ───────────────────────────────
         self._failed_solutions: Dict[str, List[str]] = {}
 
         self._subscribe_to_events()
@@ -221,19 +265,40 @@ class Orchestrator:
 
         logger.info("Orchestrator initialized")
 
+    # ── Approval server lifecycle (called by devops.py) ───────────────────────
+
+    async def start_approval_server(self) -> None:
+        """Start the HTTP server that receives Slack callbacks and email link clicks."""
+        if self._approval_server:
+            url = await self._approval_server.start()
+            logger.info("[Orchestrator] ApprovalServer started at %s", url)
+            if url:
+                print(f"\n  [ApprovalServer] Listening at: {url}")
+                print(f"  [ApprovalServer] Paste this into Slack App → Interactivity → Request URL:")
+                print(f"  [ApprovalServer]   {url}/slack/interactive\n")
+
+    async def stop_approval_server(self) -> None:
+        """Stop the HTTP server and close any ngrok tunnel."""
+        if self._approval_server:
+            await self._approval_server.stop()
+
+    # ── Event subscriptions ───────────────────────────────────────────────────
+
     def _subscribe_to_events(self) -> None:
-        self.event_bus.subscribe(EventType.SCAFFOLD_STARTED,       self._on_scaffold_started)
-        self.event_bus.subscribe(EventType.SCAFFOLD_COMPLETE,      self._on_scaffold_complete)
-        self.event_bus.subscribe(EventType.SCAFFOLD_FAILED,        self._on_scaffold_failed)
-        self.event_bus.subscribe(EventType.INCIDENT_CREATED,       self._on_incident_created)
-        self.event_bus.subscribe(EventType.INVESTIGATION_COMPLETE, self._on_investigation_complete)
-        self.event_bus.subscribe(EventType.REMEDIATION_COMPLETE,   self._on_remediation_complete)
-        self.event_bus.subscribe(EventType.REMEDIATION_FAILED,     self._on_remediation_failed)
+        self.event_bus.subscribe(EventType.SCAFFOLD_STARTED,        self._on_scaffold_started)
+        self.event_bus.subscribe(EventType.SCAFFOLD_COMPLETE,       self._on_scaffold_complete)
+        self.event_bus.subscribe(EventType.SCAFFOLD_FAILED,         self._on_scaffold_failed)
+        self.event_bus.subscribe(EventType.INCIDENT_CREATED,        self._on_incident_created)
+        self.event_bus.subscribe(EventType.INVESTIGATION_COMPLETE,  self._on_investigation_complete)
+        self.event_bus.subscribe(EventType.REMEDIATION_COMPLETE,    self._on_remediation_complete)
+        self.event_bus.subscribe(EventType.REMEDIATION_FAILED,      self._on_remediation_failed)
 
     def register_agent(self, name: str, agent: object, metadata: Optional[dict] = None) -> None:
         self.registry.register(name, agent, metadata)
         self.state_manager.set_agent_status(name, AgentStatus.IDLE)
         logger.info(f"[Orchestrator] Agent registered: '{name}'")
+
+    # ── Agent auto-registration ───────────────────────────────────────────────
 
     def _register_monitoring_agent(self) -> None:
         if self.registry.get_agent("monitoring_agent"):
@@ -373,12 +438,8 @@ class Orchestrator:
             return
         try:
             from agents.self_healing_agent.self_healing_agent import SelfHealingAgent
-
-            # Pass the project root so backups are stored inside the target project.
-            # If devops.py is run from inside the project folder, cwd is the project root.
             import os
             project_root = os.getcwd()
-
             agent = SelfHealingAgent(apply_changes=True, project_root=project_root)
             self.registry.register("self_healing_agent", agent)
             self.state_manager.set_agent_status("self_healing_agent", AgentStatus.IDLE)
@@ -519,6 +580,7 @@ class Orchestrator:
             self.state_manager.set_agent_status(record.name, AgentStatus.STOPPED)
         logger.info("[Orchestrator] Stopped")
 
+    # Kept as stubs — ApprovalManager now calls these internally
     def _pause_monitoring(self) -> None:
         agent = self.registry.get_agent("monitoring_agent")
         if agent and hasattr(agent, "pause"):
@@ -600,13 +662,12 @@ class Orchestrator:
             self.print_dashboard("Dry-run complete — no CI/CD triggered")
             return
 
-        self._pause_monitoring()
+        # ── GATE 1: Scaffold complete → proceed to CI/CD? ─────────────────
         approved = await self.approval.request_approval(
             title=f"Scaffold complete — {framework} ({language}). Proceed to CI/CD?",
             details=files,
             context={"project_path": project_path},
         )
-        self._resume_monitoring()
         if not approved:
             print("\n  Pipeline stopped.\n")
             self._dash("stage", "done")
@@ -706,8 +767,19 @@ class Orchestrator:
                 },
             ))
 
+            # Send deployment alert (one-way notification, not an approval)
             pipeline_status = run.status if run else "unknown"
-            self._pause_monitoring()
+            await self._send_alert(
+                incident_id = "deployment",
+                title       = f"CI/CD {pipeline_status.upper()} — {project_path}",
+                message     = (
+                    f"Pipeline finished with status: {pipeline_status}\n"
+                    f"Repo: {repo_url}\n"
+                    f"Logs: {len(logs)} lines collected"
+                ),
+            )
+
+            # ── GATE 2: CI/CD done → run Monitoring Agent? ────────────────
             approved = await self.approval.request_approval(
                 title=f"CI/CD {pipeline_status.upper()} — run Monitoring Agent to analyze?",
                 details=logs[:10] if logs else [
@@ -717,7 +789,6 @@ class Orchestrator:
                 ],
                 context={"project_path": project_path},
             )
-            self._resume_monitoring()
             if not approved:
                 print("\n  Monitoring skipped.\n")
                 self._dash("stage", "done")
@@ -855,7 +926,7 @@ class Orchestrator:
         files_to_fix: list = event.data.get("files_to_fix", [])
         file_preview = [f"  -> {f.get('file','?')}:{f.get('line','?')}" for f in files_to_fix[:3]]
 
-        self._pause_monitoring()
+        # ── GATE 3: Incident detected → run Knowledge Agent? ──────────────
         approved = await self.approval.request_approval(
             title="Incident detected — run Knowledge Agent to investigate?",
             details=[
@@ -867,7 +938,6 @@ class Orchestrator:
                 *file_preview,
             ],
         )
-        self._resume_monitoring()
         if not approved:
             self._dash("stage", "done")
             self.print_dashboard("Investigation cancelled")
@@ -895,7 +965,6 @@ class Orchestrator:
         error_message = "\n".join(error_parts)
 
         try:
-            # Pass current failed_solutions list so the agent avoids them
             failed_solutions = self._failed_solutions.get(event.incident_id, [])
             extra = {
                 "files_to_fix"    : files_to_fix,
@@ -915,7 +984,7 @@ class Orchestrator:
 
             if is_kb:
                 rag = agent_response.rag_result
-                self._pause_monitoring()
+                # ── GATE 4a: KB match found → apply RAG solution? ─────────
                 approved_solution = await self.approval.request_approval(
                     title="Knowledge Base match found — apply RAG solution?",
                     details=[
@@ -927,10 +996,9 @@ class Orchestrator:
                         *[f"Command    : {cmd}" for cmd in agent_response.suggested_commands[:3]],
                     ],
                 )
-                self._resume_monitoring()
             else:
                 web_refs = [f"  [{i+1}] {url}" for i, url in enumerate(agent_response.web_sources[:3])]
-                self._pause_monitoring()
+                # ── GATE 4b: No KB match → use LLM solution? ─────────────
                 approved_solution = await self.approval.request_approval(
                     title="No KB match — use LLM-generated solution?",
                     details=[
@@ -941,7 +1009,6 @@ class Orchestrator:
                         *(web_refs if web_refs else ["Web refs   : none"]),
                     ],
                 )
-                self._resume_monitoring()
 
             if not approved_solution:
                 self._dash("stage", "done")
@@ -992,36 +1059,21 @@ class Orchestrator:
     # ── Investigation Complete → Self-Healing + Retry Loop ───────────────────
 
     async def _on_investigation_complete(self, event: Event) -> None:
-        """
-        Drives the full self-healing + retry loop for one incident.
-
-        Loop behaviour:
-          INSTRUCTIONS_ONLY → print instructions to user, stop.
-          SUCCESS           → if this was a retry (retry_count>0), write to KB, stop.
-          ROLLED_BACK       → ask Knowledge Agent for a new solution (excluding failed
-                              ones), ask for user approval, attempt again.
-                              Loop continues until SUCCESS or user cancels.
-          FAILED            → surface as failure, stop.
-        """
         solution: SHSolution = event.data.get("solution")
         if not solution:
             return
 
-        # Fetch context for potential re-investigation
         error_message : str  = event.data.get("error_message", solution.root_cause)
         files_to_fix  : list = event.data.get("files_to_fix", [])
-
-        # ── approval: apply self-healing fix? ────────────────────────────
-        retry_count = len(self._failed_solutions.get(event.incident_id, []))
+        retry_count          = len(self._failed_solutions.get(event.incident_id, []))
 
         file_preview = [
             f"  -> {f.path}:{f.line}  ({f.exception})"
             for f in solution.files_to_modify[:3]
         ]
 
-        # If this is a no-files solution, just show approval for instructions
+        # ── GATE 5: No-files → generate instructions? ─────────────────────
         if not solution.files_to_modify:
-            self._pause_monitoring()
             approved = await self.approval.request_approval(
                 title="No files to auto-fix — generate manual instructions?",
                 details=[
@@ -1031,10 +1083,9 @@ class Orchestrator:
                     "The agent will produce step-by-step manual instructions.",
                 ],
             )
-            self._resume_monitoring()
         else:
+            # ── GATE 5: Files found → apply self-healing fix? ─────────────
             retry_label = f" (Retry #{retry_count})" if retry_count > 0 else ""
-            self._pause_monitoring()
             approved = await self.approval.request_approval(
                 title=f"Investigation complete{retry_label} — apply self-healing fix?",
                 details=[
@@ -1046,7 +1097,6 @@ class Orchestrator:
                     *[f"Command    : {cmd}" for cmd in solution.suggested_commands[:3]],
                 ],
             )
-            self._resume_monitoring()
 
         if not approved:
             self._dash("stage", "done")
@@ -1071,7 +1121,7 @@ class Orchestrator:
         try:
             result = await healing_agent.remediate(solution, retry_count=retry_count)
 
-            # ── INSTRUCTIONS_ONLY: print for the user and stop ────────────
+            # ── INSTRUCTIONS_ONLY ─────────────────────────────────────────
             if result.status == RemediationStatus.INSTRUCTIONS_ONLY:
                 self._dash("stage", "done")
                 self._track_incident(event.incident_id, "", "", "", "MANUAL_REQUIRED")
@@ -1093,7 +1143,6 @@ class Orchestrator:
 
             # ── SUCCESS ───────────────────────────────────────────────────
             if result.status == RemediationStatus.SUCCESS:
-                # If this was a retry, the solution is NEW — write it to the KB
                 if retry_count > 0:
                     knowledge_agent = self.registry.get_agent("knowledge_agent")
                     if knowledge_agent and hasattr(knowledge_agent, "add_to_kb"):
@@ -1105,7 +1154,6 @@ class Orchestrator:
                             tags           = [],
                         )
 
-                # Clean up retry tracking for this incident
                 self._failed_solutions.pop(event.incident_id, None)
 
                 await self.event_bus.publish(Event(
@@ -1136,15 +1184,13 @@ class Orchestrator:
                     f"  Requesting a new solution from the Knowledge Agent...\n"
                 )
 
-                # Record this failed healing_prompt so the Knowledge Agent avoids it
                 if event.incident_id not in self._failed_solutions:
                     self._failed_solutions[event.incident_id] = []
                 self._failed_solutions[event.incident_id].append(
                     solution.healing_prompt[:300]
                 )
 
-                # ── ask user before retrying ──────────────────────────────
-                self._pause_monitoring()
+                # ── GATE 6: Rolled back → try different solution? ─────────
                 retry_approved = await self.approval.request_approval(
                     title=(
                         f"Fix rolled back (attempt #{retry_count + 1}) — "
@@ -1158,7 +1204,6 @@ class Orchestrator:
                         "Choose 'no' to stop and handle manually.",
                     ],
                 )
-                self._resume_monitoring()
 
                 if not retry_approved:
                     self._dash("stage", "done")
@@ -1174,7 +1219,6 @@ class Orchestrator:
                     ))
                     return
 
-                # Re-invoke Knowledge Agent with failed solutions excluded
                 knowledge_agent = self.registry.get_agent("knowledge_agent")
                 if not knowledge_agent:
                     logger.error("[Orchestrator] Knowledge Agent not registered for retry!")
@@ -1204,8 +1248,7 @@ class Orchestrator:
                     }
                     new_response = knowledge_agent.run(error_message, extra=extra)
 
-                    # Approval for the new solution
-                    self._pause_monitoring()
+                    # ── GATE 4 again: approve new solution before applying ─
                     new_approved = await self.approval.request_approval(
                         title=f"New solution found (attempt #{retry_count + 2}) — apply?",
                         details=[
@@ -1215,7 +1258,6 @@ class Orchestrator:
                             *[f"Command    : {cmd}" for cmd in new_response.suggested_commands[:3]],
                         ],
                     )
-                    self._resume_monitoring()
 
                     if not new_approved:
                         self._dash("stage", "done")
@@ -1248,7 +1290,6 @@ class Orchestrator:
                         files_to_modify    = new_files_to_modify,
                     )
 
-                    # Publish a new INVESTIGATION_COMPLETE so the loop continues
                     await self.event_bus.publish(Event(
                         type=EventType.INVESTIGATION_COMPLETE,
                         source="knowledge_agent",
@@ -1273,9 +1314,9 @@ class Orchestrator:
                     self._dashboard["agents"]["knowledge_agent"] = "IDLE"
                     self.state_manager.set_agent_status("knowledge_agent", AgentStatus.IDLE)
 
-                return  # wait for the new INVESTIGATION_COMPLETE event
+                return
 
-            # ── FAILED (validation / fixer error) ────────────────────────
+            # ── FAILED ───────────────────────────────────────────────────
             await self.event_bus.publish(Event(
                 type=EventType.REMEDIATION_FAILED,
                 source="self_healing_agent",
@@ -1307,9 +1348,9 @@ class Orchestrator:
         self._dash("stage", "done")
         self.print_dashboard(f"RESOLVED — {len(files_fixed)} file(s) fixed, verification={verification}")
         await self._send_alert(
-            incident_id=event.incident_id,
-            title="Incident Resolved",
-            message=f"Incident {event.incident_id} resolved. Files: {files_fixed}.",
+            incident_id = event.incident_id,
+            title       = "✅ Incident Resolved",
+            message     = f"Incident {event.incident_id} resolved. Files fixed: {files_fixed}.",
         )
         self.context_manager.drop_context(event.incident_id)
 
@@ -1320,19 +1361,50 @@ class Orchestrator:
         self._dash("stage", "done")
         self.print_dashboard(f"REMEDIATION FAILED — {errors[0] if errors else 'unknown'}")
         await self._send_alert(
-            incident_id=event.incident_id,
-            title="Remediation Failed",
-            message=f"Incident {event.incident_id} could not be resolved. Errors: {errors}.",
+            incident_id = event.incident_id,
+            title       = "❌ Remediation Failed",
+            message     = f"Incident {event.incident_id} could not be resolved. Errors: {errors}.",
         )
 
+    # ── Alerting (one-way notifications, not approval gates) ──────────────────
+
     async def _send_alert(self, incident_id: str, title: str, message: str) -> None:
+        """
+        Send a one-way alert notification via all configured channels.
+        This is NOT an approval gate — no response is expected.
+
+        Fires on:
+          • Deployment complete (CI/CD status)
+          • Incident resolved
+          • Remediation failed
+          • Manual action required
+        """
+        urgent = any(
+            kw in title.lower()
+            for kw in ("failed", "critical", "manual action", "remediation failed")
+        )
+
+        # Slack alert
+        if self._slack:
+            try:
+                await self._slack.send_alert(title=title, message=message, urgent=urgent)
+            except Exception as exc:
+                logger.error("[Orchestrator] Slack alert failed: %s", exc)
+
+        # Email alert
+        if self._email:
+            try:
+                await self._email.send_alert(title=title, message=message, urgent=urgent)
+            except Exception as exc:
+                logger.error("[Orchestrator] Email alert failed: %s", exc)
+
+        # Legacy alerting_agent path (no-op if not registered)
         alerting_agent = self.registry.get_agent("alerting_agent")
-        if not alerting_agent:
-            return
-        try:
-            await alerting_agent.send(incident_id=incident_id, title=title, message=message)
-        except Exception as e:
-            logger.error(f"[Orchestrator] Alerting Agent failed: {e}")
+        if alerting_agent:
+            try:
+                await alerting_agent.send(incident_id=incident_id, title=title, message=message)
+            except Exception as exc:
+                logger.error("[Orchestrator] AlertingAgent failed: %s", exc)
 
     def summary(self) -> dict:
         return {
