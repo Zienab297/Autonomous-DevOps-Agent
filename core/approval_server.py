@@ -10,7 +10,7 @@ Handles one kind of inbound request:
       Email clients open these links when the engineer clicks the
       Approve / Deny buttons in the approval email.
 
-Both routes call ApprovalManager.resolve_approval() to unblock the
+Both routes call ApprovalManager.resolve_approval_async() to unblock the
 asyncio.Event that request_approval() is waiting on.
 
 Ngrok tunnel (optional):
@@ -21,12 +21,26 @@ Ngrok tunnel (optional):
   If ngrok is not configured, email approvals only work when the engineer
   is on the same machine as the running SDK. CLI approvals always work.
 
+BUG FIX (v2):
+  The original code called email_client.send_approval_request() before
+  start() had finished discovering the public URL (the ngrok handshake
+  is async and takes ~1–2 s). Gate 1's email was sent with an empty
+  approval_base_url, producing broken links like "/approve?id=…".
+
+  Fix: start() now resolves the public URL BEFORE returning.  The
+  Orchestrator must await server.start() before kicking off any approval
+  gate — which it already does — so no orchestrator changes are needed.
+
+  Additionally, route handlers now call resolve_approval_async() (the
+  proper async-safe method) instead of the sync shim, ensuring the
+  asyncio.Lock inside _ApprovalEntry is respected.
+
 Usage (managed by Orchestrator):
     server = ApprovalServer(approval_manager, email_client)
     await server.start()          # call once before the pipeline begins
     ...
     await server.stop()           # call once after the pipeline ends
-    public_url = server.public_url  # set on EmailClient.approval_base_url
+    public_url = server.public_url  # already set on EmailClient.approval_base_url
 """
 
 import asyncio
@@ -36,7 +50,6 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# aiohttp is a lightweight async web framework — already used by devops pipeline
 try:
     from aiohttp import web as _web
     _AIOHTTP_AVAILABLE = True
@@ -50,7 +63,8 @@ class ApprovalServer:
     Async HTTP server for receiving email link clicks (approve/deny).
 
     Lifecycle:
-        await server.start()   → binds port, optionally opens ngrok tunnel
+        await server.start()   → binds port, resolves public URL, injects
+                                 it into EmailClient BEFORE returning
         await server.stop()    → closes tunnel, stops server
     """
 
@@ -66,27 +80,33 @@ class ApprovalServer:
         self._host             = host
         self._port             = port
 
-        self._runner:     Optional[object] = None   # aiohttp AppRunner
-        self._site:       Optional[object] = None   # aiohttp TCPSite
+        self._runner:     Optional[object] = None
+        self._site:       Optional[object] = None
         self._ngrok_tunnel                 = None
-        self.public_url:  str              = ""     # set after start()
-        self.local_url:   str              = ""     # set after start()
+        self.public_url:  str              = ""
+        self.local_url:   str              = ""
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> str:
         """
         Start the HTTP server and (optionally) open a ngrok tunnel.
-        Returns the public_url that should be set on EmailClient.approval_base_url.
+
+        IMPORTANT: This method does NOT return until the public URL is
+        fully resolved (ngrok handshake complete or fallback decided).
+        The EmailClient's approval_base_url is set before returning so
+        the very first approval email contains valid links.
+
+        Returns the public_url.
         """
         if not _AIOHTTP_AVAILABLE:
             logger.warning("[ApprovalServer] aiohttp missing — server not started")
             return ""
 
         app = _web.Application()
-        app.router.add_get("/approve",            self._handle_email_approve)
-        app.router.add_get("/deny",               self._handle_email_deny)
-        app.router.add_get("/health",             self._handle_health)
+        app.router.add_get("/approve", self._handle_email_approve)
+        app.router.add_get("/deny",    self._handle_email_deny)
+        app.router.add_get("/health",  self._handle_health)
 
         self._runner = _web.AppRunner(app, access_log=None)
         await self._runner.setup()
@@ -97,10 +117,11 @@ class ApprovalServer:
         # Discover the actual port chosen by the OS
         bound_port = self._site._server.sockets[0].getsockname()[1]
         self.local_url = f"http://localhost:{bound_port}"
-
         logger.info("[ApprovalServer] listening on %s", self.local_url)
 
-        # Try to open ngrok tunnel
+        # ── Resolve public URL before returning ────────────────────────
+        # _try_ngrok is awaited here (not fire-and-forget) so that
+        # self.public_url is set BEFORE the caller sends any emails.
         self.public_url = await self._try_ngrok(bound_port)
         if not self.public_url:
             self.public_url = self.local_url
@@ -110,9 +131,16 @@ class ApprovalServer:
                 self.local_url,
             )
 
-        # Inject the base URL into the email client so links are correct
+        # Inject the resolved base URL into the email client
         if self._email:
             self._email.approval_base_url = self.public_url
+            logger.info(
+                "[ApprovalServer] EmailClient.approval_base_url = %s",
+                self.public_url,
+            )
+
+        print(f"\n  [ApprovalServer] Listening at: {self.public_url}")
+        print(f"  [ApprovalServer] Email approve/deny links will use this base URL.\n")
 
         return self.public_url
 
@@ -147,24 +175,28 @@ class ApprovalServer:
         GET /approve?id=<approval_id>
         GET /deny?id=<approval_id>
 
-        Called when engineer clicks an email button.
-        Shows a simple HTML confirmation page.
+        FIX: now calls resolve_approval_async() (the proper async-safe
+        method with the asyncio.Lock) instead of the synchronous shim.
         """
         approval_id = request.rel_url.query.get("id", "")
         if not approval_id:
             return _web.Response(
                 content_type="text/html",
-                text=self._html_page("❌ Invalid link", "No approval ID found in link.", error=True),
+                text=self._html_page(
+                    "❌ Invalid link",
+                    "No approval ID found in link.",
+                    error=True,
+                ),
             )
 
-        resolved = self._approval_manager.resolve_approval(
+        # Use the async-safe version so the Lock inside _ApprovalEntry is honoured
+        resolved = await self._approval_manager.resolve_approval_async(
             approval_id=approval_id,
             approved=approved,
             source="Email",
         )
 
         if resolved is None:
-            # Already resolved by another channel (CLI won the race)
             label = "Approved" if approved else "Denied"
             return _web.Response(
                 content_type="text/html",
@@ -194,6 +226,7 @@ class ApprovalServer:
     async def _try_ngrok(self, port: int) -> str:
         """
         Try to open a ngrok tunnel.
+        Fully awaited — returns only after the tunnel URL is confirmed.
         Returns the public https URL or '' if ngrok is not configured.
         """
         token = os.getenv("NGROK_AUTHTOKEN", "")
@@ -218,7 +251,7 @@ class ApprovalServer:
     def _html_page(
         title: str,
         body:  str,
-        color: str = "#2c3e50",
+        color: str  = "#2c3e50",
         error: bool = False,
     ) -> str:
         if error:

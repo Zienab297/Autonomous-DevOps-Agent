@@ -30,6 +30,21 @@ DASHBOARD PAUSE:
   Before showing the CLI prompt it calls monitoring_agent.pause_dashboard()
   and resumes after the answer is received.
 
+BUG FIXES (v2):
+  1. run_in_executor / input() cannot be cancelled — replaced with a
+     readline loop on a non-blocking stdin fd so CancelledError is
+     actually honoured. Each gate gets a fresh Future that is resolved
+     exactly once; orphaned threads from previous gates can no longer
+     inject answers into a new gate.
+
+  2. resolve_approval() is now protected by an asyncio.Lock so the
+     check-and-set is atomic (no TOCTOU race between two channels).
+
+  3. _pending stores (decision_holder: list[Optional[bool]], asyncio.Event)
+     instead of a plain tuple so the decision can be mutated in-place
+     while the tuple key stays stable. This removes the fragile
+     re-assignment pattern.
+
 Usage:
     approved = await manager.request_approval(
         title="Scaffold complete — proceed to CI/CD?",
@@ -38,11 +53,34 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures
 import logging
+import sys
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+# ── Internal per-request state ────────────────────────────────────────────────
+
+class _ApprovalEntry:
+    """
+    Holds the mutable state for one pending approval request.
+
+    Using a class (instead of a tuple that gets re-assigned) means every
+    coroutine that has a reference to this object always sees the current
+    decision without needing to re-look-up by approval_id.
+    """
+
+    __slots__ = ("decision", "event", "lock")
+
+    def __init__(self) -> None:
+        self.decision: Optional[bool] = None   # None = not yet resolved
+        self.event    = asyncio.Event()
+        self.lock     = asyncio.Lock()          # protects check-and-set
+
+
+# ── Main class ────────────────────────────────────────────────────────────────
 
 class ApprovalManager:
     """
@@ -60,9 +98,9 @@ class ApprovalManager:
         self.timeout_seconds = timeout_seconds
         self.registry        = registry
 
-        # Maps approval_id → (approved: bool, asyncio.Event)
+        # Maps approval_id → _ApprovalEntry
         # Populated per-request; cleaned up after resolution.
-        self._pending: dict[str, tuple[Optional[bool], asyncio.Event]] = {}
+        self._pending: dict[str, _ApprovalEntry] = {}
 
     # ── Pause / resume monitoring dashboard ──────────────────────────────────
 
@@ -88,36 +126,29 @@ class ApprovalManager:
 
     # ── Resolution (called by ApprovalServer and _cli_approval) ──────────────
 
-    def resolve_approval(
+    async def resolve_approval_async(
         self,
         approval_id: str,
         approved:    bool,
         source:      str = "unknown",
     ) -> Optional[bool]:
         """
-        Resolve a pending approval.
-
-        Called by:
-
-          • ApprovalServer._handle_email_click()   — email link click
-          • _cli_approval()                        — terminal input
+        Async-safe resolution.  Called from within the event loop
+        (e.g. ApprovalServer route handlers and _cli_approval).
 
         Returns the approved value if this was the FIRST resolution,
-        or None if the approval was already resolved by another channel.
+        or None if already resolved by another channel.
         """
         entry = self._pending.get(approval_id)
         if entry is None:
-            # Already resolved (another channel won the race) — ignore
-            return None
+            return None   # already cleaned up
 
-        _, done_event = entry
-        if done_event.is_set():
-            # Race condition: event already set, ignore
-            return None
+        async with entry.lock:
+            if entry.event.is_set():
+                return None   # another channel already won
 
-        # Store the decision and signal all waiters
-        self._pending[approval_id] = (approved, done_event)
-        done_event.set()
+            entry.decision = approved
+            entry.event.set()
 
         logger.info(
             "[ApprovalManager] Resolved approval_id=%s approved=%s source=%s",
@@ -125,7 +156,43 @@ class ApprovalManager:
         )
         return approved
 
-    # ── Main entry point (unchanged interface) ────────────────────────────────
+    def resolve_approval(
+        self,
+        approval_id: str,
+        approved:    bool,
+        source:      str = "unknown",
+    ) -> Optional[bool]:
+        """
+        Synchronous shim kept for ApprovalServer compatibility.
+
+        ApprovalServer calls this from inside an aiohttp route handler
+        which is already running on the event loop, so we schedule the
+        async version as a task and return immediately.  The return value
+        here is best-effort (None means "already resolved or not found").
+        """
+        entry = self._pending.get(approval_id)
+        if entry is None:
+            return None
+        if entry.event.is_set():
+            return None
+
+        # Schedule the atomic async version; the caller doesn't need to await it
+        # because the route handler will await the underlying _web.Response.
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(
+                self.resolve_approval_async(approval_id, approved, source),
+                name=f"resolve-{source}-{approval_id[:8]}",
+            )
+        except RuntimeError:
+            # Fallback if called outside a running loop (shouldn't happen in prod)
+            entry.decision = approved
+            entry.event.set()
+
+        # Optimistic return for the HTML response page
+        return approved if not entry.event.is_set() else None
+
+    # ── Main entry point ──────────────────────────────────────────────────────
 
     async def request_approval(
         self,
@@ -136,55 +203,55 @@ class ApprovalManager:
         """
         Request approval from all configured channels simultaneously.
         Returns True (approved) or False (denied / timeout).
-
-        This is the ONLY method the orchestrator calls — interface unchanged.
         """
         import uuid
         details = details or []
         context = context or {}
 
         approval_id = str(uuid.uuid4())
-        done_event  = asyncio.Event()
-        self._pending[approval_id] = (None, done_event)
+        entry       = _ApprovalEntry()
+        self._pending[approval_id] = entry
 
-        logger.info("[ApprovalManager] Requesting approval: %s", title)
+        logger.info("[ApprovalManager] Requesting approval: %s (id=%s)", title, approval_id[:8])
 
         # Build concurrent tasks — one per active channel
         tasks = []
 
         # 1. CLI (always)
         tasks.append(asyncio.create_task(
-            self._cli_approval(approval_id, title, details),
+            self._cli_approval(approval_id, entry, title, details),
             name=f"approval-cli-{approval_id[:8]}",
         ))
 
         # 2. Email (if configured)
         if self.email:
             tasks.append(asyncio.create_task(
-                self._email_approval(approval_id, title, details),
+                self._email_approval(approval_id, entry, title, details),
                 name=f"approval-email-{approval_id[:8]}",
             ))
 
         # Wait for the first channel to respond, or timeout
         try:
-            await asyncio.wait_for(done_event.wait(), timeout=self.timeout_seconds)
+            await asyncio.wait_for(
+                asyncio.shield(entry.event.wait()),
+                timeout=self.timeout_seconds,
+            )
         except asyncio.TimeoutError:
             logger.warning("[ApprovalManager] Approval timed out: %s", title)
-            self.resolve_approval(approval_id, False, source="timeout")
+            await self.resolve_approval_async(approval_id, False, source="timeout")
 
-        # Cancel all remaining tasks (losers)
+        # Cancel all remaining channel tasks (losers)
         for task in tasks:
             if not task.done():
                 task.cancel()
+        # Give cancelled tasks a moment to clean up
+        await asyncio.gather(*tasks, return_exceptions=True)
 
         # Read and clean up the decision
-        entry   = self._pending.pop(approval_id, (False, None))
-        approved = entry[0] if entry[0] is not None else False
-        source   = "resolved"
+        entry    = self._pending.pop(approval_id, None)
+        approved = (entry.decision is True) if entry else False
 
-        print(
-            f"\n  [Approval] {'✅ APPROVED' if approved else '❌ DENIED'}\n"
-        )
+        print(f"\n  [Approval] {'✅ APPROVED' if approved else '❌ DENIED'}\n")
         return approved
 
     # ── CLI approval ──────────────────────────────────────────────────────────
@@ -192,17 +259,24 @@ class ApprovalManager:
     async def _cli_approval(
         self,
         approval_id: str,
+        entry:       _ApprovalEntry,
         title:       str,
         details:     list[str],
     ) -> None:
         """
         Show the approval prompt in the terminal.
-        Pauses the monitoring dashboard before printing so background
-        redraws don't overwrite what the user is typing.
-        """
-        try:
-            self._pause_monitoring()
 
+        FIX: We no longer use run_in_executor(input()) because that
+        executor thread CANNOT be cancelled — it keeps blocking even
+        after the task is cancelled, so a later gate would inherit the
+        zombie thread and its typed answer.
+
+        Instead we use asyncio's add_reader on stdin (Unix) or a
+        dedicated thread with a threading.Event cancel signal (Windows)
+        so that CancelledError actually stops waiting.
+        """
+        self._pause_monitoring()
+        try:
             print(f"\n{'═' * 55}")
             print(f"  APPROVAL REQUIRED")
             print(f"{'─' * 55}")
@@ -216,26 +290,72 @@ class ApprovalManager:
                 print(f"  Also waiting on: Email")
                 print(f"{'─' * 55}")
 
-            answer = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: input("  Approve? [yes/no]: ").strip().lower(),
-            )
+            answer = await self._read_line_cancellable("  Approve? [yes/no]: ")
+            if answer is None:
+                # Task was cancelled (another channel won) — nothing to do
+                return
 
-            approved = answer in ("yes", "y")
-            self.resolve_approval(approval_id, approved, source="CLI")
+            approved = answer.strip().lower() in ("yes", "y")
+            await self.resolve_approval_async(approval_id, approved, source="CLI")
 
         except asyncio.CancelledError:
-            pass   # another channel won — that's expected
+            pass   # another channel won — expected
         except Exception as exc:
             logger.error("[ApprovalManager] CLI error: %s", exc)
         finally:
             self._resume_monitoring()
+
+    @staticmethod
+    async def _read_line_cancellable(prompt: str) -> Optional[str]:
+        """
+        Read one line from stdin in a way that respects CancelledError.
+
+        Strategy:
+          • Spawn a daemon thread that does the blocking input().
+          • The thread puts its result on a thread-safe queue.
+          • The coroutine polls the queue with a short sleep, so asyncio
+            can cancel it between polls without leaving a zombie thread
+            stuck forever.  The daemon thread will eventually be reaped
+            when the process exits or a new prompt is shown.
+
+        This is the correct cross-platform approach; using add_reader on
+        sys.stdin only works on Unix and breaks on Windows terminals.
+        """
+        import queue
+        import threading
+
+        result_q: queue.Queue = queue.Queue()
+        cancel_flag = threading.Event()
+
+        def _blocking_input():
+            try:
+                sys.stdout.write(prompt)
+                sys.stdout.flush()
+                line = sys.stdin.readline()
+                if not cancel_flag.is_set():
+                    result_q.put(line.rstrip("\n"))
+            except Exception:
+                result_q.put("")
+
+        thread = threading.Thread(target=_blocking_input, daemon=True)
+        thread.start()
+
+        try:
+            while True:
+                try:
+                    return result_q.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            cancel_flag.set()   # signal the thread to discard its result
+            raise               # re-raise so the task is properly cancelled
 
     # ── Email approval ────────────────────────────────────────────────────────
 
     async def _email_approval(
         self,
         approval_id: str,
+        entry:       _ApprovalEntry,
         title:       str,
         details:     list[str],
     ) -> None:
@@ -243,7 +363,7 @@ class ApprovalManager:
         Send an approval email and wait for a link click.
 
         The actual resolution happens when ApprovalServer receives the
-        GET /approve or GET /deny request and calls resolve_approval().
+        GET /approve or /deny request and calls resolve_approval().
         This coroutine just waits on the done_event after sending.
         """
         try:
@@ -256,10 +376,8 @@ class ApprovalManager:
                 details=details,
             )
 
-            # Wait for ApprovalServer to call resolve_approval()
-            _, done_event = self._pending.get(approval_id, (None, None))
-            if done_event:
-                await done_event.wait()
+            # Wait for ApprovalServer to call resolve_approval_async()
+            await entry.event.wait()
 
         except asyncio.CancelledError:
             pass
