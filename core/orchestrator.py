@@ -531,12 +531,12 @@ class Orchestrator:
 
     # ── Scaffold ──────────────────────────────────────────────────────────────
 
-    async def run_scaffold(self, project_path: str, dry_run: bool = False) -> None:
+    async def run_scaffold(self, project_path: str, dry_run: bool = False, skip_scaffold: bool = False) -> None:
         logger.info(f"[Orchestrator] run_scaffold: {project_path}")
         await self.event_bus.publish(Event(
             type=EventType.SCAFFOLD_STARTED,
             source="cli",
-            data={"project_path": project_path, "dry_run": dry_run},
+            data={"project_path": project_path, "dry_run": dry_run, "skip_scaffold": skip_scaffold},
         ))
 
     async def _on_scaffold_started(self, event: Event) -> None:
@@ -556,8 +556,37 @@ class Orchestrator:
 
         self.state_manager.set_agent_status("scaffold_agent", AgentStatus.RUNNING)
         self._dashboard["agents"]["scaffold_agent"] = "RUNNING"
-        project_path = event.data.get("project_path")
-        dry_run      = event.data.get("dry_run", False)
+        project_path   = event.data.get("project_path")
+        dry_run        = event.data.get("dry_run", False)
+        skip_scaffold  = event.data.get("skip_scaffold", False)
+
+        # ── skip scaffold — files already exist, user said no to re-generate ──
+        if skip_scaffold:
+            import os
+            existing_files = []
+            for f in ["Dockerfile", "docker-compose.yml", ".dockerignore",
+                      ".github/workflows/deploy.yml",
+                      "k8s/deployment.yaml", "k8s/service.yaml", "k8s/ingress.yaml"]:
+                if os.path.exists(os.path.join(project_path, f)):
+                    existing_files.append(f)
+
+            self.state_manager.set_agent_status("scaffold_agent", AgentStatus.IDLE)
+            self._dashboard["agents"]["scaffold_agent"] = "IDLE"
+            self.print_dashboard(f"Scaffold skipped — {len(existing_files)} existing files reused")
+
+            await self.event_bus.publish(Event(
+                type=EventType.SCAFFOLD_COMPLETE,
+                source="scaffold_agent",
+                data={
+                    "project_path"   : project_path,
+                    "dry_run"        : dry_run,
+                    "language"       : "unknown",
+                    "framework"      : "unknown",
+                    "generated_files": existing_files,
+                    "skipped"        : True,
+                },
+            ))
+            return
 
         try:
             result = scaffold_agent.run(project_path, dry_run=dry_run)
@@ -570,6 +599,7 @@ class Orchestrator:
                     "language"       : result.language.value,
                     "framework"      : result.framework.value,
                     "generated_files": [f.filename for f in result.generated_files],
+                    "skipped"        : False,
                 },
             ))
             self.print_dashboard(
@@ -635,9 +665,23 @@ class Orchestrator:
             token=token,
         )
         if not pushed:
-            self.print_dashboard("Git push failed — stopping")
-            self._dash("stage", "done")
-            return
+            # Push failed — ask developer if they want to continue anyway
+            # (GitHub Actions from a previous push might already be running)
+            self.print_dashboard("Git push failed — checking if we should continue to CI/CD")
+            self._pause_monitoring()
+            print(f"\n{'─'*55}")
+            print(f"  Git push failed (see error above).")
+            print(f"  GitHub Actions from a previous push may still be running.")
+            print(f"{'─'*55}")
+            try:
+                cont = input("  Continue to CI/CD anyway? [yes/no]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                cont = "no"
+            self._resume_monitoring()
+            if cont not in ("yes", "y"):
+                self._dash("stage", "done")
+                return
+            print("  Continuing to CI/CD...")
 
         self._dash("repo_url", repo_url)
 
@@ -804,10 +848,73 @@ class Orchestrator:
             r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
             return r.returncode, r.stdout + r.stderr
 
+        _SENSITIVE = [
+            ".env", ".env.*", "*.env",
+            ".devops_llm_config", ".devops_state",
+            "*.key", "*.pem", "*.p12",
+            "__pycache__/", "*.pyc", "*.pyo",
+            ".vscode/", ".idea/",
+        ]
+
+        # ── Step 1: git init ──────────────────────────────────────────────
+        run(["git", "init"], project_path)
+        print("  [git init] OK")
+
+        # ── Step 2: Write .gitignore BEFORE git add ───────────────────────
+        gitignore_path = pathlib.Path(project_path) / ".gitignore"
+        try:
+            existing = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+            lines    = existing.splitlines()
+            added    = [e for e in _SENSITIVE if e not in lines]
+            lines.extend(added)
+            gitignore_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            if added:
+                print(f"  [gitignore] Protected: {', '.join(added)}")
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Could not update .gitignore: {e}")
+
+        # ── Step 3: Physically delete sensitive files from project dir ────
+        # The real fix for GitHub Push Protection: if .devops_llm_config or
+        # .env exist inside the project folder being pushed, delete them so
+        # they can never appear in the git history — even if .gitignore fails.
+        _delete_from_project = [".devops_llm_config", ".devops_state"]
+        p = pathlib.Path(project_path)
+        for fname in _delete_from_project:
+            fpath = p / fname
+            if fpath.exists():
+                try:
+                    fpath.unlink()
+                    print(f"  [protected] Deleted {fname} from project folder (safe — stored in SDK root)")
+                except Exception:
+                    pass
+
+        # ── Step 4: Untrack any sensitive files from git index ────────────
+        _untrack = [".env", ".devops_llm_config", ".devops_state"]
+        for f in _untrack:
+            run(["git", "rm", "--cached", "-f", f], project_path)
+            run(["git", "rm", "-rf", "--cached", f], project_path)
+
+        # ── Step 5: Clean git history if previous bad commits exist ──────
+        # Squash all previous commits into one clean commit to remove
+        # any secrets that were committed in prior runs.
+        code, _ = run(["git", "log", "--oneline", "-1"], project_path)
+        if code == 0:
+            # History exists — orphan reset to remove all previous commits
+            run(["git", "checkout", "--orphan", "clean_main"], project_path)
+            run(["git", "add", "."], project_path)
+            code2, _ = run(
+                ["git", "commit", "-m", "chore: clean deployment (no secrets)"],
+                project_path,
+            )
+            if code2 == 0:
+                run(["git", "branch", "-D", "main"], project_path)
+                run(["git", "branch", "-m", "main"], project_path)
+                print("  [git history] Cleaned — fresh commit with no secrets")
+
+        # ── Step 6: Stage, commit (if needed), push ───────────────────────
         print(f"\n  Pushing to: {repo_url}")
         _OPTIONAL = {"remove old remote (ok if fails)", "git commit"}
         steps = [
-            (["git", "init"],                                     "git init"),
             (["git", "add", "."],                                 "git add"),
             (["git", "commit", "-m", "chore: add DevOps scaffold files"], "git commit"),
             (["git", "branch", "-M", "main"],                    "git branch"),
@@ -818,7 +925,15 @@ class Orchestrator:
         for cmd, label in steps:
             code, out = run(cmd, project_path)
             if code != 0 and label not in _OPTIONAL:
-                print(f"  Failed at [{label}]: {out.strip()[:200]}")
+                print(f"\n  Failed at [{label}]:")
+                print(f"  {out.strip()[:500]}")
+                if "push protection" in out.lower() or "GH013" in out:
+                    print()
+                    print("  GITHUB PUSH PROTECTION still blocked.")
+                    print("  The repo has old commits with secrets in its history.")
+                    print("  Fix: go to GitHub → repo → Settings → Code security")
+                    print("       → Secret scanning → bypass the block, OR")
+                    print("       delete the repo and create a new empty one.")
                 return False
             print(f"  [{label}] OK")
         print(f"  Pushed successfully to {repo_url}\n")

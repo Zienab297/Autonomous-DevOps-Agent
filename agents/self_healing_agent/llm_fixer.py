@@ -1,45 +1,48 @@
 """
 self_healing/llm_fixer.py
 -----------------------------
-Called by the Self-Healing Agent after a Solution is produced.
-Receives root_cause, healing_prompt, suggested_commands, and files_to_modify.
-
-Step 1: Build a structured prompt for the LLM (senior DevOps persona)
-Step 2: Call the LLM to generate new file contents + remediation steps + remediation commands
-Step 3: Parse the response and return LLMFixResponse
+Uses pluggable LLM provider via get_llm_provider(agent="healing").
 """
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import json
 
-from dataclasses import dataclass, field
-from datetime import datetime
 from typing import List, Dict, Optional
-
 from agents.self_healing_agent.models import LLMFixResponse, FileToFix
-from groq import Groq
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# ── constant ──────────────────────────────────────────────────────────────────
-MODEL = "openai/gpt-oss-120b"
+_provider = None  # module-level cache
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+def _get_provider():
+    global _provider
+    if _provider is None:
+        from providers.llm.llm_selector import get_llm_provider
+        _provider = get_llm_provider(agent="healing")
+    return _provider
+
+
+def _chat(prompt: str) -> str:
+    from providers.llm.llm_selector import is_quota_error, handle_quota_error
+    global _provider
+    provider = _get_provider()
+    try:
+        return provider.chat(messages=[{"role": "user", "content": prompt}]).content
+    except Exception as e:
+        if is_quota_error(e):
+            new_p = handle_quota_error(provider, agent="healing")
+            if new_p:
+                _provider = new_p
+                return new_p.chat(messages=[{"role": "user", "content": prompt}]).content
+        raise
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _build_files_block(files_to_modify: List[FileToFix]) -> str:
-    """
-    Render each FileToFix entry with its full enrichment for the prompt.
-
-    Shows the LLM:
-      - exact path to modify
-      - line number, function, and exception from the traceback
-      - one-line fix hint from the monitoring agent
-      - current on-disk content so the LLM can decide the correct action
-    """
     if not files_to_modify:
         return "No files provided."
 
@@ -48,17 +51,18 @@ def _build_files_block(files_to_modify: List[FileToFix]) -> str:
         current = f.current_content.strip()
         content_display = current if current else "(file does not exist yet — create it)"
 
-        # Build the enrichment lines — only include fields that have a value
         enrichment_lines = []
         if f.line:
-            enrichment_lines.append(f"  fix at         : line {f.line}" + (f"  in {f.function}()" if f.function else ""))
+            enrichment_lines.append(
+                f"  fix at         : line {f.line}"
+                + (f"  in {f.function}()" if f.function else "")
+            )
         if f.exception:
             enrichment_lines.append(f"  exception      : {f.exception}")
         if f.fix_description:
             enrichment_lines.append(f"  hint           : {f.fix_description}")
 
         enrichment_block = "\n".join(enrichment_lines)
-
         blocks.append(
             f"FILE {i}:\n"
             f"  path           : {f.path}\n"
@@ -68,25 +72,18 @@ def _build_files_block(files_to_modify: List[FileToFix]) -> str:
     return "\n\n".join(blocks)
 
 
-def _parse_json_block(text: str, key: str) -> any:
-    """
-    Extract a fenced JSON block that follows a section header.
-    e.g.  MODIFIED_FILES:\n```json\n[...]\n```
-    """
+def _parse_json_block(text: str, key: str):
     marker = f"{key}:"
     if marker not in text:
         return None
-
     segment = text.split(marker, 1)[1]
-    start = segment.find("```json")
+    start   = segment.find("```json")
     if start == -1:
         return None
-
     inner = segment[start + 7:]
-    end = inner.find("```")
+    end   = inner.find("```")
     if end == -1:
         return None
-
     try:
         return json.loads(inner[:end].strip())
     except (json.JSONDecodeError, ValueError):
@@ -94,10 +91,8 @@ def _parse_json_block(text: str, key: str) -> any:
 
 
 def _parse_steps(text: str) -> List[str]:
-    """Extract numbered steps from the STEPS section."""
-    steps = []
+    steps      = []
     in_section = False
-
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("STEPS:"):
@@ -110,18 +105,10 @@ def _parse_steps(text: str) -> List[str]:
                 step = stripped.lstrip("0123456789").lstrip(".) ").strip()
                 if step:
                     steps.append(step)
-
     return steps
 
 
 def _parse_confidence(text: str) -> float:
-    """
-    Extract the confidence float from the CONFIDENCE section.
-    Handles both same-line and next-line formats:
-        CONFIDENCE: 0.85
-        CONFIDENCE:
-        0.85
-    """
     lines = text.splitlines()
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -143,41 +130,19 @@ def _parse_confidence(text: str) -> float:
 
 
 def _parse_remediation_commands(text: str) -> List[Dict]:
-    """
-    Extract the REMEDIATION_COMMANDS JSON array from the LLM response.
-
-    Expected format in the response:
-
-        REMEDIATION_COMMANDS:
-        ```json
-        [
-          {
-            "command": "systemctl restart nginx",
-            "description": "Reload nginx after config update",
-            "order": 1,
-            "on_failure": "abort"   // "abort" | "continue" | "retry"
-          }
-        ]
-        ```
-
-    Returns a list of command dicts, sorted by "order" if present.
-    Falls back to an empty list if the section is missing or unparseable.
-    """
     commands = _parse_json_block(text, "REMEDIATION_COMMANDS")
     if not isinstance(commands, list):
         return []
-
     normalised = []
     for i, cmd in enumerate(commands):
         if not isinstance(cmd, dict) or not cmd.get("command"):
             continue
         normalised.append({
-            "command":     cmd.get("command", "").strip(),
+            "command"    : cmd.get("command", "").strip(),
             "description": cmd.get("description", ""),
-            "order":       int(cmd.get("order", i + 1)),
-            "on_failure":  cmd.get("on_failure", "abort"),
+            "order"      : int(cmd.get("order", i + 1)),
+            "on_failure" : cmd.get("on_failure", "abort"),
         })
-
     normalised.sort(key=lambda c: c["order"])
     return normalised
 
@@ -191,46 +156,17 @@ def fix_files(
     suggested_commands : List[str],
     files_to_modify    : List[FileToFix],
 ) -> LLMFixResponse:
-    """
-    Core fixer function.
 
-    Parameters
-    ----------
-    incident_id        : identifier forwarded from Solution
-    root_cause         : one-line diagnosis from the Knowledge Agent
-    healing_prompt     : full narrative produced by the Knowledge Agent
-    suggested_commands : shell/kubectl/docker commands already identified
-    files_to_modify    : List[FileToFix] — each carries path, line, function,
-                         exception, fix_description, and current_content
-                         (current_content is populated from disk by
-                         SelfHealingAgent._snapshot_files() before this call)
-
-    Returns
-    -------
-    LLMFixResponse with modified_files, steps, remediation_commands, and confidence
-    """
-
-    # ── step 1: render file block ─────────────────────────────────────────
     files_block    = _build_files_block(files_to_modify)
     commands_block = "\n".join(suggested_commands) if suggested_commands else "None"
 
     import platform
     os_name = "Windows (cmd.exe / PowerShell)" if platform.system() == "Windows" else f"Linux ({platform.system()})"
 
-    # ── step 2: build prompt ──────────────────────────────────────────────
     prompt = f"""You are a senior DevOps engineer operating as an autonomous self-healing agent.
-You have already diagnosed an incident. Your job now is to:
-  1. Examine the CURRENT content of each file listed below (read directly from disk).
-  2. Use the exact line number, function name, and exception type provided per file
-     to locate the precise change needed — do not guess.
-  3. Decide the correct ACTION for each file: "overwrite" (replace entire file),
-     "append" (add to end of file), or "replace_line" (targeted line swap).
-  4. Produce the EXACT new content for every file, AND the shell commands
-     that must be executed AFTER the files are written to fully remediate the incident.
 
 ━━━━━━━━━━━━━━━━━━  ENVIRONMENT  ━━━━━━━━━━━━━━━━━━
 OPERATING SYSTEM : {os_name}
-All commands MUST be valid on this OS. Do not use commands from other platforms.
 
 ━━━━━━━━━━━━━━━━━━  INCIDENT CONTEXT  ━━━━━━━━━━━━━━━━━━
 INCIDENT ID   : {incident_id}
@@ -241,55 +177,31 @@ ROOT CAUSE:
 HEALING PLAN:
 {healing_prompt}
 
-SUGGESTED COMMANDS (hints — refine or extend as needed):
+SUGGESTED COMMANDS:
 {commands_block}
 
 ━━━━━━━━━━━━━━━━━━  FILES TO MODIFY  ━━━━━━━━━━━━━━━━━━
-Each file entry shows:
-  • path           — the file to modify
-  • fix at         — exact line number and function where the exception occurred
-  • exception      — the exception type and message raised at that location
-  • hint           — one-line description of what needs to change
-  • current content — the full on-disk content of the file right now
-
-Use "fix at", "exception", and "hint" together to make a precise, targeted fix.
-
 {files_block}
 
 ━━━━━━━━━━━━━━━━━━  YOUR TASK  ━━━━━━━━━━━━━━━━━━
-For EVERY file listed above:
-  • Use the line number and exception to find exactly what is broken.
-  • Choose the most appropriate action:
-      - "overwrite"     — replace the entire file (use when restructuring or rewriting)
-      - "append"        — add lines to the end (use when only adding new content)
-      - "replace_line"  — swap specific lines (use for small, targeted fixes)
-  • Produce the COMPLETE new file content — no placeholders, no ellipsis.
-  • Preserve all lines that do not need to change.
+For EVERY file: choose action (overwrite/append/replace_line) and produce complete new content.
 
-For REMEDIATION_COMMANDS:
-  • Use the SUGGESTED COMMANDS above as your primary source — they are already correct.
-  • You may add extra commands (e.g. health checks) but keep them minimal.
-  • Order them by execution sequence using the "order" field (1 = first).
-  • Set "on_failure" to one of: "abort" (stop), "continue" (skip and proceed), "retry" (retry once).
+STRICT RULES:
+① NEVER use `pip install -r <file>` — install directly: `pip install pkg==ver`
+② NEVER use `systemctl`, `service` — not available on all platforms
+③ Health checks must use `on_failure="continue"`
+④ Every command must be valid on: {os_name}
 
-  STRICT RULES:
-  ① NEVER use `pip install -r <file>` — always install packages directly: `pip install pkg==ver`
-  ② NEVER use `systemctl`, `service`, `initctl` — not available on all platforms
-  ③ NEVER use Linux-only commands (grep, curl, cat, ls) on Windows — use Python or pip instead
-  ④ Health checks must use `on_failure="continue"` — the service may not be running
-  ⑤ Every command must be valid on: {os_name}
-
-Respond in this EXACT format (do not add extra sections):
+Respond in this EXACT format:
 
 STEPS:
-1. <what you changed and why — one file or logical group per step>
-2. ...
+1. <what you changed and why>
 
 MODIFIED_FILES:
 ```json
 [
   {{
-    "path": "<same path as above>",
+    "path": "<path>",
     "action": "<overwrite | append | replace_line>",
     "new_content": "<full file text with \\n for newlines>"
   }}
@@ -300,9 +212,9 @@ REMEDIATION_COMMANDS:
 ```json
 [
   {{
-    "command": "<exact shell/kubectl/docker command to run>",
-    "description": "<one-line explanation of what this command does and why>",
-    "order": <integer, 1 = first>,
+    "command": "<exact command>",
+    "description": "<one-line explanation>",
+    "order": <integer>,
     "on_failure": "<abort | continue | retry>"
   }}
 ]
@@ -312,15 +224,11 @@ CONFIDENCE:
 <float 0.0–1.0>
 """
 
-    # ── step 3: call model ────────────────────────────────────────────────
-    print(f"[LLMFixer] Calling {MODEL} for incident {incident_id}...")
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = response.choices[0].message.content
+    provider_name = _get_provider().name if _get_provider() else "unknown"
+    print(f"[LLMFixer] Calling {provider_name} for incident {incident_id}...")
 
-    # ── step 4: parse response ────────────────────────────────────────────
+    raw = _chat(prompt)
+
     modified_files       = _parse_json_block(raw, "MODIFIED_FILES") or []
     steps                = _parse_steps(raw)
     remediation_commands = _parse_remediation_commands(raw)
@@ -328,10 +236,8 @@ CONFIDENCE:
 
     print(
         f"[LLMFixer] Done — "
-        f"files={len(modified_files)}, "
-        f"steps={len(steps)}, "
-        f"cmds={len(remediation_commands)}, "
-        f"confidence={confidence}"
+        f"files={len(modified_files)}, steps={len(steps)}, "
+        f"cmds={len(remediation_commands)}, confidence={confidence}"
     )
 
     return LLMFixResponse(

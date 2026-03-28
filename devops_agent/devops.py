@@ -9,9 +9,6 @@ from datetime import datetime
 DEVOPS_AGENT_DIR = Path(__file__).resolve().parent
 ROOT             = DEVOPS_AGENT_DIR.parent
 
-# scaffold_agent must be on sys.path so bare `import shared` → scaffold_agent/shared.
-# knowledge_agent is NEVER added bare — it has its own shared/ that collides.
-# We load it via a scoped importlib helper below.
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DEVOPS_AGENT_DIR))
 sys.path.insert(0, str(ROOT / "agents" / "scaffold_agent"))
@@ -25,6 +22,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+# ── LLM Provider selector ──────────────────────────────────────────────────────
+try:
+    from providers.llm.llm_selector import (
+        get_llm_provider,
+        handle_quota_error,
+        is_quota_error,
+        get_all_agent_configs,
+    )
+    _LLM_SELECTOR_AVAILABLE = True
+except ImportError:
+    _LLM_SELECTOR_AVAILABLE = False
 
 # ── Optional agents ────────────────────────────────────────────────────────────
 try:
@@ -41,32 +50,19 @@ try:
 except ImportError:
     _MONITORING_AVAILABLE = False
 
+
 def _load_knowledge_adapter():
-    """
-    Load KnowledgeAgentAdapter without polluting sys.path with knowledge_agent/
-    bare — which would cause `from shared.models import ProjectContext` inside
-    ScaffoldAgent to resolve to knowledge_agent/shared instead of scaffold_agent/shared.
-
-    Strategy: use importlib to load from absolute path, pre-seeding sys.modules
-    with knowledge_agent/shared/* so setup_path's fallback never fires.
-    """
     import importlib.util
-
     ka_root      = ROOT / "agents" / "knowledge_agent"
     adapter_path = ka_root / "knowledge_core" / "knowledge_agent_adapter.py"
     if not adapter_path.exists():
         return FileNotFoundError(f"Not found: {adapter_path}")
-
     ka_root_s = str(ka_root)
     inserted  = ka_root_s not in sys.path
     saved     = {}
-
     try:
         if inserted:
             sys.path.insert(0, ka_root_s)
-
-        # Pre-load knowledge_agent's shared package so any bare `import shared`
-        # inside the adapter resolves to the correct module.
         for mod_name, rel in [
             ("shared",        "shared/__init__.py"),
             ("shared.models", "shared/models.py"),
@@ -81,10 +77,8 @@ def _load_knowledge_adapter():
             mod  = importlib.util.module_from_spec(spec)
             sys.modules[mod_name] = mod
             spec.loader.exec_module(mod)
-
         from agents.knowledge_agent.knowledge_core.knowledge_agent_adapter import KnowledgeAgentAdapter
         return KnowledgeAgentAdapter
-
     except Exception as exc:
         return exc
     finally:
@@ -92,6 +86,7 @@ def _load_knowledge_adapter():
             sys.modules[k] = v
         if inserted and ka_root_s in sys.path:
             sys.path.remove(ka_root_s)
+
 
 _ka_result           = _load_knowledge_adapter()
 _KNOWLEDGE_AVAILABLE = not isinstance(_ka_result, Exception)
@@ -108,6 +103,7 @@ for _lib in ["agents", "core", "httpx", "aiohttp", "urllib3", "groq",
 # ── ANSI ───────────────────────────────────────────────────────────────────────
 import ctypes as _ctypes
 
+
 def _ansi_supported() -> bool:
     if not sys.stdout.isatty():
         return False
@@ -123,8 +119,8 @@ def _ansi_supported() -> bool:
     except Exception:
         return False
 
-_ANSI = _ansi_supported()
 
+_ANSI = _ansi_supported()
 _R  = "\033[0m"  if _ANSI else ""
 _B  = "\033[1m"  if _ANSI else ""
 _D  = "\033[2m"  if _ANSI else ""
@@ -132,7 +128,6 @@ _CY = "\033[36m" if _ANSI else ""
 _GR = "\033[32m" if _ANSI else ""
 _YL = "\033[33m" if _ANSI else ""
 _RD = "\033[31m" if _ANSI else ""
-_CL = "\033[2J\033[H" if _ANSI else ""
 
 _LOGO = [
     "",
@@ -149,22 +144,28 @@ _LOGO = [
 
 
 def _print_logo():
-    """Print the logo exactly once at startup."""
     for line in _LOGO:
         print(line)
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
+#
+# FIX: Dashboard interference with agent output.
+#
+# ROOT CAUSE: The dashboard uses ANSI cursor-up sequences to redraw in-place.
+# When an agent prints output while the dashboard is "running", the next
+# redraw moves the cursor up N lines and overwrites the agent's output.
+#
+# SOLUTION:
+#   1. pause() sets _first_draw=True so next draw starts FRESH (no cursor-up)
+#   2. resume() does NOT immediately redraw — waits for the 5s loop tick
+#   3. Loop interval is 5s (was 2s) — less interruption
+#   4. Heavy agent output events (SCAFFOLD_STARTED, INCIDENT_CREATED, etc.)
+#      automatically call pause() before their output and resume() after
+#
+# Result: agent output is always visible, dashboard only redraws when safe.
 
 class Dashboard:
-    """
-    Status panel that redraws in-place every 2 seconds.
-    Does NOT contain the logo — logo is printed once before this starts.
-    Pauses completely during approval prompts so input is never clobbered.
-    """
-
-    # How many lines the status panel occupies (used to move cursor back up)
-    _HEIGHT = 20
 
     def __init__(self, orchestrator: Orchestrator):
         self._orch        = orchestrator
@@ -176,9 +177,8 @@ class Dashboard:
         self._start       = datetime.utcnow()
         self._paused      = False
         self._first_draw  = True
+        self._last_lines  = 0
         self._task: asyncio.Task | None = None
-
-    # ── lifecycle ──────────────────────────────────────────────────────────
 
     def start(self):
         self._task = asyncio.create_task(self._loop(), name="dashboard")
@@ -186,22 +186,21 @@ class Dashboard:
     def stop(self):
         if self._task and not self._task.done():
             self._task.cancel()
-        # Move cursor below the panel so subsequent prints don't overlap
         sys.stdout.write("\n")
         sys.stdout.flush()
 
     def pause(self):
-        """Freeze redraws — call before any print/input operation."""
-        self._paused = True
-        # Move cursor to a clean line below the panel
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        """
+        Stop dashboard redraws and reset to fresh-draw mode.
+        After pause(), the next _draw() will print below current output
+        instead of moving cursor up — so agent output is preserved.
+        """
+        self._paused     = True
+        self._first_draw = True  # forces fresh draw on next resume
 
     def resume(self):
-        """Unfreeze redraws and immediately redraw."""
-        self._paused    = False
-        self._first_draw = True   # force full clear+redraw
-        self._draw()
+        """Resume redraws. Does NOT draw immediately — waits for loop tick."""
+        self._paused = False
 
     def set_stage(self, stage: str):
         self._stage = stage
@@ -209,12 +208,10 @@ class Dashboard:
     def event(self, msg: str):
         self._last_event = msg
 
-    # ── background loop ────────────────────────────────────────────────────
-
     async def _loop(self):
         while True:
             try:
-                await asyncio.sleep(2)
+                await asyncio.sleep(5)  # 5s interval — less interference
                 if not self._paused:
                     self._draw()
             except asyncio.CancelledError:
@@ -222,9 +219,10 @@ class Dashboard:
             except Exception:
                 pass
 
-    # ── rendering ──────────────────────────────────────────────────────────
-
     def _draw(self):
+        if self._paused:
+            return
+
         now    = datetime.utcnow()
         up     = int((now - self._start).total_seconds())
         um, us = divmod(up, 60)
@@ -256,7 +254,7 @@ class Dashboard:
             ts   = inc.created_at.strftime("%H:%M:%S") if hasattr(inc, "created_at") else ""
             sev  = inc.severity.value if hasattr(inc, "severity") else "?"
             sc3  = _RD if sev in ("critical", "high") else _YL
-            st   = inc.status.value  if hasattr(inc, "status")   else "?"
+            st   = inc.status.value if hasattr(inc, "status") else "?"
             stc  = _YL if st != "resolved" else _GR
             desc = (inc.description[:30] + "…") if hasattr(inc, "description") and len(inc.description) > 30 else getattr(inc, "description", "")
             return (
@@ -284,8 +282,8 @@ class Dashboard:
 
         lines.append(div)
         lines.append(f"  {_B}AGENTS{_R}")
-        for a in ["scaffold_agent","cicd_agent","monitoring_agent",
-                  "knowledge_agent","self_healing_agent","alerting_agent"]:
+        for a in ["scaffold_agent", "cicd_agent", "monitoring_agent",
+                  "knowledge_agent", "self_healing_agent", "alerting_agent"]:
             lines.append(agent_row(a))
 
         lines.append(div)
@@ -301,12 +299,15 @@ class Dashboard:
         lines.append(div)
 
         if self._first_draw or not _ANSI:
+            # Fresh draw — just print, no cursor movement
             sys.stdout.write("\n".join(lines) + "\n")
             self._first_draw = False
+            self._last_lines = len(lines)
         else:
-            n = len(lines)
-            up_seq = f"\033[{n + 1}A"
-            sys.stdout.write(up_seq + "\033[J" + "\n".join(lines) + "\n")
+            # In-place redraw — only safe when nothing else has printed
+            n = self._last_lines
+            sys.stdout.write(f"\033[{n+1}A\033[J" + "\n".join(lines) + "\n")
+            self._last_lines = len(lines)
 
         sys.stdout.flush()
 
@@ -314,18 +315,117 @@ class Dashboard:
 # ── Approval wrapper ───────────────────────────────────────────────────────────
 
 def _patch_approval(approval_manager, dashboard: Dashboard):
-    """Pause dashboard during approval prompts so it never clears the input."""
     original = approval_manager.request_approval
 
     async def patched(title, details=None, context=None):
         dashboard.pause()
-        await asyncio.sleep(0)     # let any in-flight redraw finish
+        await asyncio.sleep(0.1)
         try:
             return await original(title=title, details=details, context=context)
         finally:
             dashboard.resume()
 
     approval_manager.request_approval = patched
+
+
+# ── LLM provider selection ────────────────────────────────────────────────────
+
+def _select_llm_providers_upfront(dashboard: Dashboard) -> dict:
+    if not _LLM_SELECTOR_AVAILABLE:
+        return {}
+
+    providers = {}
+    agents = [
+        ("scaffold",  "Scaffold Agent  — generates Dockerfile, k8s, CI/CD"),
+        ("knowledge", "Knowledge Agent — RAG + LLM solution generation"),
+        ("healing",   "Self-Healing Agent — applies code fixes"),
+    ]
+
+    print(f"\n{'═'*55}")
+    print(f"  {_B}LLM Provider Setup{_R}")
+    print(f"  Configure the AI model for each agent.")
+    print(f"{'─'*55}")
+
+    for agent_key, label in agents:
+        try:
+            provider = get_llm_provider(agent=agent_key)
+            providers[agent_key] = provider
+        except Exception as e:
+            print(f"  {_YL}Skipped {agent_key}: {e}{_R}")
+
+    print(f"{'═'*55}\n")
+    return providers
+
+
+def _attach_llm_providers_to_orchestrator(orchestrator, dashboard, providers):
+    if not _LLM_SELECTOR_AVAILABLE or not providers:
+        return
+
+    _AGENT_KEY_MAP = {
+        "scaffold_agent"    : "scaffold",
+        "knowledge_agent"   : "knowledge",
+        "self_healing_agent": "healing",
+    }
+
+    def _inject_provider(agent_name, agent_obj):
+        selector_key = _AGENT_KEY_MAP.get(agent_name)
+        if not selector_key:
+            return
+        provider = providers.get(selector_key)
+        if not provider:
+            return
+        if hasattr(agent_obj, "set_llm_provider"):
+            agent_obj.set_llm_provider(provider)
+        if not hasattr(orchestrator, "llm_providers"):
+            orchestrator.llm_providers = {}
+        orchestrator.llm_providers[agent_name] = provider
+
+    _orig_scaffold = orchestrator._on_scaffold_started
+    async def _wrapped_scaffold(event):
+        agent = orchestrator.registry.get_agent("scaffold_agent")
+        if agent:
+            _inject_provider("scaffold_agent", agent)
+        await _orig_scaffold(event)
+    orchestrator._on_scaffold_started = _wrapped_scaffold
+    orchestrator.event_bus._subscribers.get("scaffold_started", []).clear()
+    orchestrator.event_bus.subscribe(EventType.SCAFFOLD_STARTED, _wrapped_scaffold)
+
+    _orig_incident = orchestrator._on_incident_created
+    async def _wrapped_incident(event):
+        agent = orchestrator.registry.get_agent("knowledge_agent")
+        if agent:
+            _inject_provider("knowledge_agent", agent)
+        await _orig_incident(event)
+    orchestrator._on_incident_created = _wrapped_incident
+    orchestrator.event_bus._subscribers.get("incident_created", []).clear()
+    orchestrator.event_bus.subscribe(EventType.INCIDENT_CREATED, _wrapped_incident)
+
+    _orig_investigation = orchestrator._on_investigation_complete
+    async def _wrapped_investigation(event):
+        agent = orchestrator.registry.get_agent("self_healing_agent")
+        if agent:
+            _inject_provider("self_healing_agent", agent)
+        await _orig_investigation(event)
+    orchestrator._on_investigation_complete = _wrapped_investigation
+    orchestrator.event_bus._subscribers.get("investigation_complete", []).clear()
+    orchestrator.event_bus.subscribe(EventType.INVESTIGATION_COMPLETE, _wrapped_investigation)
+
+
+# ── Event tracker — pauses dashboard around heavy output ──────────────────────
+
+# Events that trigger heavy agent output → pause before, resume after
+_PAUSE_BEFORE = {
+    EventType.SCAFFOLD_STARTED,
+    EventType.INCIDENT_CREATED,
+    EventType.INVESTIGATION_COMPLETE,
+}
+_RESUME_AFTER = {
+    EventType.SCAFFOLD_COMPLETE,
+    EventType.SCAFFOLD_FAILED,
+    EventType.DEPLOYMENT_COMPLETE,
+    EventType.REMEDIATION_COMPLETE,
+    EventType.REMEDIATION_FAILED,
+}
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -338,7 +438,64 @@ async def _run_scaffold():
 
     _patch_approval(orchestrator.approval, dashboard)
 
-    # ── agents ────────────────────────────────────────────────────────────
+    state_file = Path(project_path) / ".devops_state"
+    first_run  = not state_file.exists()
+    _print_logo()
+
+    _SCAFFOLD_FILES = [
+        "Dockerfile", "docker-compose.yml", ".dockerignore",
+        ".github/workflows/deploy.yml",
+        "k8s/deployment.yaml", "k8s/service.yaml", "k8s/ingress.yaml",
+    ]
+    _existing      = [f for f in _SCAFFOLD_FILES if (Path(project_path) / f).exists()]
+    _skip_scaffold = False
+    _run_flow      = True
+
+    if not first_run:
+        if _existing:
+            dashboard.pause()
+            print(f"\n{'─'*55}")
+            print(f"  This project was previously deployed.")
+            print(f"  Scaffold files already exist ({len(_existing)} files).")
+            print(f"{'─'*55}")
+            try:
+                answer = input("  Re-generate scaffold files? [yes/no]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "no"
+            dashboard.resume()
+            if answer not in ("yes", "y"):
+                _skip_scaffold = True
+
+        dashboard.pause()
+        print(f"\n{'─'*55}")
+        print(f"  Run the full DevOps pipeline again?")
+        print(f"  (Scaffold → CI/CD → Monitor → Heal)")
+        print(f"{'─'*55}")
+
+        if _LLM_SELECTOR_AVAILABLE:
+            saved = get_all_agent_configs()
+            if saved:
+                print(f"  {_D}Saved LLM providers:{_R}")
+                for k, v in saved.items():
+                    if isinstance(v, dict):
+                        print(f"    {_D}{k:<12} → {v.get('provider','?').upper()} / {v.get('model','?')}{_R}")
+                print()
+
+        try:
+            answer = input("  Proceed? [yes/no]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "no"
+        dashboard.resume()
+
+        if answer not in ("yes", "y"):
+            _run_flow = False
+            print("  Skipping pipeline — launching chat agent.\n")
+
+    # ── Select LLM providers upfront ─────────────────────────────────────
+    llm_providers = _select_llm_providers_upfront(dashboard)
+    _attach_llm_providers_to_orchestrator(orchestrator, dashboard, llm_providers)
+
+    # ── Register agents ───────────────────────────────────────────────────
     orchestrator.register_agent("scaffold_agent", ScaffoldAgent(scaffold_config))
     dashboard._project = project_path
     dashboard.event("scaffold ready")
@@ -370,7 +527,7 @@ async def _run_scaffold():
             context_manager = orchestrator.context_manager,
             state_manager   = orchestrator.state_manager,
             groq_api_key    = os.getenv("GROQ_API_KEY"),
-            live_dashboard  = False,    # we control the dashboard here
+            live_dashboard  = False,
         )
         await monitoring_agent.start()
         orchestrator.register_agent("monitoring_agent", monitoring_agent)
@@ -396,19 +553,23 @@ async def _run_scaffold():
 
     await orchestrator.start()
 
-    # ── event → dashboard tracker ──────────────────────────────────────────
+    # ── Event tracker ──────────────────────────────────────────────────────
     orig_pub = orchestrator.event_bus.publish
 
     async def _tracked(event):
+        # Pause dashboard BEFORE events that produce heavy output
+        if event.type in _PAUSE_BEFORE:
+            dashboard.pause()
+
         _stage_map = {
-            EventType.SCAFFOLD_STARTED     : ("SCAFFOLD",    "scaffold agent running"),
-            EventType.SCAFFOLD_COMPLETE    : ("CICD",        lambda e: f"scaffold done — {e.data.get('framework','?')} · {len(e.data.get('generated_files',[]))} files"),
-            EventType.SCAFFOLD_FAILED      : ("DONE",        lambda e: f"scaffold failed — {e.data.get('error','')}"),
-            EventType.DEPLOYMENT_COMPLETE  : ("MONITORING",  lambda e: f"ci/cd {e.data.get('status','?')} — {len(e.data.get('logs',[]))} log lines"),
-            EventType.INCIDENT_CREATED     : ("INCIDENT",    lambda e: f"incident [{e.data.get('severity','?').upper()}] — {e.data.get('service','?')}"),
-            EventType.INVESTIGATION_COMPLETE:("MONITORING",  "knowledge agent investigation complete"),
-            EventType.REMEDIATION_COMPLETE : ("DONE",        "remediation complete — incident resolved"),
-            EventType.REMEDIATION_FAILED   : ("DONE",        "remediation failed — manual intervention needed"),
+            EventType.SCAFFOLD_STARTED     : ("SCAFFOLD",   "scaffold agent running"),
+            EventType.SCAFFOLD_COMPLETE    : ("CICD",       lambda e: f"scaffold done — {e.data.get('framework','?')} · {len(e.data.get('generated_files',[]))} files"),
+            EventType.SCAFFOLD_FAILED      : ("DONE",       lambda e: f"scaffold failed — {e.data.get('error','')}"),
+            EventType.DEPLOYMENT_COMPLETE  : ("MONITORING", lambda e: f"ci/cd {e.data.get('status','?')} — {len(e.data.get('logs',[]))} log lines"),
+            EventType.INCIDENT_CREATED     : ("INCIDENT",   lambda e: f"incident [{e.data.get('severity','?').upper()}] — {e.data.get('service','?')}"),
+            EventType.INVESTIGATION_COMPLETE:("MONITORING", "knowledge agent investigation complete"),
+            EventType.REMEDIATION_COMPLETE : ("DONE",       "remediation complete — incident resolved"),
+            EventType.REMEDIATION_FAILED   : ("DONE",       "remediation failed — manual intervention needed"),
         }
         if event.type in _stage_map:
             stage, msg = _stage_map[event.type]
@@ -418,22 +579,38 @@ async def _run_scaffold():
                 status = event.data.get("status", "")
                 dashboard._cicd_status = (
                     "success" if status == "success"
-                    else "failed" if status in ("failed","failure")
+                    else "failed" if status in ("failed", "failure")
                     else status
                 )
                 if event.data.get("repo_url"):
                     dashboard._repo = event.data["repo_url"]
+
         await orig_pub(event)
+
+        # Resume dashboard AFTER events that are done producing output
+        if event.type in _RESUME_AFTER:
+            dashboard.resume()
 
     orchestrator.event_bus.publish = _tracked
 
-    # ── print logo once, then start live status panel ─────────────────────
-    _print_logo()
+    # ── Start dashboard ────────────────────────────────────────────────────
     dashboard.set_stage("SCAFFOLD")
     dashboard.start()
-    dashboard._draw()    # draw immediately so panel shows before first poll
+    dashboard._draw()
 
-    await orchestrator.run_scaffold(project_path=project_path)
+    if not _run_flow:
+        dashboard.set_stage("DONE")
+        dashboard.event("flow skipped — chat mode")
+        dashboard._draw()
+        await asyncio.sleep(1)
+        dashboard.stop()
+        return
+
+    await orchestrator.run_scaffold(
+        project_path  = project_path,
+        dry_run       = False,
+        skip_scaffold = _skip_scaffold,
+    )
 
     dashboard.set_stage("DONE")
     dashboard.event("pipeline complete")
@@ -445,11 +622,40 @@ async def _run_scaffold():
 def main():
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    project_path = str(Path.cwd())
+    state_file   = Path(project_path) / ".devops_state"
+
     try:
         asyncio.run(_run_scaffold())
     except KeyboardInterrupt:
         pass
-    AgentController().run()
+
+    try:
+        state_file.write_text(
+            f"deployed_at={datetime.utcnow().isoformat()}\n"
+            f"project={project_path}\n"
+        )
+    except Exception:
+        pass
+
+    print(f"\n{'─'*55}")
+    print(f"  Pipeline complete. What would you like to do?")
+    print(f"{'─'*55}")
+    print(f"  [1] Run pipeline again")
+    print(f"  [2] Open chat agent (manual tasks)")
+    print(f"  [3] Exit")
+    print(f"{'─'*55}")
+    try:
+        _choice = input("  Choose [1/2/3]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        _choice = "3"
+
+    if _choice == "1":
+        main()
+        return
+    elif _choice == "2":
+        AgentController().run()
 
 
 if __name__ == "__main__":
