@@ -2,17 +2,14 @@
 core/orchestrator.py
 
 KEY CHANGES (vs original):
-  1. __init__ accepts optional slack / email clients.
-  2. ApprovalManager is initialized with those clients.
+  1. __init__ accepts optional email client only (Slack removed).
+  2. ApprovalManager is initialized with the email client.
   3. ApprovalServer (HTTP) is created and started/stopped via
      start_approval_server() / stop_approval_server() — called by devops.py.
-  4. _send_alert() now fires on SlackClient + EmailClient in addition to
-     the legacy alerting_agent path.
+  4. _send_alert() routes to email only; urgent=True (HIGH/CRITICAL severity)
+     activates the emergency lane which broadcasts to the full EMAIL_TEAM list.
   5. _pause_monitoring / _resume_monitoring removed from orchestrator body —
      they now live inside ApprovalManager, which calls them automatically.
-     Callers that used self._pause_monitoring() / self._resume_monitoring()
-     around approval calls still compile (the methods still exist as stubs
-     for backward compat) but are no longer needed.
 """
 
 import asyncio
@@ -36,13 +33,8 @@ from core.agent_registery import AgentRegistry
 from core.approval_manager import ApprovalManager
 from core.approval_server  import ApprovalServer
 
-# Optional — only imported if the client objects are provided
-# (avoids hard dependency when Slack/Email are not configured)
-try:
-    from core.slack_client import SlackClient as _SlackClient
-except ImportError:
-    _SlackClient = None
-
+# Optional — only imported if the email client object is provided
+# (avoids hard dependency when Email is not configured)
 try:
     from core.email_client import EmailClient as _EmailClient
 except ImportError:
@@ -210,7 +202,6 @@ class Orchestrator:
 
     def __init__(
         self,
-        slack=None,    # core.slack_client.SlackClient  — optional
         email=None,    # core.email_client.EmailClient  — optional
     ):
         self.event_bus       = EventBus()
@@ -218,27 +209,24 @@ class Orchestrator:
         self.context_manager = ContextManager()
         self.registry        = AgentRegistry()
 
-        # Store notification clients for _send_alert()
-        self._slack = slack
+        # Store email client for _send_alert()
         self._email = email
 
         # ── Approval stack ────────────────────────────────────────────
         self.approval = ApprovalManager(
-            slack           = slack,
             email           = email,
             timeout_seconds = 300,
             registry        = self.registry,
         )
 
-        # HTTP server for Slack button callbacks + email link clicks.
+        # HTTP server for email link clicks (approve/deny).
         # Created here; started/stopped by devops.py around the pipeline.
         self._approval_server: Optional[ApprovalServer] = (
             ApprovalServer(
                 approval_manager = self.approval,
-                slack_client     = slack,
                 email_client     = email,
             )
-            if (slack or email)
+            if email
             else None
         )
 
@@ -268,14 +256,13 @@ class Orchestrator:
     # ── Approval server lifecycle (called by devops.py) ───────────────────────
 
     async def start_approval_server(self) -> None:
-        """Start the HTTP server that receives Slack callbacks and email link clicks."""
+        """Start the HTTP server that receives email link clicks (approve/deny)."""
         if self._approval_server:
             url = await self._approval_server.start()
             logger.info("[Orchestrator] ApprovalServer started at %s", url)
             if url:
                 print(f"\n  [ApprovalServer] Listening at: {url}")
-                print(f"  [ApprovalServer] Paste this into Slack App → Interactivity → Request URL:")
-                print(f"  [ApprovalServer]   {url}/slack/interactive\n")
+                print(f"  [ApprovalServer] Email approve/deny links will use this base URL.\n")
 
     async def stop_approval_server(self) -> None:
         """Stop the HTTP server and close any ngrok tunnel."""
@@ -1351,6 +1338,7 @@ class Orchestrator:
             incident_id = event.incident_id,
             title       = "✅ Incident Resolved",
             message     = f"Incident {event.incident_id} resolved. Files fixed: {files_fixed}.",
+            severity    = event.data.get("severity", ""),
         )
         self.context_manager.drop_context(event.incident_id)
 
@@ -1364,14 +1352,26 @@ class Orchestrator:
             incident_id = event.incident_id,
             title       = "❌ Remediation Failed",
             message     = f"Incident {event.incident_id} could not be resolved. Errors: {errors}.",
+            severity    = event.data.get("severity", "high"),
         )
 
     # ── Alerting (one-way notifications, not approval gates) ──────────────────
 
-    async def _send_alert(self, incident_id: str, title: str, message: str) -> None:
+    async def _send_alert(
+        self,
+        incident_id: str,
+        title:       str,
+        message:     str,
+        severity:    str = "",
+    ) -> None:
         """
-        Send a one-way alert notification via all configured channels.
+        Send a one-way alert notification via email.
         This is NOT an approval gate — no response is expected.
+
+        Routing:
+          Normal (low/medium or no severity) → EMAIL_TO only (primary dev).
+          HIGH or CRITICAL                   → emergency lane: EMAIL_TO + full
+                                               EMAIL_TEAM list simultaneously.
 
         Fires on:
           • Deployment complete (CI/CD status)
@@ -1379,19 +1379,16 @@ class Orchestrator:
           • Remediation failed
           • Manual action required
         """
-        urgent = any(
-            kw in title.lower()
-            for kw in ("failed", "critical", "manual action", "remediation failed")
+        severity_upper = severity.upper()
+        urgent = (
+            severity_upper in ("HIGH", "CRITICAL")
+            or any(
+                kw in title.lower()
+                for kw in ("failed", "critical", "manual action", "remediation failed")
+            )
         )
 
-        # Slack alert
-        if self._slack:
-            try:
-                await self._slack.send_alert(title=title, message=message, urgent=urgent)
-            except Exception as exc:
-                logger.error("[Orchestrator] Slack alert failed: %s", exc)
-
-        # Email alert
+        # Email alert (primary + optional team broadcast on urgent)
         if self._email:
             try:
                 await self._email.send_alert(title=title, message=message, urgent=urgent)

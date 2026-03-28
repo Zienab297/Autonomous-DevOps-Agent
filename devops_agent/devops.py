@@ -25,12 +25,6 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 # ── Optional notification clients ──────────────────────────────────────────────
 try:
-    from core.slack_client import SlackClient
-    _SLACK_MODULE_AVAILABLE = True
-except ImportError:
-    _SLACK_MODULE_AVAILABLE = False
-
-try:
     from core.email_client import EmailClient
     _EMAIL_MODULE_AVAILABLE = True
 except ImportError:
@@ -141,7 +135,7 @@ _CL = "\033[2J\033[H" if _ANSI else ""
 
 _LOGO = [
     "",
-    f"  {_B}{_CY}██████╗ ███████╗██╗   ██╗ ██████╗ ██████╗ ███████╗{_R}",
+    f"  {_B}{_CY}██████╗ ███████╗██╗   ██╗ ██████╗ ██████╗███████╗{_R}",
     f"  {_B}{_CY}██╔══██╗██╔════╝██║   ██║██╔═══██╗██╔══██╗██╔════╝{_R}",
     f"  {_B}{_CY}██║  ██║█████╗  ██║   ██║██║   ██║██████╔╝███████╗{_R}",
     f"  {_B}{_CY}██║  ██║██╔══╝  ╚██╗ ██╔╝██║   ██║██╔═══╝ ╚════██║{_R}",
@@ -158,177 +152,124 @@ def _print_logo():
         print(line)
 
 
-# ── Notification client builders ───────────────────────────────────────────────
-
-def _build_slack_client():
-    """
-    Build SlackClient from .env vars.
-    Returns None silently if any required var is missing.
-    The user adds these to their project's .env file.
-    """
-    if not _SLACK_MODULE_AVAILABLE:
-        return None
-
-    token    = os.getenv("SLACK_BOT_TOKEN", "").strip()
-    channel  = os.getenv("SLACK_CHANNEL", "").strip()
-    approval = os.getenv("SLACK_APPROVAL_CHANNEL", channel).strip()
-
-    if not token or not channel:
-        return None
-
-    try:
-        client = SlackClient(
-            bot_token        = token,
-            channel          = channel,
-            approval_channel = approval,
-        )
-        print(f"  [Slack] ✓ alerts → {channel}  |  approvals → {approval}")
-        return client
-    except Exception as exc:
-        print(f"  [Slack] ✗ failed to init: {exc}")
-        return None
-
+# ── Email client builder ───────────────────────────────────────────────────────
 
 def _build_email_client():
     """
     Build EmailClient from .env vars.
+
+    Primary recipient  : EMAIL_TO           (required for email to be enabled)
+    Team broadcast list: EMAIL_TEAM         (comma-separated, optional)
+                         Used for the emergency lane when severity is HIGH/CRITICAL.
+
     Returns None silently if any required var is missing.
-    The user adds these to their project's .env file.
     """
     if not _EMAIL_MODULE_AVAILABLE:
         return None
 
-    host     = os.getenv("SMTP_HOST", "").strip()
-    port_s   = os.getenv("SMTP_PORT", "587").strip()
+    host     = os.getenv("SMTP_HOST",     "").strip()
+    port_s   = os.getenv("SMTP_PORT",     "587").strip()
     username = os.getenv("SMTP_USERNAME", "").strip()
     password = os.getenv("SMTP_PASSWORD", "").strip()
-    from_    = os.getenv("EMAIL_FROM", username).strip()
-    to_      = os.getenv("EMAIL_TO", "").strip()
+    from_    = os.getenv("EMAIL_FROM",    username).strip()
+    to_      = os.getenv("EMAIL_TO",      "").strip()
+
+    # EMAIL_TEAM is a comma-separated list; strip whitespace around each address
+    team_raw = os.getenv("EMAIL_TEAM", "").strip()
+    team     = [a.strip() for a in team_raw.split(",") if a.strip()] if team_raw else []
 
     if not (host and username and password and to_):
         return None
 
     try:
+        port   = int(port_s)
         client = EmailClient(
-            smtp_host    = host,
-            smtp_port    = int(port_s),
-            username     = username,
-            password     = password,
-            from_address = from_,
-            to_address   = to_,
-            # approval_base_url is injected later by ApprovalServer after ngrok binds
+            smtp_host         = host,
+            smtp_port         = port,
+            username          = username,
+            password          = password,
+            from_address      = from_,
+            to_address        = to_,
+            team_addresses    = team,
+            approval_base_url = os.getenv("APPROVAL_BASE_URL", "").strip(),
         )
-        print(f"  [Email] ✓ alerts + approvals → {to_}")
+        team_info = f"  |  team emergency lane → {len(team)} extra address(es)" if team else ""
+        print(f"  [Email] ✓ alerts / approvals → {to_}{team_info}")
         return client
     except Exception as exc:
         print(f"  [Email] ✗ failed to init: {exc}")
         return None
 
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
+# ── Live status dashboard ──────────────────────────────────────────────────────
 
 class Dashboard:
-    """
-    Status panel that redraws in-place every 2 seconds.
-    Does NOT contain the logo — logo is printed once before this starts.
-    Pauses completely during approval prompts so input is never clobbered.
-    """
-
-    _HEIGHT = 20
+    """Minimal in-terminal live status panel (redraws in-place on ANSI terminals)."""
 
     def __init__(self, orchestrator: Orchestrator):
         self._orch        = orchestrator
-        self._stage       = "INIT"
+        self._stage       = "IDLE"
+        self._last_event  = "starting…"
         self._project     = ""
         self._repo        = ""
         self._cicd_status = ""
-        self._last_event  = ""
-        self._start       = datetime.utcnow()
         self._paused      = False
+        self._task        = None
         self._first_draw  = True
-        self._task: asyncio.Task | None = None
+        self._started_at  = datetime.utcnow()
+
+    def set_stage(self, s: str):  self._stage = s
+    def event(self, msg: str):    self._last_event = msg
+
+    def pause(self):  self._paused = True
+    def resume(self): self._paused = False
 
     def start(self):
-        self._task = asyncio.create_task(self._loop(), name="dashboard")
+        if _ANSI:
+            self._task = asyncio.get_event_loop().call_later(2, self._tick)
 
     def stop(self):
-        if self._task and not self._task.done():
+        if self._task:
             self._task.cancel()
-        sys.stdout.write("\n")
-        sys.stdout.flush()
 
-    def pause(self):
-        self._paused = True
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-    def resume(self):
-        self._paused    = False
-        self._first_draw = True
-        self._draw()
-
-    def set_stage(self, stage: str):
-        self._stage = stage
-
-    def event(self, msg: str):
-        self._last_event = msg
+    def _tick(self):
         if not self._paused:
             self._draw()
-
-    async def _loop(self):
-        while True:
-            await asyncio.sleep(2)
-            if not self._paused:
-                self._draw()
+        self._task = asyncio.get_event_loop().call_later(2, self._tick)
 
     def _draw(self):
         if self._paused:
             return
 
-        orch      = self._orch
-        incidents = list(orch.state_manager.get_all_incidents()) if hasattr(orch.state_manager, "get_all_incidents") else []
+        now       = datetime.utcnow()
+        elapsed   = int((now - self._started_at).total_seconds())
+        uh, rem   = divmod(elapsed, 3600)
+        um, us    = divmod(rem, 60)
+        W         = 52
 
-        now      = datetime.utcnow()
-        elapsed  = int((now - self._start).total_seconds())
-        uh, rem  = divmod(elapsed, 3600)
-        um, us   = divmod(rem, 60)
-
-        W = 58
-
-        sc = {
-            "INIT": _D, "SCAFFOLD": _CY, "CICD": _CY,
-            "MONITORING": _YL, "INCIDENT": _RD,
-            "HEALING": _YL, "DONE": _GR,
-        }.get(self._stage, _R)
+        incidents = self._orch.state_manager.get_active_incidents() if hasattr(
+            self._orch.state_manager, "get_active_incidents") else []
 
         def agent_row(name):
-            registered = orch.registry.get_agent(name) is not None
-            raw = orch._dashboard["agents"].get(name, "IDLE" if registered else "—")
-            if not registered:
-                sym, col = "○", _D
-            elif raw == "RUNNING":
-                sym, col = "▶", _YL
-            elif raw == "IDLE":
-                sym, col = "●", _GR
-            else:
-                sym, col = "○", _D
-            return f"  {sym} {name:<24} {col}{raw}{_R}"
+            raw  = self._orch._dashboard["agents"].get(name, "IDLE")
+            st   = str(raw).upper()
+            stc  = _GR if st == "IDLE" else _YL if st in ("RUNNING","BUSY") else _RD
+            return f"  {_D}{name:<22}{_R}  {_B}{stc}{st}{_R}"
 
         def inc_row(inc):
-            ts   = inc.created_at.strftime("%H:%M:%S") if hasattr(inc, "created_at") else ""
-            sev  = inc.severity.value if hasattr(inc, "severity") else "?"
-            sc3  = _RD if sev in ("critical", "high") else _YL
-            st   = inc.status.value  if hasattr(inc, "status")   else "?"
-            stc  = _YL if st != "resolved" else _GR
-            desc = (inc.description[:30] + "…") if hasattr(inc, "description") and len(inc.description) > 30 else getattr(inc, "description", "")
+            sev  = getattr(inc, "severity", "?")
+            svc  = getattr(inc, "service",  "?")
+            desc = getattr(inc, "description", "")[:38]
+            st   = str(getattr(inc, "status", "?")).upper()
+            stc  = _GR if "RESOLV" in st else _RD if "FAIL" in st else _YL
             return (
-                f"  {_D}{ts}{_R}  {_B}{sc3}{sev.upper():<8}{_R}"
-                f"  {_D}{inc.service:<18}{_R}  {_B}{stc}{st}{_R}\n"
+                f"  {_D}{svc:<18}{_R}  {_B}{stc}{st}{_R}\n"
                 f"           {_D}{desc}{_R}"
             )
 
         lines = []
         div   = f"  {_D}{'─'*W}{_R}"
+        sc    = _GR if self._stage == "DONE" else _YL
 
         lines.append(div)
         lines.append(
@@ -396,16 +337,15 @@ async def _run_scaffold():
     project_path    = str(Path.cwd())
     scaffold_config = load_scaffold_config()
 
-    # ── Build notification clients from .env ──────────────────────────────
+    # ── Build email client from .env ──────────────────────────────────────
     print("\n  Checking notification channels...")
-    slack = _build_slack_client()
     email = _build_email_client()
-    if not slack and not email:
-        print("  [Channels] CLI only — add SLACK_BOT_TOKEN or SMTP_* to .env for remote approvals")
+    if not email:
+        print("  [Channels] CLI only — add SMTP_* vars to .env to enable email approvals and alerts")
     print()
 
-    # ── Build orchestrator with notification clients ───────────────────────
-    orchestrator = Orchestrator(slack=slack, email=email)
+    # ── Build orchestrator with email client ──────────────────────────────
+    orchestrator = Orchestrator(email=email)
     dashboard    = Dashboard(orchestrator)
 
     _patch_approval(orchestrator.approval, dashboard)
@@ -468,9 +408,7 @@ async def _run_scaffold():
 
     await orchestrator.start()
 
-    # ── Start approval server (Slack callbacks + email links) ─────────────
-    # This must happen AFTER orchestrator.start() and BEFORE the pipeline runs.
-    # The server binds a port, opens ngrok if configured, and prints the URL.
+    # ── Start approval server (email link callbacks) ───────────────────────
     await orchestrator.start_approval_server()
 
     # ── Event → dashboard tracker ──────────────────────────────────────────

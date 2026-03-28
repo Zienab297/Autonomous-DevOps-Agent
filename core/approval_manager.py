@@ -1,8 +1,8 @@
 """
 core/approval_manager.py
 ────────────────────────
-Manages approvals across CLI, Slack, and Email simultaneously.
-First channel to respond wins — others are cancelled.
+Manages approvals across CLI and Email simultaneously.
+First channel to respond wins — the other is cancelled.
 
 GATE MAP (from orchestrator):
   Gate 1  — Scaffold complete → proceed to CI/CD?
@@ -12,25 +12,25 @@ GATE MAP (from orchestrator):
   Gate 5  — New solution found (retry #N) → apply?
   Gate 6  — Rolled back → re-invoke Knowledge Agent?
 
-All six gates call request_approval() — the same interface as before.
-The orchestrator never needs to know which channel responded.
+All six gates call request_approval() — the orchestrator never needs to
+know which channel responded.
 
 CHANNEL BEHAVIOUR:
   CLI    — always active; pauses the monitoring dashboard while waiting.
-  Slack  — active if SlackClient is injected; sends Block Kit buttons.
-  Email  — active if EmailClient is injected; sends HTML email with links.
+  Email  — active if EmailClient is injected; sends HTML email with
+           Approve / Deny links that hit the ApprovalServer.
 
 RESOLUTION:
   resolve_approval() is called by:
-    • ApprovalServer  — for Slack button clicks and email link clicks
+    • ApprovalServer  — for email link clicks (GET /approve or /deny)
     • _cli_approval() — directly, when the user types yes/no
 
 DASHBOARD PAUSE:
   ApprovalManager accepts an optional `registry` reference.
   Before showing the CLI prompt it calls monitoring_agent.pause_dashboard()
-  and resumes after the answer is received — same pattern as before.
+  and resumes after the answer is received.
 
-Usage (unchanged from old approval_manager):
+Usage:
     approved = await manager.request_approval(
         title="Scaffold complete — proceed to CI/CD?",
         details=["Dockerfile", "k8s/deployment.yaml"],
@@ -46,18 +46,16 @@ logger = logging.getLogger(__name__)
 
 class ApprovalManager:
     """
-    Sends approval requests to CLI + Slack + Email simultaneously.
+    Sends approval requests to CLI + Email simultaneously.
     First channel to respond wins.
     """
 
     def __init__(
         self,
-        slack=None,              # core.slack_client.SlackClient    (optional)
         email=None,              # core.email_client.EmailClient    (optional)
         timeout_seconds: int = 300,
         registry=None,           # AgentRegistry — used to pause monitoring dashboard
     ):
-        self.slack           = slack
         self.email           = email
         self.timeout_seconds = timeout_seconds
         self.registry        = registry
@@ -100,7 +98,7 @@ class ApprovalManager:
         Resolve a pending approval.
 
         Called by:
-          • ApprovalServer._handle_slack()         — Slack button click
+
           • ApprovalServer._handle_email_click()   — email link click
           • _cli_approval()                        — terminal input
 
@@ -160,14 +158,7 @@ class ApprovalManager:
             name=f"approval-cli-{approval_id[:8]}",
         ))
 
-        # 2. Slack (if configured)
-        if self.slack:
-            tasks.append(asyncio.create_task(
-                self._slack_approval(approval_id, title, details),
-                name=f"approval-slack-{approval_id[:8]}",
-            ))
-
-        # 3. Email (if configured)
+        # 2. Email (if configured)
         if self.email:
             tasks.append(asyncio.create_task(
                 self._email_approval(approval_id, title, details),
@@ -221,13 +212,8 @@ class ApprovalManager:
                 for item in details:
                     print(f"    + {item}")
             print(f"{'─' * 55}")
-            if self.slack or self.email:
-                channels = []
-                if self.slack:
-                    channels.append("Slack")
-                if self.email:
-                    channels.append("Email")
-                print(f"  Also waiting on: {' / '.join(channels)}")
+            if self.email:
+                print(f"  Also waiting on: Email")
                 print(f"{'─' * 55}")
 
             answer = await asyncio.get_event_loop().run_in_executor(
@@ -244,41 +230,6 @@ class ApprovalManager:
             logger.error("[ApprovalManager] CLI error: %s", exc)
         finally:
             self._resume_monitoring()
-
-    # ── Slack approval ────────────────────────────────────────────────────────
-
-    async def _slack_approval(
-        self,
-        approval_id: str,
-        title:       str,
-        details:     list[str],
-    ) -> None:
-        """
-        Send an approval request to Slack and wait for a button click.
-
-        The actual resolution happens when ApprovalServer receives the
-        POST /slack/interactive callback and calls resolve_approval().
-        This coroutine just waits on the done_event after posting.
-        """
-        try:
-            if not self.slack:
-                return
-
-            await self.slack.send_approval_request(
-                approval_id=approval_id,
-                title=title,
-                details=details,
-            )
-
-            # Wait for ApprovalServer to call resolve_approval()
-            _, done_event = self._pending.get(approval_id, (None, None))
-            if done_event:
-                await done_event.wait()
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.error("[ApprovalManager] Slack error: %s", exc)
 
     # ── Email approval ────────────────────────────────────────────────────────
 
