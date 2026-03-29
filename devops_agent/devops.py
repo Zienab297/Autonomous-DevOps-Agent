@@ -23,6 +23,13 @@ from dotenv import load_dotenv
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
+# ── Optional notification clients ──────────────────────────────────────────────
+try:
+    from core.email_client import EmailClient
+    _EMAIL_MODULE_AVAILABLE = True
+except ImportError:
+    _EMAIL_MODULE_AVAILABLE = False
+
 # ── LLM Provider selector ──────────────────────────────────────────────────────
 try:
     from providers.llm.llm_selector import (
@@ -52,6 +59,11 @@ except ImportError:
 
 
 def _load_knowledge_adapter():
+    """
+    Load KnowledgeAgentAdapter without polluting sys.path with knowledge_agent/
+    bare — which would cause `from shared.models import ProjectContext` inside
+    ScaffoldAgent to resolve to knowledge_agent/shared instead of scaffold_agent/shared.
+    """
     import importlib.util
     ka_root      = ROOT / "agents" / "knowledge_agent"
     adapter_path = ka_root / "knowledge_core" / "knowledge_agent_adapter.py"
@@ -131,7 +143,7 @@ _RD = "\033[31m" if _ANSI else ""
 
 _LOGO = [
     "",
-    f"  {_B}{_CY}██████╗ ███████╗██╗   ██╗ ██████╗ ██████╗ ███████╗{_R}",
+    f"  {_B}{_CY}██████╗ ███████╗██╗   ██╗ ██████╗ ██████╗███████╗{_R}",
     f"  {_B}{_CY}██╔══██╗██╔════╝██║   ██║██╔═══██╗██╔══██╗██╔════╝{_R}",
     f"  {_B}{_CY}██║  ██║█████╗  ██║   ██║██║   ██║██████╔╝███████╗{_R}",
     f"  {_B}{_CY}██║  ██║██╔══╝  ╚██╗ ██╔╝██║   ██║██╔═══╝ ╚════██║{_R}",
@@ -148,7 +160,56 @@ def _print_logo():
         print(line)
 
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
+# ── Email client builder ───────────────────────────────────────────────────────
+
+def _build_email_client():
+    """
+    Build EmailClient from .env vars.
+
+    Primary recipient  : EMAIL_TO           (required for email to be enabled)
+    Team broadcast list: EMAIL_TEAM         (comma-separated, optional)
+                         Used for the emergency lane when severity is HIGH/CRITICAL.
+
+    Returns None silently if any required var is missing.
+    """
+    if not _EMAIL_MODULE_AVAILABLE:
+        return None
+
+    host     = os.getenv("SMTP_HOST",     "").strip()
+    port_s   = os.getenv("SMTP_PORT",     "587").strip()
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "").strip()
+    from_    = os.getenv("EMAIL_FROM",    username).strip()
+    to_      = os.getenv("EMAIL_TO",      "").strip()
+
+    # EMAIL_TEAM is a comma-separated list; strip whitespace around each address
+    team_raw = os.getenv("EMAIL_TEAM", "").strip()
+    team     = [a.strip() for a in team_raw.split(",") if a.strip()] if team_raw else []
+
+    if not (host and username and password and to_):
+        return None
+
+    try:
+        port   = int(port_s)
+        client = EmailClient(
+            smtp_host         = host,
+            smtp_port         = port,
+            username          = username,
+            password          = password,
+            from_address      = from_,
+            to_address        = to_,
+            team_addresses    = team,
+            approval_base_url = os.getenv("APPROVAL_BASE_URL", "").strip(),
+        )
+        team_info = f"  |  team emergency lane → {len(team)} extra address(es)" if team else ""
+        print(f"  [Email] ✓ alerts / approvals → {to_}{team_info}")
+        return client
+    except Exception as exc:
+        print(f"  [Email] ✗ failed to init: {exc}")
+        return None
+
+
+# ── Live status dashboard ──────────────────────────────────────────────────────
 #
 # FIX: Dashboard interference with agent output.
 #
@@ -166,25 +227,31 @@ def _print_logo():
 # Result: agent output is always visible, dashboard only redraws when safe.
 
 class Dashboard:
+    """Minimal in-terminal live status panel (redraws in-place on ANSI terminals)."""
 
     def __init__(self, orchestrator: Orchestrator):
         self._orch        = orchestrator
-        self._stage       = "INIT"
+        self._stage       = "IDLE"
+        self._last_event  = "starting…"
         self._project     = ""
         self._repo        = ""
         self._cicd_status = ""
-        self._last_event  = ""
-        self._start       = datetime.utcnow()
         self._paused      = False
+        self._task        = None
         self._first_draw  = True
         self._last_lines  = 0
+        self._start       = datetime.utcnow()
         self._task: asyncio.Task | None = None
 
+    def set_stage(self, s: str):  self._stage = s
+    def event(self, msg: str):    self._last_event = msg
+
     def start(self):
-        self._task = asyncio.create_task(self._loop(), name="dashboard")
+        if _ANSI:
+            self._task = asyncio.get_event_loop().call_later(2, self._tick)
 
     def stop(self):
-        if self._task and not self._task.done():
+        if self._task:
             self._task.cancel()
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -202,11 +269,10 @@ class Dashboard:
         """Resume redraws. Does NOT draw immediately — waits for loop tick."""
         self._paused = False
 
-    def set_stage(self, stage: str):
-        self._stage = stage
-
-    def event(self, msg: str):
-        self._last_event = msg
+    def _tick(self):
+        if not self._paused:
+            self._draw()
+        self._task = asyncio.get_event_loop().call_later(5, self._tick)
 
     async def _loop(self):
         while True:
@@ -257,9 +323,9 @@ class Dashboard:
             st   = inc.status.value if hasattr(inc, "status") else "?"
             stc  = _YL if st != "resolved" else _GR
             desc = (inc.description[:30] + "…") if hasattr(inc, "description") and len(inc.description) > 30 else getattr(inc, "description", "")
+            svc  = getattr(inc, "service", "?")
             return (
-                f"  {_D}{ts}{_R}  {_B}{sc3}{sev.upper():<8}{_R}"
-                f"  {_D}{inc.service:<18}{_R}  {_B}{stc}{st}{_R}\n"
+                f"  {_D}{svc:<18}{_R}  {_B}{stc}{st.upper()}{_R}\n"
                 f"           {_D}{desc}{_R}"
             )
 
@@ -433,8 +499,17 @@ _RESUME_AFTER = {
 async def _run_scaffold():
     project_path    = str(Path.cwd())
     scaffold_config = load_scaffold_config()
-    orchestrator    = Orchestrator()
-    dashboard       = Dashboard(orchestrator)
+
+    # ── Build email client from .env ──────────────────────────────────────
+    print("\n  Checking notification channels...")
+    email = _build_email_client()
+    if not email:
+        print("  [Channels] CLI only — add SMTP_* vars to .env to enable email approvals and alerts")
+    print()
+
+    # ── Build orchestrator with email client ──────────────────────────────
+    orchestrator = Orchestrator(email=email)
+    dashboard    = Dashboard(orchestrator)
 
     _patch_approval(orchestrator.approval, dashboard)
 
@@ -553,6 +628,9 @@ async def _run_scaffold():
 
     await orchestrator.start()
 
+    # ── Start approval server (email link callbacks) ───────────────────────
+    await orchestrator.start_approval_server()
+
     # ── Event tracker ──────────────────────────────────────────────────────
     orig_pub = orchestrator.event_bus.publish
 
@@ -617,6 +695,9 @@ async def _run_scaffold():
     dashboard._draw()
     await asyncio.sleep(1)
     dashboard.stop()
+
+    # ── Stop approval server after pipeline ends ───────────────────────────
+    await orchestrator.stop_approval_server()
 
 
 def main():
