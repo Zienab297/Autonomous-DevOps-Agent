@@ -5,3 +5,4 @@
 /devops_agent/devops_agent.egg-info/
 .env
 /devops_agent/devops_agent.egg-info/
+.devops_llm_config
