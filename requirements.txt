@@ -178,3 +178,8 @@ cffi==2.0.0
 pyngrok==7.5.1
 Werkzeug==3.1.6
 pytest-asyncio==1.3.0
+# ── PostgreSQL / SQLAlchemy layer ─────────────────────────────────────────────
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9       # PostgreSQL driver (binary — no C build needed)
+alembic>=1.13.0              # Optional: migrations
+ 

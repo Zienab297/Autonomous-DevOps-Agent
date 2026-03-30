@@ -8,7 +8,7 @@ and how to reach them.
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from core.models import AgentStatus
@@ -34,7 +34,7 @@ class AgentRecord:
     name: str
     agent: object
     status: AgentStatus = AgentStatus.IDLE
-    registered_at: datetime = field(default_factory=datetime.utcnow)
+    registered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_active: Optional[datetime] = None
     metadata: Dict = field(default_factory=dict)
 
@@ -152,7 +152,7 @@ class AgentRegistry:
             return
 
         record.status = status
-        record.last_active = datetime.utcnow()
+        record.last_active = datetime.now(timezone.utc)
         logger.info(f"[AgentRegistry] '{name}' → {status.value}")
 
     def get_status(self, name: str) -> Optional[AgentStatus]:
@@ -175,8 +175,7 @@ class AgentRegistry:
         """Update last_active timestamp for a registered Agent."""
         record = self._agents.get(name)
         if record:
-            from datetime import datetime
-            record.last_active = datetime.utcnow()
+            record.last_active = datetime.now(timezone.utc)
 
     # ============================================================
     # Summary

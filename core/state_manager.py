@@ -6,7 +6,7 @@ The single source of truth for what is happening right now.
 """
 from dataclasses import dataclass, field
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from core.models import (
     AgentStatus,
@@ -80,7 +80,7 @@ class StateManager:
             return
 
         incident.status = status
-        incident.updated_at = datetime.utcnow()
+        incident.updated_at = datetime.now(timezone.utc)
         logger.info(f"[StateManager] Incident {incident_id} → {status.value}")
 
     def get_active_incidents(self) -> List[Incident]:
@@ -197,6 +197,3 @@ class StateManager:
             f"incidents={len(self._incidents)}, "
             f"agents={len(self._agent_statuses)})"
         )
-    
-    
-        

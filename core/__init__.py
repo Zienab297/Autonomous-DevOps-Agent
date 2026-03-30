@@ -9,6 +9,7 @@ Usage:
     from core import StateManager
     from core import ContextManager
     from core import AgentRegistry
+    from core import DatabaseManager                 ← NEW
     from core.models import Incident, Severity, Solution
 """
 
@@ -17,6 +18,7 @@ from core.state_manager   import StateManager
 from core.context_manager import ContextManager, IncidentContext
 from core.agent_registery import AgentRegistry, AgentRecord
 from core.orchestrator    import Orchestrator
+from core.database        import DatabaseManager                  # ← NEW
 from core.models import (
     # Enums
     Severity,
@@ -46,6 +48,7 @@ __all__ = [
     "IncidentContext",
     "AgentRegistry",
     "AgentRecord",
+    "DatabaseManager",                                            # ← NEW
     # Enums
     "Severity",
     "IncidentStatus",

@@ -41,7 +41,7 @@ One-shot log analysis (called by Orchestrator after CI/CD)
 import asyncio
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from core.base_agent import BaseAgent, AgentEvent
@@ -76,7 +76,7 @@ def _sev(s: str) -> str:
     return f"{_BOLD}{c}{s.upper():<8}{_RESET}"
 
 def _age(dt: datetime) -> str:
-    secs = int((datetime.utcnow() - dt).total_seconds())
+    secs = int((datetime.now(timezone.utc) - dt).total_seconds())
     if secs < 60:   return f"{secs}s ago"
     if secs < 3600: return f"{secs // 60}m ago"
     return f"{secs // 3600}h ago"
@@ -144,7 +144,7 @@ class MonitoringAgent(BaseAgent):
         }
         self._event_log  : list[tuple[datetime, str]] = []
         self._poll_count : int = 0
-        self._agent_start: datetime = datetime.utcnow()
+        self._agent_start: datetime = datetime.now(timezone.utc)
 
     # --------------------------------------------------------
     # BaseAgent lifecycle hooks
@@ -310,7 +310,7 @@ class MonitoringAgent(BaseAgent):
                 message   = msg,
                 level     = level,
                 service   = service,
-                timestamp = datetime.utcnow(),
+                timestamp = datetime.now(timezone.utc),
                 metadata  = {},
             ))
         return logs
@@ -333,7 +333,7 @@ class MonitoringAgent(BaseAgent):
         }
 
     def _log_event(self, msg: str) -> None:
-        self._event_log.append((datetime.utcnow(), msg))
+        self._event_log.append((datetime.now(timezone.utc), msg))
         if len(self._event_log) > 50:
             self._event_log.pop(0)
 
@@ -374,7 +374,7 @@ class MonitoringAgent(BaseAgent):
             )
 
             self._poll_count += 1
-            self._service_state[service]["last_poll"] = datetime.utcnow()
+            self._service_state[service]["last_poll"] = datetime.now(timezone.utc)
             self._service_state[service]["metrics"]   = {m.name: m.value for m in metrics}
 
             anomalies = self._detector.analyze(service, metrics, logs)
@@ -485,7 +485,7 @@ class MonitoringAgent(BaseAgent):
         self.logger.debug("[MonitoringAgent] Resumed")
 
     def _redraw_dashboard(self) -> None:
-        now    = datetime.utcnow()
+        now    = datetime.now(timezone.utc)
         uptime = int((now - self._agent_start).total_seconds())
         um, us = divmod(uptime, 60)
         uh, um = divmod(um, 60)

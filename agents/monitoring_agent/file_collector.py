@@ -54,7 +54,7 @@ Usage in agent._build_collector()
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -108,7 +108,7 @@ class FileCollector(BaseCollector):
             traceback_count — raw number of distinct tracebacks found
         """
         results = self._scan_service(service)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         total_errors = sum(len(r.errors) for r in results)
         error_rate   = (
@@ -165,7 +165,7 @@ class FileCollector(BaseCollector):
                     message   = err.message,
                     level     = "ERROR",
                     service   = service,
-                    timestamp = err.timestamp or datetime.utcnow(),
+                    timestamp = err.timestamp or datetime.now(timezone.utc),
                     metadata  = {
                         # PRIMARY — the exact location to fix
                         "fix_here"      : f"{err.file}:{err.line}",

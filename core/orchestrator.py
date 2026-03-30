@@ -15,7 +15,7 @@ import asyncio
 import logging
 import sys
 import pathlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from core.models import (
@@ -30,6 +30,18 @@ from core.state_manager import StateManager
 from core.context_manager import ContextManager
 from core.agent_registery import AgentRegistry
 from core.approval_manager import ApprovalManager
+
+try:
+    from core.database import DatabaseManager
+    _DB_AVAILABLE = True
+except ImportError:
+    _DB_AVAILABLE = False
+
+try:
+    from core.pg_database import PostgreSQLDatabaseManager
+    _PG_AVAILABLE = True
+except ImportError:
+    _PG_AVAILABLE = False
 
 from agents.self_healing_agent.models import FileToFix, Solution as SHSolution
 from agents.monitoring_agent.agent import MonitoringAgent
@@ -197,6 +209,8 @@ class Orchestrator:
         self.approval        = ApprovalManager()
         self.approval.registry = self.registry
         self._running        = False
+        self.db              = None   # SQLite DatabaseManager (set via set_database())
+        self.pg_db           = None   # PostgreSQL DatabaseManager (set via set_pg_database())
 
         # ── per-incident tracking for the retry loop ──────────────────────
         # Maps incident_id → list of healing_prompt summaries that have
@@ -209,7 +223,7 @@ class Orchestrator:
         self._register_self_healing_agent()
 
         self._dashboard: dict = {
-            "started_at"  : datetime.utcnow(),
+            "started_at"  : datetime.now(timezone.utc),
             "stage"       : "idle",
             "project"     : "",
             "repo_url"    : "",
@@ -234,6 +248,57 @@ class Orchestrator:
         self.registry.register(name, agent, metadata)
         self.state_manager.set_agent_status(name, AgentStatus.IDLE)
         logger.info(f"[Orchestrator] Agent registered: '{name}'")
+
+    def set_database(self, db: "DatabaseManager") -> None:
+        """
+        Wire a DatabaseManager into the Orchestrator.
+        Call this from devops.py right after creating the Orchestrator:
+
+            db = DatabaseManager.for_project(project_path)
+            orchestrator.set_database(db)
+
+        After this call, every EventBus publish is auto-logged to SQLite.
+        """
+        self.db = db
+        logger.info(f"[Orchestrator] Database connected: {db}")
+
+        _orig_publish = self.event_bus.publish
+
+        async def _logged_publish(event):
+            await _orig_publish(event)
+            try:
+                db.log_event(event)
+            except Exception as _e:
+                logger.debug(f"[DB] log_event failed: {_e}")
+
+        self.event_bus.publish = _logged_publish
+        logger.info("[Orchestrator] EventBus auto-logging to DB enabled")
+
+    def set_pg_database(self, pg_db: "PostgreSQLDatabaseManager") -> None:
+        """
+        Wire a PostgreSQLDatabaseManager into the Orchestrator.
+        Call from devops.py after creating the Orchestrator:
+
+            pg = PostgreSQLDatabaseManager.for_project(project_path, DATABASE_URL)
+            orchestrator.set_pg_database(pg)
+
+        All events, incidents, solutions, actions, and alerts are persisted
+        to PostgreSQL automatically — in parallel with the SQLite store.
+        """
+        self.pg_db = pg_db
+        logger.info(f"[Orchestrator] PostgreSQL database connected: {pg_db}")
+
+        _orig_publish_pg = self.event_bus.publish
+
+        async def _pg_logged_publish(event):
+            await _orig_publish_pg(event)
+            try:
+                pg_db.log_event(event)
+            except Exception as _e:
+                logger.debug(f"[PgDB] log_event failed: {_e}")
+
+        self.event_bus.publish = _pg_logged_publish
+        logger.info("[Orchestrator] EventBus auto-logging to PostgreSQL enabled")
 
     def _register_monitoring_agent(self) -> None:
         if self.registry.get_agent("monitoring_agent"):
@@ -267,12 +332,17 @@ class Orchestrator:
             if str(_project_root) not in sys.path:
                 sys.path.insert(0, str(_project_root))
 
+            # Remove scaffold_agent from sys.path to prevent
+            # its shared/models.py from shadowing knowledge_agent's
+            sys.path = [p for p in sys.path if "scaffold_agent" not in p]
+
             _stale = [
                 k for k in sys.modules
                 if k in ("shared", "knowledge_core")
                 or k.startswith("shared.")
                 or k.startswith("knowledge_core.")
                 or k.startswith("agents.knowledge_agent")
+                or k.startswith("agents.scaffold_agent")
             ]
             for k in _stale:
                 del sys.modules[k]
@@ -421,7 +491,7 @@ class Orchestrator:
             "severity"   : severity,
             "description": description,
             "status"     : status,
-            "at"         : datetime.utcnow().strftime("%H:%M:%S"),
+            "at"         : datetime.now(timezone.utc).strftime("%H:%M:%S"),
         })
 
     def print_dashboard(self, event_line: str = "") -> None:
@@ -431,7 +501,7 @@ class Orchestrator:
         )
         W = 66
 
-        uptime_s = int((datetime.utcnow() - self._dashboard["started_at"]).total_seconds())
+        uptime_s = int((datetime.now(timezone.utc) - self._dashboard["started_at"]).total_seconds())
         um, us   = divmod(uptime_s, 60)
         uh, um   = divmod(um, 60)
         uptime   = f"{uh:02d}:{um:02d}:{us:02d}"
@@ -821,7 +891,8 @@ class Orchestrator:
         url = f"https://api.github.com/repos/{repo}/actions/runs?per_page=1&branch=main"
         for attempt in range(4):
             try:
-                async with aiohttp.ClientSession(headers=headers) as session:
+                connector = aiohttp.TCPConnector(force_close=True)
+                async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             data = await resp.json()
@@ -944,6 +1015,16 @@ class Orchestrator:
     async def handle_incident(self, incident: Incident) -> None:
         self.state_manager.add_incident(incident)
         self.state_manager.update_incident_status(incident.incident_id, IncidentStatus.INVESTIGATING)
+        if self.db:
+            try:
+                self.db.save_incident(incident)
+            except Exception as _e:
+                logger.debug(f"[DB] save_incident: {_e}")
+        if self.pg_db:
+            try:
+                self.pg_db.save_incident(incident)
+            except Exception as _e:
+                logger.debug(f"[PgDB] save_incident: {_e}")
         if not self.context_manager.get_context(incident.incident_id):
             self.context_manager.create_context(incident)
             self.context_manager.add_metrics(incident.incident_id, incident.metrics)
@@ -1080,7 +1161,21 @@ class Orchestrator:
                 files_to_modify    = files_to_modify,
             )
 
+            # Ensure incident_id is set so the repository FK constraint is satisfied
+            if not getattr(solution, "incident_id", None):
+                solution.incident_id = event.incident_id
+
             self.state_manager.add_solution(solution)
+            if self.db:
+                try:
+                    self.db.save_solution(solution)
+                except Exception as _e:
+                    logger.debug(f"[DB] save_solution: {_e}")
+            if self.pg_db:
+                try:
+                    self.pg_db.save_solution(solution)
+                except Exception as _e:
+                    logger.debug(f"[PgDB] save_solution: {_e}")
             self.print_dashboard(
                 f"Knowledge Agent complete — source={solution.source} "
                 f"confidence={solution.confidence:.0%}"
@@ -1418,6 +1513,16 @@ class Orchestrator:
         files_fixed  = event.data.get("files_fixed", [])
         verification = event.data.get("verification", "not_run")
         self.state_manager.update_incident_status(event.incident_id, IncidentStatus.RESOLVED)
+        if self.db:
+            try:
+                self.db.update_incident_status(event.incident_id, "resolved")
+            except Exception as _e:
+                logger.debug(f"[DB] update resolved: {_e}")
+        if self.pg_db:
+            try:
+                self.pg_db.update_incident_status(event.incident_id, "resolved")
+            except Exception as _e:
+                logger.debug(f"[PgDB] update resolved: {_e}")
         self._track_incident(event.incident_id, "", "", "", "RESOLVED")
         self._dash("stage", "done")
         self.print_dashboard(f"RESOLVED — {len(files_fixed)} file(s) fixed, verification={verification}")
@@ -1431,6 +1536,16 @@ class Orchestrator:
     async def _on_remediation_failed(self, event: Event) -> None:
         errors = event.data.get("errors", [])
         self.state_manager.update_incident_status(event.incident_id, IncidentStatus.FAILED)
+        if self.db:
+            try:
+                self.db.update_incident_status(event.incident_id, "failed")
+            except Exception as _e:
+                logger.debug(f"[DB] update failed: {_e}")
+        if self.pg_db:
+            try:
+                self.pg_db.update_incident_status(event.incident_id, "failed")
+            except Exception as _e:
+                logger.debug(f"[PgDB] update failed: {_e}")
         self._track_incident(event.incident_id, "", "", "", "FAILED")
         self._dash("stage", "done")
         self.print_dashboard(f"REMEDIATION FAILED — {errors[0] if errors else 'unknown'}")
