@@ -80,6 +80,48 @@ _EXCEPTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches Python's standalone SyntaxError block — NO "Traceback" header.
+# Python emits this format for compile-time errors:
+#
+#   File "deploy.py", line 12
+#     def foo(:
+#            ^
+#   SyntaxError: invalid syntax
+#
+# IndentationError and TabError share the same layout.
+# Matches Python's standalone SyntaxError block — NO "Traceback" header.
+# Python emits this format for compile-time errors:
+#
+#   File "deploy.py", line 12
+#     def foo(:
+#            ^
+#   SyntaxError: invalid syntax
+#
+# IndentationError and TabError share the same layout.
+_SYNTAX_FILE_RE = re.compile(
+    r'^\s*File "(?P<file>[^"]+)",\s+line (?P<line>\d+)\s*$'
+)
+_SYNTAX_EXC_NAMES = {"SyntaxError", "IndentationError", "TabError"}
+_SYNTAX_EXC_RE = re.compile(
+    r'^(?P<exc>SyntaxError|IndentationError|TabError):\s*(?P<msg>.+)',
+    re.IGNORECASE,
+)
+
+# Matches the GitHub Actions / pytest / python -c inline format:
+#
+#   *** Sorry: IndentationError: expected an indented block after function definition on line 10 (main.py, line 11)
+#   SyntaxError: invalid syntax (deploy.py, line 5)
+#   E   IndentationError: unexpected indent (utils/helper.py, line 23)
+#
+# All three variants pack everything onto a single line.
+_SYNTAX_INLINE_RE = re.compile(
+    r'(?:^\*+\s*Sorry:\s*|^\s*E\s+)?'           # optional *** Sorry: or pytest "E" prefix
+    r'(?P<exc>SyntaxError|IndentationError|TabError):\s*'
+    r'(?P<msg>[^(]+?)\s*'                        # message up to the parenthetical
+    r'\((?P<file>[^,)]+),\s*line\s+(?P<line>\d+)\)',  # (filename, line N)
+    re.IGNORECASE,
+)
+
 # Matches common log line prefixes to extract timestamp + level:
 #   "2024-03-24 02:13:50 ERROR ..."
 #   "2024-03-24T02:13:50.123Z [ERROR] ..."
@@ -92,6 +134,30 @@ _LOG_PREFIX_RE = re.compile(
 
 # ── data models ───────────────────────────────────────────────────────────────
 
+# ── issue type classification ─────────────────────────────────────────────────
+# Maps exception types to a human-readable issue category.
+# "syntax"  → SyntaxError, IndentationError, TabError
+# "import"  → ModuleNotFoundError, ImportError
+# "runtime" → everything else (KeyError, TypeError, ConnectionError, etc.)
+
+_SYNTAX_EXCEPTIONS = {"SyntaxError", "IndentationError", "TabError"}
+_IMPORT_EXCEPTIONS = {"ModuleNotFoundError", "ImportError"}
+
+
+def classify_issue_type(exception_type: str) -> str:
+    """
+    Return a human-readable issue category for a given exception type.
+
+    Returns one of: "syntax" | "import" | "runtime"
+    """
+    short = exception_type.split(".")[-1]
+    if short in _SYNTAX_EXCEPTIONS:
+        return "syntax"
+    if short in _IMPORT_EXCEPTIONS:
+        return "import"
+    return "runtime"
+
+
 @dataclass
 class ParsedError:
     """
@@ -100,6 +166,7 @@ class ParsedError:
     The most actionable fields for a developer:
         file + line  → go here to fix it
         exception_type + message → what went wrong
+        issue_type   → "syntax" | "import" | "runtime"
         full_traceback → complete context
     """
     log_file       : str             # e.g. "logs/auth-api/run_2024-03-24.log"
@@ -112,6 +179,7 @@ class ParsedError:
     full_traceback : str             # raw multi-line traceback text
     timestamp      : Optional[datetime] = None
     level          : str = "ERROR"
+    issue_type     : str = "runtime" # "syntax" | "import" | "runtime"
 
     def __str__(self) -> str:
         return (
@@ -131,6 +199,7 @@ class ParsedError:
             "full_traceback": self.full_traceback,
             "timestamp"     : self.timestamp.isoformat() if self.timestamp else None,
             "level"         : self.level,
+            "issue_type"    : self.issue_type,
         }
 
 
@@ -333,7 +402,7 @@ class LogParser:
                 if current_level == "WARN":
                     current_level = "WARNING"
 
-            # Detect start of a Python traceback
+            # ── Detect start of a Python traceback (runtime errors) ──────────
             if "Traceback (most recent call last)" in line:
                 traceback_lines, exc_type, exc_msg, frames = self._collect_traceback(lines, i)
 
@@ -351,9 +420,80 @@ class LogParser:
                         full_traceback = "\n".join(traceback_lines),
                         timestamp      = current_ts,
                         level          = current_level,
+                        issue_type     = classify_issue_type(exc_type),
                     ))
 
                 i += len(traceback_lines)
+                continue
+
+            # ── Detect standalone SyntaxError / IndentationError / TabError ──
+            # Python compile-time errors have NO "Traceback" header.
+            # The pattern is:
+            #   File "foo.py", line N          ← _SYNTAX_FILE_RE
+            #     <offending source line>
+            #       ^                          (caret, optional)
+            #   SyntaxError: <message>         ← _SYNTAX_EXC_RE
+            syn_file_match = _SYNTAX_FILE_RE.match(line)
+            if syn_file_match:
+                # Peek ahead up to 4 lines for the SyntaxError line
+                exc_type_found = ""
+                exc_msg_found  = ""
+                block_lines    = [line]
+                j = i + 1
+                while j < min(i + 5, len(lines)):
+                    peek = lines[j].strip()
+                    block_lines.append(lines[j])
+                    exc_m = _SYNTAX_EXC_RE.match(peek)
+                    if exc_m:
+                        exc_type_found = exc_m.group("exc")
+                        exc_msg_found  = peek
+                        break
+                    j += 1
+
+                if exc_type_found:
+                    errors.append(ParsedError(
+                        log_file       = log_file,
+                        service        = service,
+                        exception_type = exc_type_found,
+                        message        = exc_msg_found,
+                        file           = syn_file_match.group("file"),
+                        line           = int(syn_file_match.group("line")),
+                        function       = "<module>",
+                        full_traceback = "\n".join(block_lines),
+                        timestamp      = current_ts,
+                        level          = "ERROR",
+                        issue_type     = "syntax",
+                    ))
+                    i += len(block_lines)
+                    continue
+
+            # ── Detect inline syntax errors (GitHub Actions / pytest / python -c) ──
+            # These pack everything onto ONE line:
+            #   *** Sorry: IndentationError: expected an indented block ... (main.py, line 11)
+            #   SyntaxError: invalid syntax (deploy.py, line 5)
+            #   E   IndentationError: unexpected indent (utils/helper.py, line 23)
+            inline_syn = _SYNTAX_INLINE_RE.search(line)
+            if inline_syn:
+                exc_type_found = inline_syn.group("exc")
+                raw_msg        = inline_syn.group("msg").strip()
+                file_name      = inline_syn.group("file").strip()
+                line_no        = int(inline_syn.group("line"))
+                exc_msg_found  = f"{exc_type_found}: {raw_msg} ({file_name}, line {line_no})"
+
+                errors.append(ParsedError(
+                    log_file       = log_file,
+                    service        = service,
+                    exception_type = exc_type_found,
+                    message        = exc_msg_found,
+                    file           = file_name,
+                    line           = line_no,
+                    function       = "<module>",
+                    full_traceback = line,
+                    timestamp      = current_ts,
+                    level          = "ERROR",
+                    issue_type     = "syntax",
+                ))
+                i += 1
                 continue
 
             i += 1

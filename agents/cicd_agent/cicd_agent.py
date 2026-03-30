@@ -45,6 +45,9 @@ from core.models import AgentStatus, Deployment, DeploymentStatus
 from core.state_manager import StateManager
 from core.context_manager import ContextManager
 from providers.cicd.base_provider import BaseCICDProvider, PipelineRun, RollbackResult
+from agents.cicd_agent.deployment_manager import DeploymentManager
+from agents.cicd_agent.rollback_manager import RollbackManager
+from agents.cicd_agent.pipeline_manager import PipelineManager, PipelineResult
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,14 @@ class CICDAgent(BaseAgent):
         self.provider     = provider
         self._state_mgr   = state
         self._ctx_manager = ctx_manager
+
+        # Higher-level managers — usable directly or via run_pipeline()
+        self._deployment_mgr = DeploymentManager(provider)
+        self._rollback_mgr   = RollbackManager(provider)
+        self._pipeline_mgr   = PipelineManager(
+            deployment_manager = self._deployment_mgr,
+            rollback_manager   = self._rollback_mgr,
+        )
 
         self.logger.info(f"CICDAgent created — provider={provider.name}")
 
@@ -390,6 +401,64 @@ class CICDAgent(BaseAgent):
         Used by the KnowledgeAgent during incident investigation.
         """
         return await self.provider.collect_logs(run_id, repo)
+
+    async def run_pipeline(
+        self,
+        service:     str,
+        branch:      str = "main",
+        version:     str = "",
+        environment: str = "production",
+        incident_id: Optional[str] = None,
+    ) -> PipelineResult:
+        """
+        Run the full CI/CD pipeline (build stages → k8s deploy → health check).
+        Publishes DEPLOYMENT_STARTED before the pipeline and DEPLOYMENT_COMPLETE
+        after it, whether it succeeds or fails.
+
+        For the Kubernetes provider this is the preferred entry point over
+        deploy() — it adds health checking and automatic rollback on failure.
+        """
+        self.logger.info(
+            f"run_pipeline: service={service} branch={branch} "
+            f"version={version} env={environment}"
+        )
+
+        await self.publish(Event(
+            type        = EventType.DEPLOYMENT_STARTED,
+            source      = self.name,
+            incident_id = incident_id,
+            data        = {"service": service, "branch": branch,
+                           "environment": environment, "version": version},
+        ))
+
+        result = await self._pipeline_mgr.run(
+            service     = service,
+            branch      = branch,
+            version     = version,
+            environment = environment,
+            incident_id = incident_id,
+        )
+
+        # Persist the deployment record if k8s_deploy stage produced one
+        if result.deployment:
+            await self._persist_deployment(result.deployment, incident_id)
+
+        await self.publish(Event(
+            type        = EventType.DEPLOYMENT_COMPLETE,
+            source      = self.name,
+            incident_id = incident_id,
+            data        = {
+                "service":      service,
+                "version":      version,
+                "environment":  environment,
+                "success":      result.success,
+                "rolled_back":  result.rolled_back,
+                "failed_stage": result.failed_stage.name if result.failed_stage else None,
+            },
+        ))
+
+        self.logger.info(result.summary())
+        return result
 
     async def health_check(self) -> dict[str, Any]:
         """Check provider connectivity. Returns dict for Orchestrator.summary()."""

@@ -73,6 +73,21 @@ class IncidentFactory:
         # Build a concise description
         description = self._build_description(service, anomalies)
 
+        # Collect issue_type and flawed_file from anomalies that have them
+        issue_types  = list({a.issue_type  for a in anomalies if a.issue_type  not in ("", "unknown")})
+        flawed_files = list({a.flawed_file for a in anomalies if a.flawed_file != ""})
+
+        # Also pull flawed files directly from traceback log metadata
+        for log in logs:
+            meta = log.metadata or {}
+            if "fix_here" in meta and meta["fix_here"] not in flawed_files:
+                flawed_files.append(meta["fix_here"])
+            if "issue_type" in meta and meta["issue_type"] not in issue_types:
+                issue_types.append(meta["issue_type"])
+
+        primary_issue_type  = issue_types[0]  if issue_types  else "unknown"
+        primary_flawed_file = flawed_files[0] if flawed_files else ""
+
         incident = Incident(
             service     = service,
             severity    = severity,
@@ -82,13 +97,19 @@ class IncidentFactory:
             logs        = logs,
             metadata    = {
                 "anomaly_count"  : len(anomalies),
+                "issue_type"     : primary_issue_type,
+                "flawed_file"    : primary_flawed_file,
+                "all_issue_types": issue_types,
+                "all_flawed_files": flawed_files,
                 "anomaly_details": [
                     {
-                        "metric"   : a.metric_name,
-                        "value"    : a.current_value,
-                        "threshold": a.threshold,
-                        "severity" : a.severity.value,
-                        "message"  : a.message,
+                        "metric"      : a.metric_name,
+                        "value"       : a.current_value,
+                        "threshold"   : a.threshold,
+                        "severity"    : a.severity.value,
+                        "message"     : a.message,
+                        "issue_type"  : a.issue_type,
+                        "flawed_file" : a.flawed_file,
                     }
                     for a in anomalies
                 ],

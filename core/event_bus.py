@@ -22,9 +22,11 @@ logger = logging.getLogger(__name__)
 
 class EventType(str, Enum):
     # Monitoring Events
-    ANOMALY_DETECTED    = "monitoring.anomaly_detected"
-    INCIDENT_CREATED    = "monitoring.incident_created"
-    METRICS_COLLECTED   = "monitoring.metrics_collected"
+    ANOMALY_DETECTED      = "monitoring.anomaly_detected"
+    INCIDENT_CREATED      = "monitoring.incident_created"
+    METRICS_COLLECTED     = "monitoring.metrics_collected"
+    FILE_SCAN_FAILED      = "monitoring.file_scan_failed"
+    SYNTAX_ERROR_DETECTED = "monitoring.syntax_error_detected"
 
     # Investigation Events
     INVESTIGATION_STARTED   = "knowledge.investigation_started"
