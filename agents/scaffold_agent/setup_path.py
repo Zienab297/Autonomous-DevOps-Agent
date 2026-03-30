@@ -24,6 +24,5 @@ else:
     else:
         raise RuntimeError("Could not find scaffold_agent root directory")
 
-if str(ROOT) in sys.path:
-    sys.path.remove(str(ROOT))
-sys.path.append(str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))

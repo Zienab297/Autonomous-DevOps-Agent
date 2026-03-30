@@ -55,6 +55,20 @@ from agents.monitoring_agent.collector import BaseCollector, MockCollector
 from agents.monitoring_agent.detector import Detector
 from agents.monitoring_agent.incident_factory import IncidentFactory
 from agents.monitoring_agent.groq_analyzer import GroqAnalyzer
+from agents.monitoring_agent.file_scanner import FileScanner, RiskLevel, ScanResult
+
+# SYNTAX_ERROR_DETECTED must be present in EventType (core/event_bus.py).
+# If not yet added, we fall back to a string sentinel so nothing crashes —
+# but add it to the enum for full bus routing:
+#
+#   class EventType(str, Enum):
+#       ...
+#       SYNTAX_ERROR_DETECTED = "syntax_error_detected"
+#
+try:
+    _SYNTAX_EVENT_TYPE = EventType.SYNTAX_ERROR_DETECTED   # type: ignore[attr-defined]
+except AttributeError:
+    _SYNTAX_EVENT_TYPE = "syntax_error_detected"           # graceful fallback
 
 logger = logging.getLogger(__name__)
 
@@ -129,11 +143,15 @@ class MonitoringAgent(BaseAgent):
         self._detector  = Detector(self._config.thresholds)
         self._factory   = IncidentFactory()
         self._analyzer  = GroqAnalyzer(api_key=groq_api_key)
+        self._scanner   = FileScanner(
+            rollback_threshold = RiskLevel.HIGH,
+            llm_analyzer       = self._analyzer,
+        )
+        self._cicd_agent = None   # injected via set_cicd_agent() after construction
 
         self._poll_task        : Optional[asyncio.Task] = None
         self._dashboard_task   : Optional[asyncio.Task] = None
         self._dashboard_paused : bool = False   # set True by ApprovalManager during input
-        self._poll_paused      : bool = False   # set True during approval to stop polling spam
 
         self._active_incidents: dict[str, str] = {}
 
@@ -209,6 +227,134 @@ class MonitoringAgent(BaseAgent):
             ))
 
     # --------------------------------------------------------
+    # CI/CD agent wiring
+    # --------------------------------------------------------
+
+    def set_cicd_agent(self, cicd_agent) -> None:
+        """
+        Inject the CICDAgent after both agents are constructed.
+        Called by the Orchestrator during setup.
+
+            monitoring_agent.set_cicd_agent(cicd_agent)
+        """
+        self._cicd_agent = cicd_agent
+        self.logger.info("[MonitoringAgent] CICDAgent wired for file-scan rollback")
+
+    # --------------------------------------------------------
+    # File scanning — public entry point
+    # --------------------------------------------------------
+
+    async def scan_and_rollback_if_unsafe(
+        self,
+        path:        str,
+        service:     str,
+        version:     str        = "",
+        environment: str        = "production",
+        incident_id: str | None = None,
+    ) -> ScanResult:
+        """
+        Scan an uploaded file or directory for malicious/disturbing content.
+        If unsafe, publishes FILE_SCAN_FAILED and triggers a rollback via CICDAgent.
+
+        Returns the ScanResult so the caller can inspect files_with_problems().
+
+        Usage (from Orchestrator or directly):
+            result = await monitoring_agent.scan_and_rollback_if_unsafe(
+                path        = "/uploads/artifact.sh",
+                service     = "auth-api",
+                version     = "v1.2.3",
+                environment = "production",
+            )
+            if not result.safe:
+                print(result.files_with_problems())
+        """
+        self.logger.info(
+            "[MonitoringAgent] Scanning: path=%s service=%s version=%s",
+            path, service, version,
+        )
+        self._log_event(f"SCAN  {service} — {path}")
+
+        result: ScanResult = await asyncio.to_thread(self._scanner.scan, path)
+
+        self.logger.info(
+            "[MonitoringAgent] Scan complete: %s", result
+        )
+
+        if result.safe:
+            self._log_event(f"OK    {service} — scan clean ({path})")
+            return result
+
+        # ── Unsafe — build the event payload with full file details ──────────
+        files_with_problems = result.files_with_problems()
+
+        self._log_event(
+            f"!!! SCAN FAIL [{result.risk_level.value.upper()}] "
+            f"{service} — {len(result.findings)} finding(s) in "
+            f"{len(files_with_problems)} file(s)"
+        )
+        self.logger.warning(
+            "[MonitoringAgent] Unsafe artifact: %s  findings=%d  files=%s",
+            result.summary,
+            len(result.findings),
+            [f["file"] for f in files_with_problems],
+        )
+        for fp in files_with_problems:
+            self.logger.warning(
+                "[MonitoringAgent]   FILE: %s  (%d finding(s))",
+                fp["file"], len(fp["findings"]),
+            )
+            for finding in fp["findings"]:
+                self.logger.warning(
+                    "[MonitoringAgent]     line %-4s [%-8s] %s — %s",
+                    finding["line"], finding["risk_level"],
+                    finding["category"], finding["detail"],
+                )
+
+        # Publish FILE_SCAN_FAILED with full findings attached
+        await self.publish(Event(
+            type        = EventType.FILE_SCAN_FAILED,
+            source      = self.name,
+            incident_id = incident_id,
+            data        = {
+                "service":             service,
+                "version":             version,
+                "environment":         environment,
+                "path":                str(path),
+                "risk_level":          result.risk_level.value,
+                "summary":             result.summary,
+                "finding_count":       len(result.findings),
+                "files_with_problems": files_with_problems,   # ← full detail
+                "scanned_files":       result.scanned_files,
+            },
+        ))
+
+        # Trigger rollback if CICDAgent is wired
+        if self._cicd_agent:
+            self.logger.warning(
+                "[MonitoringAgent] Triggering rollback: service=%s version=%s env=%s",
+                service, version, environment,
+            )
+            await self.publish(Event(
+                type        = EventType.ROLLBACK_TRIGGERED,
+                source      = self.name,
+                incident_id = incident_id,
+                data        = {
+                    "service":     service,
+                    "version":     version,
+                    "environment": environment,
+                    "reason":      f"File scan failed: {result.summary}",
+                    "files_with_problems": files_with_problems,
+                },
+            ))
+        else:
+            self.logger.warning(
+                "[MonitoringAgent] No CICDAgent wired — skipping rollback. "
+                "Call set_cicd_agent() to enable automatic rollback."
+            )
+
+        return result
+
+    # --------------------------------------------------------
     # One-shot public method — called directly by the Orchestrator
     # --------------------------------------------------------
 
@@ -281,24 +427,54 @@ class MonitoringAgent(BaseAgent):
         """
         Convert raw CI/CD log strings to Log objects the Detector can process.
 
-        Handles two formats:
+        Handles three formats:
           1. Free-text logs — keyword match for ERROR/FAIL/TRACEBACK etc.
           2. Structured CI/CD step summaries — conclusion=failure/skipped
-             (produced by GitHub Actions / CICDAgent step collector).
-             These are tagged ERROR so both _check_log_errors AND
-             _check_cicd_conclusion in the Detector can fire on them.
+          3. Inline syntax errors (GitHub Actions / pytest / python -c):
+               *** Sorry: IndentationError: expected an indented block ... (main.py, line 11)
+               SyntaxError: invalid syntax (deploy.py, line 5)
+               E   IndentationError: unexpected indent (utils/helper.py, line 23)
         """
+        import re as _re
+
+        # Matches all single-line syntax error formats from CI/CD runners:
+        #   *** Sorry: IndentationError: ... (main.py, line 11)
+        #   ##[error]IndentationError: ... (main.py, line 11)   ← GitHub Actions
+        #   E   IndentationError: ...  (pytest)
+        #   SyntaxError: ... (deploy.py, line 5)
+        _INLINE_SYN = _re.compile(
+            r'(?:^\*+\s*Sorry:\s*|##\[error\]\s*|^\s*E\s+)?'
+            r'(?P<exc>SyntaxError|IndentationError|TabError):\s*'
+            r'(?P<msg>[^(]+?)\s*'
+            r'\((?P<file>[^,)]+),\s*line\s+(?P<line>\d+)\)',
+            _re.IGNORECASE,
+        )
+
         logs = []
         for line in raw_lines:
             msg   = line.strip()
             lower = msg.lower()
             upper = msg.upper()
 
-            # Structured CI/CD conclusion lines — check BEFORE generic keywords
-            # so "conclusion=failure" isn't missed when "FAIL" also matches
-            if "conclusion=failure" in lower or "conclusion=skipped" in lower:
+            # ── GitHub Actions native log formats ────────────────────────
+            # ##[error]   → step failed
+            # ##[warning] → step warning
+            # Process completed with exit code N (N≠0) → failure
+            # conclusion=failure / conclusion=skipped → CI/CD step summary
+            is_gh_error   = msg.startswith("##[error]") or "##[error]" in lower
+            is_gh_warning = msg.startswith("##[warning]") or "##[warning]" in lower
+            is_exit_fail  = (
+                "process completed with exit code" in lower
+                and not lower.endswith("exit code 0")
+            )
+            is_conclusion_fail = (
+                "conclusion=failure" in lower or "conclusion=skipped" in lower
+            )
+
+            if is_gh_error or is_exit_fail or is_conclusion_fail:
                 level = "ERROR"
-            # Generic free-text keyword detection
+            elif is_gh_warning:
+                level = "WARN"
             elif any(k in upper for k in ("ERROR", "FAIL", "TRACEBACK", "EXCEPTION", "CRITICAL")):
                 level = "ERROR"
             elif any(k in upper for k in ("WARNING", "WARN")):
@@ -306,30 +482,92 @@ class MonitoringAgent(BaseAgent):
             else:
                 level = "INFO"
 
+            meta: dict = {}
+
+            # ── Priority 1: inline syntax error with filename + line ─────────
+            # Catches: *** Sorry: IndentationError: ... (main.py, line 11)
+            inline_m = _INLINE_SYN.search(msg)
+            if inline_m:
+                level              = "ERROR"
+                file_name          = inline_m.group("file").strip()
+                line_no            = inline_m.group("line")
+                exc_name           = inline_m.group("exc")
+                meta["issue_type"] = "syntax"
+                meta["exception"]  = exc_name
+                meta["file"]       = file_name
+                meta["line"]       = int(line_no)
+                meta["fix_here"]   = f"{file_name}:{line_no}"
+                meta["full_traceback"] = msg
+
+            # ── Priority 2: keyword-only syntax match (no filename yet) ─────
+            elif any(e in lower for e in ("syntaxerror", "indentationerror", "taberror")):
+                level              = "ERROR"
+                meta["issue_type"] = "syntax"
+                _fn = _re.search(r'file\s+"?([^\s",]+\.py)"?,\s*line\s+(\d+)', lower)
+                if _fn:
+                    meta["file"]     = _fn.group(1)
+                    meta["line"]     = int(_fn.group(2))
+                    meta["fix_here"] = f"{_fn.group(1)}:{_fn.group(2)}"
+
+            elif any(e in lower for e in ("modulenotfounderror", "importerror")):
+                meta["issue_type"] = "import"
+
             logs.append(Log(
                 message   = msg,
                 level     = level,
                 service   = service,
                 timestamp = datetime.utcnow(),
-                metadata  = {},
+                metadata  = meta,
             ))
         return logs
-
     @staticmethod
     def _incident_payload(incident: Incident) -> dict:
-        llm = incident.metadata.get("llm_analysis", {})
+        llm  = incident.metadata.get("llm_analysis", {})
+        meta = incident.metadata
+
+        # Build a clean syntax_errors list from anomaly_details for easy consumption
+        syntax_errors = [
+            {
+                "file"   : d.get("flawed_file", "").split(":")[0],
+                "line"   : d.get("flawed_file", "").split(":")[1] if ":" in d.get("flawed_file", "") else "?",
+                "message": d.get("message", ""),
+            }
+            for d in meta.get("anomaly_details", [])
+            if d.get("issue_type") == "syntax" and d.get("flawed_file")
+        ]
+
+        # Human-readable label for orchestrator/dashboard display
+        _ISSUE_LABELS = {
+            "syntax"      : "SYNTAX ERROR",
+            "import"      : "IMPORT ERROR",
+            "runtime"     : "RUNTIME ERROR",
+            "cicd_failure": "CI/CD PIPELINE FAILURE",
+            "unknown"     : "UNCLASSIFIED ERROR",
+        }
+        raw_issue_type  = meta.get("issue_type", "unknown") or "unknown"
+        issue_type_label = _ISSUE_LABELS.get(raw_issue_type, raw_issue_type.upper().replace("_", " "))
+
         return {
-            "incident_id"  : incident.incident_id,
-            "service"      : incident.service,
-            "severity"     : incident.severity.value,
-            "description"  : incident.description,
-            "impact"       : llm.get("impact", ""),
-            "recommended"  : llm.get("recommended", ""),
-            "confidence"   : llm.get("confidence", 0.0),
-            "report"       : llm.get("report", ""),
-            "anomaly_count": incident.metadata.get("anomaly_count", 0),
-            "llm_fallback" : llm.get("fallback", True),
-            "files_to_fix" : llm.get("files_to_fix", []),
+            "incident_id"       : incident.incident_id,
+            "service"           : incident.service,
+            "severity"          : incident.severity.value,
+            "description"       : incident.description,
+            "impact"            : llm.get("impact", ""),
+            "recommended"       : llm.get("recommended", ""),
+            "confidence"        : llm.get("confidence", 0.0),
+            "report"            : llm.get("report", ""),
+            "anomaly_count"     : meta.get("anomaly_count", 0),
+            "llm_fallback"      : llm.get("fallback", True),
+            "files_to_fix"      : llm.get("files_to_fix", []),
+            # ── issue classification ───────────────────────────────────────
+            "issue_type"        : raw_issue_type,
+            "issue_type_label"  : issue_type_label,   # ← for display in orchestrator/UI
+            "flawed_file"       : meta.get("flawed_file", ""),
+            "all_issue_types"   : meta.get("all_issue_types", []),
+            "all_flawed_files"  : meta.get("all_flawed_files", []),
+            # ── syntax errors — always present, empty list if none ─────────
+            "syntax_errors"     : syntax_errors,
+            "has_syntax_error"  : bool(syntax_errors),
         }
 
     def _log_event(self, msg: str) -> None:
@@ -351,8 +589,6 @@ class MonitoringAgent(BaseAgent):
                 await asyncio.sleep(self._config.poll_interval)
             except asyncio.CancelledError:
                 break
-            if self._poll_paused:
-                continue
             try:
                 await self._poll_all_services()
             except asyncio.CancelledError:
@@ -423,14 +659,74 @@ class MonitoringAgent(BaseAgent):
                 incident.incident_id, incident.severity.value.upper(), incident.service,
             )
 
+            # ── Broadcast a dedicated SYNTAX_ERROR_DETECTED event so every
+            #    agent in the system learns the exact broken file + line ─────
+            syntax_anomalies = [
+                a for a in anomalies
+                if getattr(a, "issue_type", "") == "syntax"
+            ]
+            if syntax_anomalies:
+                syntax_files = []
+                for a in syntax_anomalies:
+                    parts     = a.flawed_file.split(":", 1)
+                    file_name = parts[0]
+                    line_no   = parts[1] if len(parts) > 1 else "?"
+                    syntax_files.append({
+                        "file"       : file_name,
+                        "line"       : line_no,
+                        "message"    : a.message,
+                        "incident_id": incident.incident_id,
+                    })
+
+                await self.publish(Event(
+                    type        = _SYNTAX_EVENT_TYPE,
+                    source      = self.name,
+                    incident_id = incident.incident_id,
+                    data        = {
+                        "service"      : service,
+                        "incident_id"  : incident.incident_id,
+                        "severity"     : "high",
+                        "error_count"  : len(syntax_files),
+                        "syntax_errors": syntax_files,
+                        "summary"      : (
+                            f"{len(syntax_files)} syntax error(s) in {service} — "
+                            + ", ".join(
+                                f"{f['file']}:{f['line']}" for f in syntax_files
+                            )
+                        ),
+                    },
+                ))
+                self.logger.error(
+                    "[MonitoringAgent] 🔴 SYNTAX_ERROR_DETECTED — %d broken file(s) in '%s': %s",
+                    len(syntax_files),
+                    service,
+                    [f"{f['file']}:{f['line']}" for f in syntax_files],
+                )
+
+            # Log issue_type and flawed_file from incident metadata
+            issue_type  = incident.metadata.get("issue_type", "unknown")
+            flawed_file = incident.metadata.get("flawed_file", "")
+            if issue_type != "unknown" or flawed_file:
+                self.logger.warning(
+                    "[MonitoringAgent] ISSUE TYPE: %s%s",
+                    issue_type.upper(),
+                    f" — flawed file: {flawed_file}" if flawed_file else "",
+                )
+                if issue_type == "syntax" and flawed_file:
+                    self.logger.warning(
+                        "[MonitoringAgent] SYNTAX ERROR in %s — fix this file before redeploying",
+                        flawed_file,
+                    )
+
             files_to_fix = incident.metadata.get("llm_analysis", {}).get("files_to_fix", [])
             if files_to_fix:
                 self.logger.warning("[MonitoringAgent] FILES TO FIX (%d):", len(files_to_fix))
-                for i, f in enumerate(files_to_fix, 1):
+                for idx, f in enumerate(files_to_fix, 1):
                     self.logger.warning(
-                        "[MonitoringAgent]   [%d] %s line %s in %s() — %s",
-                        i, f.get("file","?"), f.get("line","?"),
+                        "[MonitoringAgent]   [%d] %s line %s in %s() — %s [%s]",
+                        idx, f.get("file","?"), f.get("line","?"),
                         f.get("function","?"), f.get("exception",""),
+                        f.get("issue_type", issue_type),
                     )
 
         except Exception as e:
@@ -466,23 +762,6 @@ class MonitoringAgent(BaseAgent):
     def resume_dashboard(self) -> None:
         """Resume the live dashboard after the user has answered."""
         self._dashboard_paused = False
-
-    def pause(self) -> None:
-        """
-        Pause both polling and dashboard during approval prompts.
-        Stops the monitoring spam while waiting for user input.
-        """
-        self._poll_paused = True
-        self._dashboard_paused = True
-        self.logger.debug("[MonitoringAgent] Paused (approval in progress)")
-
-    def resume(self) -> None:
-        """
-        Resume both polling and dashboard after approval is answered.
-        """
-        self._poll_paused = False
-        self._dashboard_paused = False
-        self.logger.debug("[MonitoringAgent] Resumed")
 
     def _redraw_dashboard(self) -> None:
         now    = datetime.utcnow()

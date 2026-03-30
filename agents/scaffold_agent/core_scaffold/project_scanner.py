@@ -1,4 +1,3 @@
-from setup_path import *
 """
 core_scaffold/project_scanner.py
 ---------------------------------
@@ -15,11 +14,11 @@ Steps:
 import os
 from pathlib import Path
 
-from shared.models import (
+from agents.scaffold_agent.shared.models import (
     ProjectContext, Language, Framework,
     DeployConfig, ProjectSize, DeployTarget, CicdPlatform,
 )
-from shared.config import Config
+from agents.scaffold_agent.shared.config import Config
 
 
 # ── language detection ────────────────────────────────────────────────────────

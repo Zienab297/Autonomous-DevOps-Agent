@@ -20,7 +20,10 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 from groq import Groq
-from agents.self_healing_agent.models import VerificationStatus, CommandResult, VerificationReport
+try:
+    from agents.self_healing_agent.models import VerificationStatus, CommandResult, VerificationReport
+except ImportError:
+    from models import VerificationStatus, CommandResult, VerificationReport  # standalone / test mode
 import os
 from dotenv import load_dotenv
 
@@ -29,7 +32,7 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 logger = logging.getLogger(__name__)
 
-MODEL = "openai/gpt-oss-120b"
+MODEL = "llama-3.3-70b-versatile"
 
 
 # ============================================================

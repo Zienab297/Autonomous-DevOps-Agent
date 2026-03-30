@@ -47,6 +47,8 @@ class Anomaly:
             threshold=0.40,
             severity=Severity.CRITICAL,
             message="error_rate 0.4500 exceeds CRITICAL threshold 0.40",
+            issue_type="runtime",
+            flawed_file="deploy.py:47",
         )
     """
     service       : str
@@ -59,6 +61,10 @@ class Anomaly:
 
     # Optional: raw evidence that triggered the anomaly
     evidence_logs : List[Log] = field(default_factory=list)
+
+    # Issue classification — populated when traceback logs are present
+    issue_type    : str = "unknown"   # "syntax" | "import" | "runtime" | "unknown"
+    flawed_file   : str = ""          # e.g. "deploy.py:47" or "" if not available
 
     def __str__(self):
         return (
@@ -110,6 +116,7 @@ class Detector:
         anomalies += self._check_memory(service, metric_map)
 
         # --- Log checks ---
+        anomalies += self._check_syntax_errors(service, logs)   # ← syntax first
         anomalies += self._check_log_errors(service, logs)
         anomalies += self._check_cicd_conclusion(service, logs)
 
@@ -187,6 +194,8 @@ class Detector:
                 f"{count} traceback(s) detected in CI/CD logs "
                 f"(threshold: {threshold}) [{severity.value}]"
             ),
+            issue_type    = "runtime",   # refined by _check_log_errors if logs present
+            flawed_file   = "",          # populated downstream from log metadata
         )]
 
     def _check_latency(
@@ -243,6 +252,71 @@ class Detector:
             return [self._anomaly(service, "memory_usage", v, t.memory_medium, Severity.MEDIUM)]
         return []
 
+    def _check_syntax_errors(
+        self, service: str, logs: List[Log]
+    ) -> List[Anomaly]:
+        """
+        Dedicated check for syntax/indentation/tab errors in CI/CD logs.
+
+        These are compile-time failures — the service will NEVER start
+        until they are fixed, so we always raise at least MEDIUM severity
+        and include the exact file + line in the anomaly message.
+
+        Fires independently of _check_log_errors so the incident payload
+        always distinguishes "syntax bug" from "runtime error".
+        """
+        syntax_logs = [
+            l for l in logs
+            if l.level == "ERROR"
+            and (l.metadata or {}).get("issue_type") == "syntax"
+        ]
+        if not syntax_logs:
+            return []
+
+        anomalies: List[Anomaly] = []
+        seen_files: set = set()
+
+        for log in syntax_logs:
+            meta      = log.metadata or {}
+            fix_here  = meta.get("fix_here", "")
+            exc_type  = meta.get("exception", "SyntaxError")
+            file_name = meta.get("file", "")
+            line_no   = meta.get("line", "?")
+
+            # One anomaly per unique file — avoid duplicate noise
+            if fix_here and fix_here in seen_files:
+                continue
+            if fix_here:
+                seen_files.add(fix_here)
+
+            location = f"{file_name}:{line_no}" if file_name else fix_here or "unknown"
+            message  = (
+                f"SYNTAX ERROR in {location} — {exc_type}: {log.message} "
+                f"[fix this file before redeploying]"
+            )
+
+            anomalies.append(Anomaly(
+                service       = service,
+                metric_name   = "syntax_error",
+                current_value = 1.0,
+                threshold     = 0.0,
+                severity      = Severity.HIGH,   # always HIGH — service won't boot
+                message       = message,
+                evidence_logs = [log],
+                issue_type    = "syntax",
+                flawed_file   = fix_here or location,
+            ))
+
+        if anomalies:
+            logger.error(
+                "[Detector] %d SYNTAX ERROR(s) in %s — files: %s",
+                len(anomalies),
+                service,
+                [a.flawed_file for a in anomalies],
+            )
+
+        return anomalies
+
     def _check_log_errors(
         self, service: str, logs: List[Log]
     ) -> List[Anomaly]:
@@ -252,6 +326,9 @@ class Detector:
         For FileCollector, every Log is already a traceback — so this acts
         as a secondary confirmation check. For MockCollector / live backends
         it's the primary log-level check.
+
+        Also extracts issue_type and flawed_file from log metadata when
+        available (populated by FileCollector from parsed tracebacks).
         """
         error_logs = [l for l in logs if l.level == "ERROR"]
         count = len(error_logs)
@@ -268,6 +345,29 @@ class Detector:
         else:
             severity = Severity.MEDIUM
 
+        # Extract issue_type and flawed_file from error log metadata.
+        # Priority 1: a log that has fix_here (exact location known)
+        # Priority 2: a log that has issue_type but no fix_here
+        #             (e.g. ##[error]IndentationError from GitHub Actions)
+        issue_type  = "unknown"
+        flawed_file = ""
+        fallback_issue_type = "unknown"
+
+        for log in error_logs:
+            meta = log.metadata or {}
+            if "fix_here" in meta:
+                # Best case — we know the exact file and line
+                issue_type  = meta.get("issue_type", "runtime")
+                flawed_file = meta.get("fix_here", "")
+                break
+            elif meta.get("issue_type") and meta["issue_type"] != "unknown":
+                # We know the type but not the exact location yet
+                fallback_issue_type = meta["issue_type"]
+
+        # Use the fallback type if we never found a fix_here
+        if issue_type == "unknown" and fallback_issue_type != "unknown":
+            issue_type = fallback_issue_type
+
         anomaly = Anomaly(
             service       = service,
             metric_name   = "log_error_count",
@@ -277,8 +377,11 @@ class Detector:
             message       = (
                 f"{count} ERROR log lines detected "
                 f"(threshold: {threshold}) [{severity.value}]"
+                + (f" — {issue_type} error in {flawed_file}" if flawed_file else "")
             ),
-            evidence_logs = error_logs[:10],  # keep first 10 as evidence
+            evidence_logs = error_logs[:10],
+            issue_type    = issue_type,
+            flawed_file   = flawed_file,
         )
         return [anomaly]
 
@@ -302,15 +405,31 @@ class Detector:
         pipeline_failed = False
 
         for log in logs:
-            msg_lower = log.message.lower()
-            # Top-level pipeline failure
+            msg       = log.message
+            msg_lower = msg.lower()
+
+            # Top-level pipeline failure (CI/CD agent structured summary)
             if "status=completed" in msg_lower and "conclusion=failure" in msg_lower:
                 pipeline_failed = True
                 failure_logs.append(log)
-            # Individual step failure
+
+            # Individual step failure — structured summary
             elif "conclusion=failure" in msg_lower:
                 failure_logs.append(log)
-            # Skipped steps are a secondary signal (caused by the failure)
+
+            # GitHub Actions native error lines: ##[error]<message>
+            elif msg.startswith("##[error]") or "##[error]" in msg_lower:
+                failure_logs.append(log)
+
+            # Non-zero exit code line from GitHub Actions runner
+            elif (
+                "process completed with exit code" in msg_lower
+                and not msg_lower.endswith("exit code 0")
+            ):
+                pipeline_failed = True
+                failure_logs.append(log)
+
+            # Skipped steps — secondary signal
             elif "conclusion=skipped" in msg_lower:
                 skipped_logs.append(log)
 
@@ -331,6 +450,23 @@ class Detector:
             + f" [{severity.value}]"
         )
 
+        # Try to find a syntax/import/runtime error hidden inside the failed step logs
+        # so we can classify more precisely than "cicd_failure"
+        refined_issue_type = "cicd_failure"
+        for log in failure_logs + skipped_logs:
+            meta = log.metadata or {}
+            it = meta.get("issue_type", "")
+            if it in ("syntax", "import", "runtime"):
+                refined_issue_type = it
+                break
+            msg_lower = log.message.lower()
+            if any(e in msg_lower for e in ("syntaxerror", "indentationerror", "taberror")):
+                refined_issue_type = "syntax"
+                break
+            if any(e in msg_lower for e in ("modulenotfounderror", "importerror")):
+                refined_issue_type = "import"
+                break
+
         return [Anomaly(
             service       = service,
             metric_name   = "cicd_conclusion",
@@ -339,6 +475,7 @@ class Detector:
             severity      = severity,
             message       = message,
             evidence_logs = (failure_logs + skipped_logs)[:10],
+            issue_type    = refined_issue_type,
         )]
 
     # --------------------------------------------------------
