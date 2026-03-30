@@ -11,7 +11,6 @@ ROOT             = DEVOPS_AGENT_DIR.parent
 
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DEVOPS_AGENT_DIR))
-sys.path.insert(0, str(ROOT / "agents" / "scaffold_agent"))
 
 from controllers.agent_controller import AgentController
 from agents.scaffold_agent.shared.config import load_config as load_scaffold_config
@@ -52,40 +51,15 @@ except ImportError:
 
 
 def _load_knowledge_adapter():
-    import importlib.util
-    ka_root      = ROOT / "agents" / "knowledge_agent"
-    adapter_path = ka_root / "knowledge_core" / "knowledge_agent_adapter.py"
-    if not adapter_path.exists():
-        return FileNotFoundError(f"Not found: {adapter_path}")
-    ka_root_s = str(ka_root)
-    inserted  = ka_root_s not in sys.path
-    saved     = {}
+    # Import via fully-qualified package path only.
+    # Never add knowledge_agent root to sys.path — both scaffold_agent and
+    # knowledge_agent have a 'shared/' sub-package; adding the root causes
+    # Python to resolve bare 'shared.models' to scaffold_agent/shared/models.py.
     try:
-        if inserted:
-            sys.path.insert(0, ka_root_s)
-        for mod_name, rel in [
-            ("shared",        "shared/__init__.py"),
-            ("shared.models", "shared/models.py"),
-            ("shared.config", "shared/config.py"),
-        ]:
-            fpath = ka_root / rel
-            if not fpath.exists():
-                continue
-            if mod_name in sys.modules:
-                saved[mod_name] = sys.modules[mod_name]
-            spec = importlib.util.spec_from_file_location(mod_name, str(fpath))
-            mod  = importlib.util.module_from_spec(spec)
-            sys.modules[mod_name] = mod
-            spec.loader.exec_module(mod)
         from agents.knowledge_agent.knowledge_core.knowledge_agent_adapter import KnowledgeAgentAdapter
         return KnowledgeAgentAdapter
     except Exception as exc:
         return exc
-    finally:
-        for k, v in saved.items():
-            sys.modules[k] = v
-        if inserted and ka_root_s in sys.path:
-            sys.path.remove(ka_root_s)
 
 
 _ka_result           = _load_knowledge_adapter()
@@ -535,16 +509,8 @@ async def _run_scaffold():
 
     if _KNOWLEDGE_AVAILABLE:
         try:
-            ka_root_s = str(ROOT / "agents" / "knowledge_agent")
-            _added    = ka_root_s not in sys.path
-            if _added:
-                sys.path.insert(0, ka_root_s)
-            try:
-                orchestrator.register_agent("knowledge_agent", KnowledgeAgentAdapter())
-                dashboard.event("knowledge agent registered")
-            finally:
-                if _added and ka_root_s in sys.path:
-                    sys.path.remove(ka_root_s)
+            orchestrator.register_agent("knowledge_agent", KnowledgeAgentAdapter())
+            dashboard.event("knowledge agent registered")
         except Exception as e:
             dashboard.event(f"knowledge skipped — {e}")
     else:

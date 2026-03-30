@@ -123,7 +123,7 @@ def _build_prompt(service, anomalies, metrics, logs, now) -> str:
 
     files_to_fix_schema = (
         '  "files_to_fix": [{"file": "deploy.py", "line": 47, "function": "run_pipeline", '
-        '"exception": "KeyError: \'AWS_REGION\'", "fix_description": "What needs to change"}],'
+        '"exception": "KeyError: AWS_REGION", "fix_description": "What needs to change"}],'
         if has_tracebacks else '  "files_to_fix": [],'
     )
 
@@ -204,13 +204,63 @@ class GroqAnalyzer:
         return self._parse(raw)
 
     def _parse(self, raw: str) -> IncidentAnalysis:
-        clean = raw
-        if clean.startswith("```"):
-            clean = "\n".join(
-                l for l in clean.split("\n") if not l.strip().startswith("```")
-            ).strip()
+        """
+        Robustly extract and parse the JSON object from the LLM response.
 
-        parsed     = json.loads(clean)
+        Handles:
+        - Clean JSON with no wrapper
+        - JSON wrapped in ```json ... ``` fences
+        - JSON buried after explanation text
+        - Unescaped quotes / backslashes from log content in the prompt
+        """
+        # Step 1: extract the JSON object by finding the outermost { ... }
+        # This handles cases where the LLM adds explanation before/after
+        brace_start = raw.find("{")
+        brace_end   = raw.rfind("}")
+        if brace_start == -1 or brace_end == -1 or brace_end <= brace_start:
+            raise ValueError("No JSON object found in LLM response")
+
+        clean = raw[brace_start : brace_end + 1]
+
+        # Step 2: try direct parse first
+        try:
+            parsed = json.loads(clean)
+        except json.JSONDecodeError:
+            # Step 3: repair common LLM JSON mistakes
+            import re as _re
+            # Remove trailing commas before } or ]
+            clean = _re.sub(r",\s*([}\]])", r"\1", clean)
+            # Replace smart quotes with straight quotes
+            clean = clean.replace("\u201c", '"').replace("\u201d", '"')
+            clean = clean.replace("\u2018", "'").replace("\u2019", "'")
+            # Fix unescaped Windows backslash paths (e.g. D:\rename\file.py)
+            # Only fix lone backslashes that aren't already a valid escape
+            clean = _re.sub(r"\\(?![\"'/nrtbfu])", r"\\\\", clean)
+            try:
+                parsed = json.loads(clean)
+            except json.JSONDecodeError:
+                # Last resort: extract just the string values we need
+                # using regex rather than full JSON parse
+                def _extract(key):
+                    m = _re.search(
+                        r'"' + key + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', clean
+                    )
+                    return m.group(1) if m else ""
+                def _extract_float(key):
+                    m = _re.search(r'"' + key + r'"\s*:\s*([0-9.]+)', clean)
+                    try:
+                        return float(m.group(1)) if m else 0.7
+                    except ValueError:
+                        return 0.7
+                parsed = {
+                    "severity"         : _extract("severity") or "medium",
+                    "root_cause"       : _extract("root_cause"),
+                    "impact"           : _extract("impact"),
+                    "recommended_action": _extract("recommended_action"),
+                    "confidence"       : _extract_float("confidence"),
+                    "incident_report"  : _extract("incident_report"),
+                    "files_to_fix"     : [],
+                }
         severity   = _SEVERITY_MAP.get(parsed.get("severity","medium").lower(), Severity.MEDIUM)
         confidence = float(parsed.get("confidence", 0.7))
         confidence = max(0.0, min(1.0, confidence))

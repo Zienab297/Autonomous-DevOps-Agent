@@ -62,13 +62,16 @@ sys.path.insert(0, AGENT_DIR)
 # IMPORTS  (real modules — no stubs)
 # ══════════════════════════════════════════════════════════════════════════════
 
-from models import (           # noqa: E402
-    Solution,
-    RemediationStatus,
-    VerificationStatus,
-    SelfHealingResult,
-)
-from self_healing_agent import SelfHealingAgent  # noqa: E402
+try:
+    from agents.self_healing_agent.models import (
+        Solution, RemediationStatus, VerificationStatus, SelfHealingResult, FileToFix,
+    )
+    from agents.self_healing_agent.self_healing_agent import SelfHealingAgent
+except ImportError:
+    from models import (           # noqa: E402  (standalone mode)
+        Solution, RemediationStatus, VerificationStatus, SelfHealingResult, FileToFix,
+    )
+    from self_healing_agent import SelfHealingAgent  # noqa: E402
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,11 +125,11 @@ def build_solutions(base_dir: str) -> List[Solution]:
             "pip check",
         ],
         references=["https://pypi.org/"],
-        files_to_modify=[{
-            "path":    req_path,
-            "action":  "overwrite",
-            "content": read_file(req_path),   # broken content — LLM fixes it
-        }],
+        files_to_modify=[FileToFix(
+            path            = req_path,
+            fix_description = "Fix broken dependencies in requirements.txt",
+            current_content = read_file(req_path),
+        )],
     ))
 
     # ── 2. ci.yml ────────────────────────────────────────────────────────────
@@ -149,11 +152,11 @@ def build_solutions(base_dir: str) -> List[Solution]:
         confidence=0.95,
         suggested_commands=[],
         references=["https://github.com/actions/checkout"],
-        files_to_modify=[{
-            "path":    ci_path,
-            "action":  "overwrite",
-            "content": read_file(ci_path),    # broken content — LLM fixes it
-        }],
+        files_to_modify=[FileToFix(
+            path            = ci_path,
+            fix_description = "Fix broken GitHub Actions workflow in ci.yml",
+            current_content = read_file(ci_path),
+        )],
     ))
 
     # ── 3. Dockerfile ────────────────────────────────────────────────────────
@@ -178,11 +181,11 @@ def build_solutions(base_dir: str) -> List[Solution]:
             "docker run --rm -p 5000:5000 my-app:fixed",
         ],
         references=["https://docs.docker.com/engine/reference/builder/"],
-        files_to_modify=[{
-            "path":    docker_path,
-            "action":  "overwrite",
-            "content": read_file(docker_path),   # broken content — LLM fixes it
-        }],
+        files_to_modify=[FileToFix(
+            path            = docker_path,
+            fix_description = "Fix broken apt-get install and Flask binding in Dockerfile",
+            current_content = read_file(docker_path),
+        )],
     ))
 
     # ── 4. deployment.yaml ───────────────────────────────────────────────────
@@ -206,11 +209,11 @@ def build_solutions(base_dir: str) -> List[Solution]:
             "kubectl apply -f deployment.yaml",
         ],
         references=["https://kubernetes.io/docs/concepts/workloads/controllers/deployment/"],
-        files_to_modify=[{
-            "path":    deploy_path,
-            "action":  "overwrite",
-            "content": read_file(deploy_path),   # broken content — LLM fixes it
-        }],
+        files_to_modify=[FileToFix(
+            path            = deploy_path,
+            fix_description = "Add missing spec.selector.matchLabels to Kubernetes Deployment",
+            current_content = read_file(deploy_path),
+        )],
     ))
 
     return solutions
