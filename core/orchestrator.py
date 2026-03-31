@@ -1096,11 +1096,25 @@ class Orchestrator:
             return
 
         # ── Step C: self-healing always runs ─────────────────────────────────
-        # (INVESTIGATION_COMPLETE already published above when KA succeeded,
-        #  so _on_investigation_complete will call remediate(). Only call it
-        #  directly here in the fallback path to avoid double-execution.)
-        if knowledge_agent and self.registry.get_agent("knowledge_agent"):
-            # Knowledge agent succeeded → _on_investigation_complete handles it
+        # INVESTIGATION_COMPLETE was already published when KA succeeded, so
+        # _on_investigation_complete will call remediate() in that case.
+        # Only invoke self-healing directly here in the fallback path
+        # (KA failed or not registered) to avoid double-execution.
+        #
+        # BUG FIX: the old check `if knowledge_agent and ...` was always True
+        # because `knowledge_agent` holds the agent object regardless of whether
+        # the KA call succeeded or raised an exception. We now check `solution`
+        # origin instead: if the KA succeeded it published INVESTIGATION_COMPLETE
+        # and set solution.source != 'fallback', so we can safely return and let
+        # _on_investigation_complete handle self-healing. If solution came from
+        # _build_fallback_solution, we must invoke self-healing directly here.
+        ka_succeeded = (
+            knowledge_agent is not None
+            and solution is not None
+            and getattr(solution, "source", "fallback") != "fallback"
+        )
+        if ka_succeeded:
+            # KA succeeded → _on_investigation_complete handles self-healing
             return
 
         # Fallback path — directly invoke self-healing
