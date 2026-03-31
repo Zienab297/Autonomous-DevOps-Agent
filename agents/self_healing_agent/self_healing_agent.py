@@ -68,7 +68,7 @@ from core.models import RemediationStatus
 
 logger = logging.getLogger(__name__)
 
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".self_healing_backups")
+# Backup location is resolved at runtime from self._project_root — see _apply_to_disk()
 
 # safe SYNTAX_ERROR_DETECTED lookup (added in previous session)
 try:
@@ -633,18 +633,27 @@ class SelfHealingAgent(BaseAgent):
 
     def _apply_to_disk(self, modifications: List[FileModificationResult]) -> None:
         timestamp  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        backup_dir = os.path.join(BACKUP_DIR, timestamp)
+        # Backup root lives inside the user's project, never next to the SDK files
+        backup_dir = self._project_root / ".self_healing_backups" / timestamp
 
         for mod in modifications:
             try:
                 if mod.old_content:
-                    os.makedirs(backup_dir, exist_ok=True)
-                    bak_name    = os.path.basename(mod.path) + ".bak"
-                    backup_path = os.path.join(backup_dir, bak_name)
-                    with open(backup_path, "w", encoding="utf-8") as fh:
-                        fh.write(mod.old_content)
-                    mod.backup_path = backup_path
-                    logger.info("[SelfHealingAgent] Backup: %s", backup_path)
+                    # Preserve the relative path structure inside the backup folder
+                    # so that two files with the same basename don't collide.
+                    # e.g. /user_project/src/main.py
+                    #   → <project_root>/.self_healing_backups/<ts>/src/main.py.bak
+                    try:
+                        rel = Path(mod.path).resolve().relative_to(self._project_root)
+                    except ValueError:
+                        # path is outside project_root — fall back to basename only
+                        rel = Path(os.path.basename(mod.path))
+
+                    bak_path = backup_dir / rel.parent / (rel.name + ".bak")
+                    bak_path.parent.mkdir(parents=True, exist_ok=True)
+                    bak_path.write_text(mod.old_content, encoding="utf-8")
+                    mod.backup_path = str(bak_path)
+                    logger.info("[SelfHealingAgent] Backup: %s", bak_path)
 
                 os.makedirs(os.path.dirname(mod.path) or ".", exist_ok=True)
                 write_mode = "a" if mod.action == "append" else "w"
