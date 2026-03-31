@@ -11,7 +11,6 @@ ROOT             = DEVOPS_AGENT_DIR.parent
 
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DEVOPS_AGENT_DIR))
-sys.path.insert(0, str(ROOT / "agents" / "scaffold_agent"))
 
 from controllers.agent_controller import AgentController
 from agents.scaffold_agent.shared.config import load_config as load_scaffold_config
@@ -45,6 +44,13 @@ try:
 except ImportError as _llm_err:
     _LLM_SELECTOR_AVAILABLE = False
 
+# ── Email client ───────────────────────────────────────────────────────────────
+try:
+    from core.email_client import EmailClient
+    _EMAIL_MODULE_AVAILABLE = True
+except ImportError:
+    _EMAIL_MODULE_AVAILABLE = False
+
 # ── Optional agents ────────────────────────────────────────────────────────────
 try:
     from agents.cicd_agent.cicd_agent import CICDAgent
@@ -61,40 +67,15 @@ except ImportError:
     _MONITORING_AVAILABLE = False
 
 def _load_knowledge_adapter():
-    import importlib.util
-    ka_root      = ROOT / "agents" / "knowledge_agent"
-    adapter_path = ka_root / "knowledge_core" / "knowledge_agent_adapter.py"
-    if not adapter_path.exists():
-        return FileNotFoundError(f"Not found: {adapter_path}")
-    ka_root_s = str(ka_root)
-    inserted  = ka_root_s not in sys.path
-    saved     = {}
+    # Import via fully-qualified package path only.
+    # Never add knowledge_agent root to sys.path — both scaffold_agent and
+    # knowledge_agent have a 'shared/' sub-package; adding the root causes
+    # Python to resolve bare 'shared.models' to scaffold_agent/shared/models.py.
     try:
-        if inserted:
-            sys.path.insert(0, ka_root_s)
-        for mod_name, rel in [
-            ("shared",        "shared/__init__.py"),
-            ("shared.models", "shared/models.py"),
-            ("shared.config", "shared/config.py"),
-        ]:
-            fpath = ka_root / rel
-            if not fpath.exists():
-                continue
-            if mod_name in sys.modules:
-                saved[mod_name] = sys.modules[mod_name]
-            spec = importlib.util.spec_from_file_location(mod_name, str(fpath))
-            mod  = importlib.util.module_from_spec(spec)
-            sys.modules[mod_name] = mod
-            spec.loader.exec_module(mod)
         from agents.knowledge_agent.knowledge_core.knowledge_agent_adapter import KnowledgeAgentAdapter
         return KnowledgeAgentAdapter
     except Exception as exc:
         return exc
-    finally:
-        for k, v in saved.items():
-            sys.modules[k] = v
-        if inserted and ka_root_s in sys.path:
-            sys.path.remove(ka_root_s)
 
 _ka_result           = _load_knowledge_adapter()
 _KNOWLEDGE_AVAILABLE = not isinstance(_ka_result, Exception)
@@ -151,6 +132,53 @@ _LOGO = [
 def _print_logo():
     for line in _LOGO:
         print(line)
+
+
+
+# ── Email client builder ───────────────────────────────────────────────────────
+
+def _build_email_client():
+    """
+    Build EmailClient from ALERT_* env vars.
+
+    ALERT_ENGINEER_EMAIL  — primary developer; receives all approvals and alerts.
+    ALERT_TEAM_EMAILS     — comma-separated; receives alerts when HIGH / CRITICAL.
+
+    Returns None silently if required vars are missing.
+    """
+    if not _EMAIL_MODULE_AVAILABLE:
+        return None
+
+    host     = os.getenv("ALERT_SMTP_HOST",     "").strip()
+    port_s   = os.getenv("ALERT_SMTP_PORT",     "587").strip()
+    username = os.getenv("ALERT_SMTP_USERNAME", "").strip()
+    password = os.getenv("ALERT_SMTP_PASSWORD", "").strip()
+    from_    = os.getenv("ALERT_FROM_ADDRESS",  username).strip()
+    engineer = os.getenv("ALERT_ENGINEER_EMAIL","").strip()
+
+    team_raw = os.getenv("ALERT_TEAM_EMAILS", "").strip()
+    team     = [a.strip() for a in team_raw.split(",") if a.strip()] if team_raw else []
+
+    if not (host and username and password and engineer):
+        return None
+
+    try:
+        client = EmailClient(
+            smtp_host         = host,
+            smtp_port         = int(port_s),
+            username          = username,
+            password          = password,
+            from_address      = from_,
+            engineer_email    = engineer,
+            team_emails       = team,
+            approval_base_url = os.getenv("ALERT_APPROVAL_BASE_URL", "").strip(),
+        )
+        team_info = f"  |  emergency team → {len(team)} address(es)" if team else ""
+        print(f"  [Email] approvals/alerts → {engineer}{team_info}")
+        return client
+    except Exception as exc:
+        print(f"  [Email] failed to init: {exc}")
+        return None
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
@@ -395,8 +423,16 @@ def _attach_llm_providers_to_orchestrator(orchestrator: Orchestrator, dashboard:
 async def _run_scaffold():
     project_path    = str(Path.cwd())
     scaffold_config = load_scaffold_config()
-    orchestrator    = Orchestrator()
-    dashboard       = Dashboard(orchestrator)
+
+    # ── Build email client from ALERT_* env vars ──────────────────────────
+    print("\n  Checking notification channels...")
+    email = _build_email_client()
+    if not email:
+        print("  [Channels] CLI only — add ALERT_SMTP_* to .env to enable email approvals/alerts")
+    print()
+
+    orchestrator = Orchestrator(email=email)
+    dashboard    = Dashboard(orchestrator)
 
     _patch_approval(orchestrator.approval, dashboard)
 
@@ -504,16 +540,8 @@ async def _run_scaffold():
 
     if _KNOWLEDGE_AVAILABLE:
         try:
-            ka_root_s = str(ROOT / "agents" / "knowledge_agent")
-            _added    = ka_root_s not in sys.path
-            if _added:
-                sys.path.insert(0, ka_root_s)
-            try:
-                orchestrator.register_agent("knowledge_agent", KnowledgeAgentAdapter())
-                dashboard.event("knowledge agent registered")
-            finally:
-                if _added and ka_root_s in sys.path:
-                    sys.path.remove(ka_root_s)
+            orchestrator.register_agent("knowledge_agent", KnowledgeAgentAdapter())
+            dashboard.event("knowledge agent registered")
         except Exception as e:
             dashboard.event(f"knowledge skipped — {e}")
     else:
@@ -521,6 +549,7 @@ async def _run_scaffold():
         dashboard.event(f"knowledge unavailable — {err}")
 
     await orchestrator.start()
+    await orchestrator.start_approval_server()
 
     # ── Wire PostgreSQL DB (if configured) ────────────────────────────────
     if _PG_AVAILABLE:
@@ -576,6 +605,7 @@ async def _run_scaffold():
         dashboard._draw()
         await asyncio.sleep(1)
         dashboard.stop()
+        await orchestrator.stop_approval_server()
         return
 
     await orchestrator.run_scaffold(
@@ -589,6 +619,13 @@ async def _run_scaffold():
     dashboard._draw()
     await asyncio.sleep(1)
     dashboard.stop()
+    await orchestrator.stop_approval_server()
+    # Cancel any lingering approval tasks so their input() calls don't
+    # bleed into the post-pipeline menu prompt.
+    for task in asyncio.all_tasks():
+        if task.get_name().startswith("approval-"):
+            task.cancel()
+    await asyncio.sleep(0.1)  # let cancelled tasks finish cleanup
 
 
 def _show_main_menu() -> str:

@@ -1,4 +1,3 @@
-from setup_path import *
 """
 core_scaffold/file_generator.py
 --------------------------------
@@ -9,7 +8,7 @@ Handles multiple LLM output formats robustly.
 import re
 from pathlib import Path
 
-from shared.models import GeneratedFile, ScaffoldResult
+from agents.scaffold_agent.shared.models import GeneratedFile, ScaffoldResult
 
 
 # ── known filenames the LLM might generate ───────────────────────────────────

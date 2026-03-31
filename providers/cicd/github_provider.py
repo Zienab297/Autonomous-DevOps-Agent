@@ -192,27 +192,116 @@ class GitHubProvider(BaseCICDProvider):
         )
 
     async def collect_logs(self, run_id: str, repo: str) -> list[str]:
-        """Return job names + step conclusions (avoids large zip download)."""
+        """
+        Fetch the full text logs for a workflow run so the MonitoringAgent
+        can find syntax errors, tracebacks, and other failure details.
+
+        Strategy
+        --------
+        1. Call GET /actions/runs/{run_id}/jobs  → get job list + step summaries
+        2. For each job, call GET /actions/jobs/{job_id}/logs  → raw text log
+           (GitHub redirects to a pre-signed S3 URL — aiohttp follows it)
+        3. Parse raw log lines and include them in the output
+        4. Always prepend the structured step-conclusion lines so the
+           _check_cicd_conclusion detector still fires on conclusion=failure
+
+        Falls back gracefully: if the zip/log fetch fails for any job,
+        we still return the step-summary lines for that job.
+        """
+        import io
+        import zipfile
+
         full = self._full_repo(repo)
         s    = await self._get_session()
+
+        # ── Step 1: get job list ──────────────────────────────────────────────
         async with s.get(
             f"{self.BASE}/repos/{full}/actions/runs/{run_id}/jobs"
         ) as resp:
             if resp.status != 200:
+                logger.warning(
+                    "[GitHubProvider] collect_logs: jobs endpoint returned %d for run %s",
+                    resp.status, run_id,
+                )
                 return []
-            data = await resp.json()
+            jobs_data = await resp.json()
 
-        lines = []
-        for job in data.get("jobs", []):
-            lines.append(
-                f"[{job['name']}] status={job['status']} "
+        all_lines: list[str] = []
+
+        for job in jobs_data.get("jobs", []):
+            job_id   = job.get("id")
+            job_name = job.get("name", str(job_id))
+
+            # ── Step 2a: structured summary line (keeps _check_cicd_conclusion working) ──
+            all_lines.append(
+                f"[{job_name}] status={job['status']} "
                 f"conclusion={job.get('conclusion')}"
             )
             for step in job.get("steps", []):
-                lines.append(
+                all_lines.append(
                     f"  step={step['name']} "
                     f"conclusion={step.get('conclusion')}"
                 )
+
+            # ── Step 2b: fetch actual log text for this job ───────────────────
+            if not job_id:
+                continue
+            try:
+                log_lines = await self._fetch_job_log_lines(full, job_id, job_name)
+                all_lines.extend(log_lines)
+            except Exception as exc:
+                logger.warning(
+                    "[GitHubProvider] collect_logs: could not fetch log for job %s (%s): %s",
+                    job_name, job_id, exc,
+                )
+
+        logger.info(
+            "[GitHubProvider] collect_logs: run=%s repo=%s → %d lines",
+            run_id, full, len(all_lines),
+        )
+        return all_lines
+
+    async def _fetch_job_log_lines(
+        self, full_repo: str, job_id: int, job_name: str
+    ) -> list[str]:
+        """
+        Fetch raw log text for a single job.
+
+        GitHub returns a 302 redirect to a pre-signed URL containing plain
+        text logs (NOT a zip at the job level — only the run-level endpoint
+        returns a zip).  aiohttp follows redirects automatically.
+
+        Returns a list of stripped, non-empty log lines prefixed with the
+        job name so the MonitoringAgent can trace which job they came from.
+        """
+        s   = await self._get_session()
+        url = f"{self.BASE}/repos/{full_repo}/actions/jobs/{job_id}/logs"
+
+        async with s.get(url, allow_redirects=True) as resp:
+            if resp.status not in (200, 302):
+                logger.debug(
+                    "[GitHubProvider] job log fetch returned %d for job %s",
+                    resp.status, job_id,
+                )
+                return []
+            raw_text = await resp.text(encoding="utf-8", errors="replace")
+
+        lines: list[str] = []
+        for raw_line in raw_text.splitlines():
+            # GitHub prefixes every line with a timestamp: "2024-03-24T02:13:50.1234567Z "
+            # Strip it so the detector regexes match cleanly.
+            line = raw_line.strip()
+            if not line:
+                continue
+            # Remove the leading timestamp (fixed 29-char ISO prefix + space)
+            if len(line) > 29 and line[4] == "-" and line[7] == "-" and "T" in line[:20]:
+                line = line[29:].strip()
+            if line:
+                lines.append(line)
+
+        logger.debug(
+            "[GitHubProvider] job '%s' → %d log lines", job_name, len(lines)
+        )
         return lines
 
     # ── deployment ────────────────────────────────────────────────────────────
