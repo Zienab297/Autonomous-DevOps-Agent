@@ -394,6 +394,18 @@ class Orchestrator:
             self.state_manager.set_agent_status(record.name, AgentStatus.STOPPED)
         logger.info("[Orchestrator] Stopped")
 
+    async def start_approval_server(self) -> None:
+        """Start the HTTP server that handles email approve/deny link clicks."""
+        if self._approval_server:
+            url = await self._approval_server.start()
+            if url:
+                print(f"  [ApprovalServer] Listening at: {url}\n")
+
+    async def stop_approval_server(self) -> None:
+        """Stop the HTTP server and terminate the Cloudflare tunnel."""
+        if self._approval_server:
+            await self._approval_server.stop()
+
     # ── Scaffold ──────────────────────────────────────────────────────────────
 
     async def run_scaffold(
