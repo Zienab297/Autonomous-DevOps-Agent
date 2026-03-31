@@ -1,57 +1,49 @@
 """
 core/approval_manager.py
--------------------------
-Manages approvals across CLI, Slack, and Email.
-First channel to respond wins — others are ignored.
+────────────────────────
+Manages approvals across CLI and Email simultaneously.
+First channel to respond wins — the other is cancelled.
 
-KEY FIX: The MonitoringAgent prints a live dashboard on a background task.
-This overwrites the CLI input prompt and the user can't type.
-Solution: ApprovalManager accepts an optional `registry` reference.
-Before showing the CLI prompt it calls monitoring_agent.pause_dashboard(),
-and resumes it after the answer is received.
+CHANNELS:
+  CLI    — always active; pauses the monitoring dashboard while waiting.
+  Email  — active if EmailClient is injected; sends HTML email with
+           Approve / Deny links served by ApprovalServer.
 
-Usage:
-    manager = ApprovalManager(slack, email, registry=orchestrator.registry)
-    approved = await manager.request_approval(
-        title="Scaffold complete — proceed to CI/CD?",
-        details=["Dockerfile", "k8s/deployment.yaml", ...],
-    )
-    if approved:
-        ...
+RESOLUTION:
+  resolve_approval() is called by:
+    * ApprovalServer  — when engineer clicks email link (GET /approve or /deny)
+    * _cli_approval() — when user types yes/no in the terminal
+
+DASHBOARD PAUSE:
+  ApprovalManager accepts an optional `registry` reference.
+  Before showing the CLI prompt it pauses the MonitoringAgent live dashboard.
 """
 
 import asyncio
 import logging
+import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 class ApprovalManager:
-    """
-    Sends approval requests to CLI + Slack + Email simultaneously.
-    First channel to respond wins.
-    """
 
     def __init__(
         self,
-        slack=None,
         email=None,
         timeout_seconds: int = 300,
-        registry=None,          # ← AgentRegistry; used to pause monitoring dashboard
+        registry=None,
     ):
-        self.slack           = slack
         self.email           = email
         self.timeout_seconds = timeout_seconds
-        self.registry        = registry   # set via orchestrator after init
+        self.registry        = registry
+        # approval_id -> (approved: bool | None, asyncio.Event)
+        self._pending: dict = {}
 
-    # ── pause / resume monitoring dashboard ──────────────────────────────────
+    # ── Dashboard pause / resume ──────────────────────────────────────────────
 
     def _pause_monitoring(self) -> None:
-        """
-        Stop the MonitoringAgent's live dashboard print loop so it doesn't
-        overwrite the CLI approval prompt while the user is typing.
-        """
         if not self.registry:
             return
         agent = self.registry.get_agent("monitoring_agent")
@@ -62,7 +54,6 @@ class ApprovalManager:
                 pass
 
     def _resume_monitoring(self) -> None:
-        """Resume the MonitoringAgent dashboard after the user has answered."""
         if not self.registry:
             return
         agent = self.registry.get_agent("monitoring_agent")
@@ -72,180 +63,108 @@ class ApprovalManager:
             except Exception:
                 pass
 
-    # ── main entry point ──────────────────────────────────────────────────────
+    # ── Resolution (called by ApprovalServer) ────────────────────────────────
 
-    async def request_approval(
-        self,
-        title  : str,
-        details: list[str] = None,
-        context: dict      = None,
-    ) -> bool:
+    def resolve_approval(self, approval_id: str, approved: bool, source: str = "unknown") -> Optional[bool]:
         """
-        Request approval from all available channels simultaneously.
-        Returns True (approved) or False (denied / timeout).
+        Resolve a pending approval. Returns the decision on first call,
+        None if already resolved by another channel.
         """
-        details = details or []
-        context = context or {}
+        entry = self._pending.get(approval_id)
+        if entry is None:
+            return None
+        _, done_event = entry
+        if done_event.is_set():
+            return None
+        self._pending[approval_id] = (approved, done_event)
+        done_event.set()
+        logger.info("[ApprovalManager] Resolved id=%s approved=%s source=%s", approval_id, approved, source)
+        return approved
 
-        logger.info(f"[ApprovalManager] Requesting approval: {title}")
+    # ── Main entry point ──────────────────────────────────────────────────────
 
-        # Shared event — first responder sets it
-        decision: dict = {"approved": None}
-        resolved = asyncio.Event()
+    async def request_approval(self, title: str, details: list = None, context: dict = None) -> bool:
+        """Request approval from CLI + Email simultaneously. Returns True/False."""
+        details     = details or []
+        context     = context or {}
+        approval_id = str(uuid.uuid4())
+        done_event  = asyncio.Event()
+        self._pending[approval_id] = (None, done_event)
 
-        async def resolve(approved: bool, source: str):
-            if not resolved.is_set():
-                decision["approved"] = approved
-                decision["source"]   = source
-                resolved.set()
-                logger.info(
-                    f"[ApprovalManager] Decision from {source}: "
-                    f"{'APPROVED' if approved else 'DENIED'}"
-                )
+        logger.info("[ApprovalManager] Requesting approval: %s", title)
 
-        # Build all tasks
-        tasks = []
-
-        # 1. CLI approval (always available)
-        tasks.append(asyncio.create_task(
-            self._cli_approval(title, details, resolve)
-        ))
-
-        # 2. Slack approval (if configured)
-        if self.slack:
-            tasks.append(asyncio.create_task(
-                self._slack_approval(title, details, context, resolve)
-            ))
-
-        # 3. Email approval (if configured)
+        tasks = [
+            asyncio.create_task(
+                self._cli_approval(approval_id, title, details),
+                name=f"approval-cli-{approval_id[:8]}",
+            )
+        ]
         if self.email:
             tasks.append(asyncio.create_task(
-                self._email_approval(title, details, context, resolve)
+                self._email_approval(approval_id, title, details),
+                name=f"approval-email-{approval_id[:8]}",
             ))
 
-        # Wait for first response or timeout
         try:
-            await asyncio.wait_for(resolved.wait(), timeout=self.timeout_seconds)
+            await asyncio.wait_for(done_event.wait(), timeout=self.timeout_seconds)
         except asyncio.TimeoutError:
-            logger.warning(f"[ApprovalManager] Approval timed out: {title}")
-            decision["approved"] = False
-            decision["source"]   = "timeout"
+            logger.warning("[ApprovalManager] Approval timed out: %s", title)
+            self.resolve_approval(approval_id, False, source="timeout")
 
-        # Cancel remaining tasks
         for task in tasks:
             if not task.done():
                 task.cancel()
 
-        approved = decision.get("approved", False)
-        source   = decision.get("source", "unknown")
-        print(
-            f"\n  [Approval] Decision: "
-            f"{'✅ APPROVED' if approved else '❌ DENIED'} (via {source})\n"
-        )
-
+        entry    = self._pending.pop(approval_id, (False, None))
+        approved = entry[0] if entry[0] is not None else False
+        print(f"\n  [Approval] {'APPROVED' if approved else 'DENIED'}\n")
         return approved
 
-    # ── CLI approval ──────────────────────────────────────────────────────────
+    # ── CLI channel ───────────────────────────────────────────────────────────
 
-    async def _cli_approval(
-        self,
-        title  : str,
-        details: list[str],
-        resolve,
-    ):
-        """
-        Ask for approval directly in the terminal.
-
-        Pauses the MonitoringAgent dashboard before showing the prompt so
-        background prints don't overwrite what the user is typing.
-        Resumes the dashboard after the answer is received.
-        """
+    async def _cli_approval(self, approval_id: str, title: str, details: list) -> None:
         try:
-            # ── pause monitoring dashboard ────────────────────────────────
             self._pause_monitoring()
-
-            print(f"\n{'═' * 55}")
+            print(f"\n{'=' * 55}")
             print(f"  APPROVAL REQUIRED")
-            print(f"{'─' * 55}")
+            print(f"{'-' * 55}")
             print(f"  {title}")
             if details:
-                print(f"{'─' * 55}")
+                print(f"{'-' * 55}")
                 for item in details:
                     print(f"    + {item}")
-            print(f"{'─' * 55}")
-            if self.slack or self.email:
-                print(f"  Waiting for Slack / Email response too...")
-                print(f"{'─' * 55}")
+            print(f"{'-' * 55}")
+            if self.email:
+                print(f"  Also waiting on: Email")
+                print(f"{'-' * 55}")
 
-            # Run input in thread so it doesn't block the event loop
             answer = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: input("  Approve? [yes/no]: ").strip().lower()
+                lambda: input("  Approve? [yes/no]: ").strip().lower(),
             )
-
-            approved = answer in ("yes", "y")
-            await resolve(approved, "CLI")
+            self.resolve_approval(approval_id, answer in ("yes", "y"), source="CLI")
 
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.error(f"[ApprovalManager] CLI error: {e}")
+        except Exception as exc:
+            logger.error("[ApprovalManager] CLI error: %s", exc)
         finally:
-            # ── always resume monitoring dashboard ────────────────────────
             self._resume_monitoring()
 
-    # ── Slack approval ────────────────────────────────────────────────────────
+    # ── Email channel ─────────────────────────────────────────────────────────
 
-    async def _slack_approval(
-        self,
-        title  : str,
-        details: list[str],
-        context: dict,
-        resolve,
-    ):
-        """Send approval request to Slack and wait for button click."""
+    async def _email_approval(self, approval_id: str, title: str, details: list) -> None:
+        """Send email then wait for ApprovalServer to call resolve_approval()."""
         try:
-            if not self.slack:
-                return
-
-            approval_id = await self.slack.send_approval_request(
+            await self.email.send_approval_request(
+                approval_id=approval_id,
                 title=title,
                 details=details,
-                context=context,
             )
-
-            result = await self.slack.wait_for_response(approval_id)
-            await resolve(result, "Slack")
-
+            _, done_event = self._pending.get(approval_id, (None, None))
+            if done_event:
+                await done_event.wait()
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.error(f"[ApprovalManager] Slack error: {e}")
-
-    # ── Email approval ────────────────────────────────────────────────────────
-
-    async def _email_approval(
-        self,
-        title  : str,
-        details: list[str],
-        context: dict,
-        resolve,
-    ):
-        """Send approval request via Email and wait for link click."""
-        try:
-            if not self.email:
-                return
-
-            approval_id = await self.email.send_approval_request(
-                title=title,
-                details=details,
-                context=context,
-            )
-
-            result = await self.email.wait_for_response(approval_id)
-            await resolve(result, "Email")
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"[ApprovalManager] Email error: {e}")
+        except Exception as exc:
+            logger.error("[ApprovalManager] Email error: %s", exc)

@@ -84,11 +84,13 @@ class IncidentFactory:
                 "anomaly_count"  : len(anomalies),
                 "anomaly_details": [
                     {
-                        "metric"   : a.metric_name,
-                        "value"    : a.current_value,
-                        "threshold": a.threshold,
-                        "severity" : a.severity.value,
-                        "message"  : a.message,
+                        "metric"     : a.metric_name,
+                        "value"      : a.current_value,
+                        "threshold"  : a.threshold,
+                        "severity"   : a.severity.value,
+                        "message"    : a.message,
+                        "issue_type" : getattr(a, "issue_type", "unknown") or "unknown",
+                        "flawed_file": getattr(a, "flawed_file", "") or "",
                     }
                     for a in anomalies
                 ],

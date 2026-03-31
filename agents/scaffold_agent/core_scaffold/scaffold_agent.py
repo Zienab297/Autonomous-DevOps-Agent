@@ -1,4 +1,3 @@
-from setup_path import *
 """
 core_scaffold/scaffold_agent.py
 --------------------------------
@@ -6,10 +5,10 @@ Main orchestrator for the Scaffold Agent.
 """
 
 import ollama
-from shared.models import ProjectContext, ScaffoldResult, DeployConfig, DeployTarget
-from shared.config import Config
-from core_scaffold.project_scanner import ProjectScanner
-from core_scaffold.file_generator  import parse_llm_response, write_files
+from agents.scaffold_agent.shared.models import ProjectContext, ScaffoldResult, DeployConfig, DeployTarget
+from agents.scaffold_agent.shared.config import Config
+from agents.scaffold_agent.core_scaffold.project_scanner import ProjectScanner
+from agents.scaffold_agent.core_scaffold.file_generator import parse_llm_response, write_files
 
 
 class ScaffoldAgent:
@@ -70,10 +69,11 @@ class ScaffoldAgent:
     # ── prompt builder ────────────────────────────────────────────────────────
 
     def _build_prompt(self, context: ProjectContext) -> str:
-        deploy       = context.deploy_config
-        project_name = context.project_name
-        db_block     = self._db_compose_block(deploy, project_name)
-        entry        = context.entry_point.replace(".py", "")
+        deploy        = context.deploy_config
+        project_name  = context.project_name
+        db_block      = self._db_compose_block(deploy, project_name)
+        entry         = context.entry_point.replace(".py", "")
+        syntax_check  = self._syntax_check_step(context)
 
         return f"""You are a DevOps engineer. Your only job is to output deployment files.
 
@@ -158,6 +158,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+{syntax_check}
       - uses: docker/login-action@v3
         with:
           username: ${{{{ secrets.DOCKER_USERNAME }}}}
@@ -275,9 +276,28 @@ START with FILE: Dockerfile
                 )
                 if gf.content != original:
                     print(f"[ScaffoldAgent] Fixed Dockerfile COPY command (LLM used project name instead of '.')")
+
+            if gf.filename == ".github/workflows/deploy.yml":
+                original = gf.content
+                # Fix: remove trailing dash in Docker image names (e.g. myapp-:latest → myapp:latest)
+                gf.content = re.sub(r'([\w][\w\-]*)-(:[\w])', r'\1\2', gf.content)
+                if gf.content != original:
+                    print("[ScaffoldAgent] Fixed trailing dash in Docker image name in deploy.yml")
         return files
 
     # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _syntax_check_step(self, context: ProjectContext) -> str:
+        """Return the correct syntax-check step for the detected language."""
+        steps = {
+            "python" : "        run: python -m compileall .",
+            "node"   : "        run: node --check $(find . -name '*.js' | head -1)",
+            "go"     : "        run: go build ./...",
+            "java"   : "        run: mvn compile --no-transfer-progress",
+            "rust"   : "        run: cargo check",
+        }
+        cmd = steps.get(context.language.value, "        run: python -m compileall .")
+        return f"      - name: Validate {context.language.value} syntax\n{cmd}"
 
     def _db_compose_block(self, deploy: DeployConfig, project_name: str) -> str:
         """Add database service to docker-compose if detected."""

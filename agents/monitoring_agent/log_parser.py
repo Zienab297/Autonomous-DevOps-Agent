@@ -89,6 +89,75 @@ _LOG_PREFIX_RE = re.compile(
     r'\s+(?:\[)?(?P<level>ERROR|WARNING|WARN|INFO|DEBUG|CRITICAL|FATAL)(?:\])?\s*'
 )
 
+# ── GitHub Actions / Python compiler syntax-error patterns ────────────────────
+#
+# GitHub Actions reports Python syntax/indentation errors WITHOUT a traceback.
+# They appear as either:
+#
+#   *** Sorry: IndentationError: expected an indented block ... (main.py, line 11)
+#   SyntaxError: invalid syntax (main.py, line 5)
+#   IndentationError: unexpected indent (app.py, line 23)
+#
+# Pattern A — "*** Sorry:" prefix (most common in GHA Python runner output)
+_GHA_SORRY_RE = re.compile(
+    r'\*+\s*Sorry:\s*'
+    r'(?P<exc_type>\w+(?:Error|Exception|Warning))\s*:\s*'
+    r'(?P<message>[^(]+)'
+    r'\((?P<file>[^,\)]+),\s*line\s*(?P<line>\d+)\)',
+    re.IGNORECASE,
+)
+
+# Pattern B — bare "ExcType: message (file.py, line N)" without the Sorry prefix
+_GHA_BARE_RE = re.compile(
+    r'^(?P<exc_type>(?:Syntax|Indentation|Tab|Name|Import|Attribute|Type|Value)'
+    r'Error)\s*:\s*(?P<message>[^(]+)'
+    r'\((?P<file>[^,\)]+),\s*line\s*(?P<line>\d+)\)',
+    re.IGNORECASE,
+)
+
+# Pattern C — bare "ExcType: message" with NO "(file, line N)" suffix.
+#
+# Python's compiler emits this when the error location was already shown on
+# the preceding lines as a "File ... line N" frame + caret (^) pointer, e.g.:
+#
+#   File "main.py", line 15
+#     uvicorn.run(app, host="0.0.0.0", port=8000)?
+#                                                ^
+#   SyntaxError: invalid syntax
+#
+# Also catches GitHub Actions ##[error] prefixed variants:
+#   ##[error]SyntaxError: invalid syntax
+#
+# Covers ALL common Python compile-time and runtime error types.
+_GHA_BARE_NOLOC_RE = re.compile(
+    r'^(?:##\[error\])?'
+    r'(?P<exc_type>'
+    r'(?:Syntax|Indentation|Tab)Error'              # compile-time
+    r'|(?:Name|Import|Attribute|Type|Value|Key'     # runtime / lookup
+    r'|Runtime|OS|IO|File(?:Not)?Found'
+    r'|Permission|Timeout|Connection|Module(?:NotFound)?'
+    r'|Assertion|Not(?:Implemented)?|Recursion'
+    r'|Zero(?:Division)?|Overflow|Memory|Unicode'
+    r'|Stop(?:Iteration)?|Generator(?:Exit)?'
+    r'|Keyboard(?:Interrupt)?|System(?:Exit)?)Error'
+    r')'
+    r'\s*:\s*(?P<message>.+)',
+    re.IGNORECASE,
+)
+
+# Matches a "  File "x.py", line N" line that appears BEFORE a bare exception
+# (same format as a traceback frame but without the "in func" part — emitted
+# directly by the Python compiler for SyntaxError / IndentationError).
+#
+# Handles variants seen in GitHub Actions logs:
+#   *** File "./main.py", line 15      ← *** prefix + ./ path prefix
+#       File "main.py", line 15        ← standard
+#       File "./main.py", line 15      ← ./ prefix only
+_GHA_FILE_LINE_RE = re.compile(
+    r'^(?:\*+\s*)?'                        # optional leading *** marker
+    r'\s*File\s+"(?P<file>[^"]+)",\s+line\s+(?P<line>\d+)\s*$'
+)
+
 
 # ── data models ───────────────────────────────────────────────────────────────
 
@@ -333,6 +402,32 @@ class LogParser:
                 if current_level == "WARN":
                     current_level = "WARNING"
 
+            # ── GitHub Actions syntax/indentation errors (no traceback wrapper) ──
+            # These appear as "*** Sorry: IndentationError: ... (main.py, line 11)"
+            # or bare "SyntaxError: ... (file.py, line N)" — match BEFORE the
+            # standard traceback check so they are never silently dropped.
+            #
+            # Pass the preceding lines as context so Pattern C can look back for
+            # the "  File "x.py", line N" header that Python emits above the
+            # offending code snippet when there is no (file, line) suffix on the
+            # exception line itself (e.g. "SyntaxError: invalid syntax").
+            syntax_err = self._match_gha_syntax_error(line, preceding_lines=lines[:i])
+            if syntax_err:
+                errors.append(ParsedError(
+                    log_file       = log_file,
+                    service        = service,
+                    exception_type = syntax_err["exc_type"],
+                    message        = syntax_err["message"],
+                    file           = syntax_err["file"],
+                    line           = syntax_err["line"],
+                    function       = "<module>",
+                    full_traceback = line.strip(),
+                    timestamp      = current_ts,
+                    level          = "ERROR",
+                ))
+                i += 1
+                continue
+
             # Detect start of a Python traceback
             if "Traceback (most recent call last)" in line:
                 traceback_lines, exc_type, exc_msg, frames = self._collect_traceback(lines, i)
@@ -364,6 +459,89 @@ class LogParser:
             errors        = errors,
             raw_log_lines = len(lines),
         )
+
+    @staticmethod
+    def _match_gha_syntax_error(
+        line: str,
+        preceding_lines: Optional[list] = None,
+    ) -> Optional[dict]:
+        """
+        Try to match a GitHub Actions / Python-compiler syntax error.
+        Returns a dict with exc_type, message, file, line (int) or None.
+
+        Handles three formats:
+
+        Pattern A — "*** Sorry:" prefix (most common in GHA Python runner):
+          *** Sorry: IndentationError: expected an indented block (main.py, line 11)
+
+        Pattern B — bare with location suffix:
+          SyntaxError: invalid syntax (app.py, line 5)
+
+        Pattern C — bare with NO location suffix (Python compiler multi-line output):
+          File "main.py", line 15          ← on a preceding line
+            uvicorn.run(app, ...)?         ← code line
+                                ^          ← caret pointer
+          SyntaxError: invalid syntax      ← THIS line (no file/line suffix)
+
+          Also handles ##[error] prefixed GitHub Actions variants:
+          ##[error]SyntaxError: invalid syntax
+        """
+        # Patterns A and B — location embedded in the same line
+        for pattern in (_GHA_SORRY_RE, _GHA_BARE_RE):
+            m = pattern.search(line)
+            if m:
+                exc_type = m.group("exc_type").strip()
+                raw_msg  = m.group("message").strip().rstrip("—- ")
+                file_    = m.group("file").strip()
+                lineno   = int(m.group("line"))
+                full_msg = f"{exc_type}: {raw_msg} ({file_}, line {lineno})"
+                return {
+                    "exc_type": exc_type,
+                    "message" : full_msg,
+                    "file"    : file_,
+                    "line"    : lineno,
+                }
+
+        # Pattern C — bare exception line; look back up to 10 lines for the
+        # "  File "x.py", line N" compiler header that Python emits above the
+        # offending code snippet and caret pointer.
+        m = _GHA_BARE_NOLOC_RE.match(line.strip())
+        if m:
+            exc_type = m.group("exc_type").strip()
+            raw_msg  = m.group("message").strip()
+
+            # Try to find file + line from preceding context
+            file_   : str = "unknown"
+            lineno  : int = 0
+
+            if preceding_lines:
+                # Walk backwards; skip blank lines, caret lines, and code lines
+                for prev in reversed(preceding_lines[-10:]):
+                    prev_stripped = prev.strip()
+                    # Skip caret pointer lines (^^^^^) and blank lines
+                    if not prev_stripped or set(prev_stripped) <= {"^", " ", "\t"}:
+                        continue
+                    # Skip pure code/source lines that are indented but not a File line
+                    fm = _GHA_FILE_LINE_RE.match(prev)
+                    if fm:
+                        file_  = fm.group("file").strip().lstrip("./")
+                        lineno = int(fm.group("line"))
+                        break
+                    # If we hit a non-file, non-blank, non-caret line that isn't
+                    # the File header, the context window is exhausted
+                    if not prev_stripped.startswith("File "):
+                        break
+
+            loc_suffix = f" ({file_}, line {lineno})" if file_ != "unknown" else ""
+            full_msg   = f"{exc_type}: {raw_msg}{loc_suffix}"
+            return {
+                "exc_type": exc_type,
+                "message" : full_msg,
+                "file"    : file_,
+                "line"    : lineno,
+            }
+
+        return None
 
     def _collect_traceback(
         self,
