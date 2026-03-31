@@ -38,8 +38,10 @@ Workflow inside remediate()
     Step 8 — Verify:   LLM verifier confirms the fix actually worked
     Step 9 — Publish:  REMEDIATION_COMPLETE or REMEDIATION_FAILED
 """
+import asyncio
 import logging
 import os
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -241,6 +243,55 @@ class SelfHealingAgent(BaseAgent):
             source          = "syntax_error_detected",
         )
 
+        # ── Step 1: dry-run — snapshot files and get the LLM's proposed fix ───
+        # We do NOT write to disk yet. Show the diff to the user first.
+        solution.files_to_modify = self._normalise_files(solution.files_to_modify)
+        self._snapshot_files(solution.files_to_modify)
+
+        try:
+            llm_response = fix_files(
+                incident_id        = solution.incident_id,
+                root_cause         = solution.root_cause,
+                healing_prompt     = solution.healing_prompt,
+                suggested_commands = solution.suggested_commands,
+                files_to_modify    = solution.files_to_modify,
+            )
+        except Exception as exc:
+            logger.error("[SelfHealingAgent] LLM Fixer raised during preview: %s", exc, exc_info=True)
+            await self.publish(Event(
+                type        = EventType.REMEDIATION_FAILED,
+                source      = self.name,
+                incident_id = incident_id,
+                data        = {
+                    "incident_id": incident_id,
+                    "service"    : service,
+                    "issue_type" : "syntax",
+                    "reason"     : f"LLM Fixer failed: {exc}",
+                },
+            ))
+            return
+
+        # ── Step 2: show diff and ask the user ───────────────────────────────
+        approved = await self._ask_user_approval(solution, llm_response)
+        if not approved:
+            logger.info(
+                "[SelfHealingAgent] User rejected the proposed fix for %s — aborting",
+                incident_id,
+            )
+            await self.publish(Event(
+                type        = EventType.REMEDIATION_FAILED,
+                source      = self.name,
+                incident_id = incident_id,
+                data        = {
+                    "incident_id": incident_id,
+                    "service"    : service,
+                    "issue_type" : "syntax",
+                    "reason"     : "User rejected the proposed fix",
+                },
+            ))
+            return
+
+        # ── Step 3: approved — run the full pipeline ─────────────────────────
         result = await self.remediate(solution)
 
         # Publish result back onto the event bus
@@ -435,12 +486,86 @@ class SelfHealingAgent(BaseAgent):
     def _guard_solution(self, solution: Solution) -> List[str]:
         errors = []
         if not solution.files_to_modify:
-            errors.append("Solution.files_to_modify is empty — nothing to fix.")
-            return errors
+            # ── fallback: try to extract file+line from the incident description ──
+            # This handles the case where log_parser found 0 files but the CI/CD
+            # output contains a plain "*** Sorry: IndentationError: ... (main.py, line 11)"
+            # that was embedded in the description by groq_analyzer / incident_factory.
+            recovered = self._extract_files_from_description(solution)
+            if recovered:
+                logger.info(
+                    "[SelfHealingAgent] Guard: recovered %d file(s) from incident description",
+                    len(recovered),
+                )
+                solution.files_to_modify = recovered
+            else:
+                errors.append("Solution.files_to_modify is empty — nothing to fix.")
+                return errors
         for i, f in enumerate(solution.files_to_modify):
             if not f.path.strip():
                 errors.append(f"files_to_modify[{i}] missing 'path'.")
         return errors
+
+    # ── patterns reused from log_parser for description scanning ──────────────
+    _DESC_SORRY_RE = re.compile(
+        r'\*+\s*Sorry:\s*(?P<exc_type>\w+(?:Error|Exception))\s*:\s*'
+        r'(?P<message>[^(]+)\((?P<file>[^,\)]+),\s*line\s*(?P<line>\d+)\)',
+        re.IGNORECASE,
+    )
+    _DESC_BARE_RE = re.compile(
+        r'(?P<exc_type>(?:Syntax|Indentation|Tab)Error)\s*:\s*'
+        r'(?P<message>[^(]+)\((?P<file>[^,\)]+),\s*line\s*(?P<line>\d+)\)',
+        re.IGNORECASE,
+    )
+
+    def _extract_files_from_description(self, solution: Solution) -> List[FileToFix]:
+        """
+        Scan the solution's root_cause and healing_prompt for GitHub-Actions-style
+        syntax error messages and build FileToFix entries from them.
+
+        Matches:
+          *** Sorry: IndentationError: expected an indented block (main.py, line 11)
+          SyntaxError: invalid syntax (app.py, line 5)
+        """
+        search_text = " ".join(filter(None, [
+            getattr(solution, "root_cause",     ""),
+            getattr(solution, "healing_prompt", ""),
+            getattr(solution, "description",    ""),
+        ]))
+
+        seen: set = set()
+        files: List[FileToFix] = []
+
+        for pattern in (self._DESC_SORRY_RE, self._DESC_BARE_RE):
+            for m in pattern.finditer(search_text):
+                raw_file = m.group("file").strip()
+                lineno   = int(m.group("line"))
+                exc_type = m.group("exc_type").strip()
+                msg      = m.group("message").strip().rstrip("—- ")
+
+                key = (raw_file, lineno)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                file_path = str(self._resolve_path(raw_file))
+                full_msg  = f"{exc_type}: {msg} ({raw_file}, line {lineno})"
+
+                logger.info(
+                    "[SelfHealingAgent] Recovered from description: %s line %d — %s",
+                    raw_file, lineno, exc_type,
+                )
+                files.append(FileToFix(
+                    path            = file_path,
+                    line            = lineno,
+                    function        = "<module>",
+                    exception       = full_msg,
+                    fix_description = (
+                        f"Fix {exc_type} at line {lineno}. "
+                        f"Original error: {full_msg}"
+                    ),
+                ))
+
+        return files
 
     def _snapshot_files(self, files_to_modify: List[FileToFix]) -> None:
         """Read current content from disk into each FileToFix.current_content."""
@@ -603,6 +728,89 @@ class SelfHealingAgent(BaseAgent):
                 abort_triggered = True
 
         return results
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # User approval gate
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _ask_user_approval(
+        self,
+        solution     : Solution,
+        llm_response : LLMFixResponse,
+    ) -> bool:
+        """
+        Print the proposed file changes as a unified diff and ask the user
+        to accept or reject via stdin. Returns True if accepted.
+
+        Uses asyncio.to_thread for the blocking input() call so the event
+        loop is not stalled while waiting for the user.
+        """
+        import difflib
+
+        print("\n" + "═" * 68)
+        print("  🔧  SELF-HEALING AGENT — PROPOSED FIX")
+        print("═" * 68)
+        print(f"  Incident : {solution.incident_id}")
+        print(f"  Cause    : {solution.root_cause}")
+        print(f"  Files    : {len(llm_response.modified_files)}")
+        print("═" * 68)
+
+        snapshots = {f.path: f.current_content for f in solution.files_to_modify}
+
+        for entry in llm_response.modified_files:
+            path        = entry.get("path", "?")
+            new_content = entry.get("new_content", "")
+            old_content = snapshots.get(path, "")
+
+            diff = list(difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                lineterm="",
+            ))
+
+            print(f"\n  File: {path}")
+            print("  " + "-" * 60)
+            if diff:
+                for dl in diff[:60]:   # cap at 60 diff lines for readability
+                    prefix = dl[0] if dl else " "
+                    color  = "\033[32m" if prefix == "+" else "\033[31m" if prefix == "-" else ""
+                    reset  = "\033[0m" if color else ""
+                    print(f"  {color}{dl.rstrip()}{reset}")
+                if len(diff) > 60:
+                    print(f"  ... ({len(diff) - 60} more lines not shown)")
+            else:
+                print("  (no diff — content unchanged)")
+
+        print("\n" + "═" * 68)
+        if llm_response.steps:
+            print("  Steps the agent will take:")
+            for i, step in enumerate(llm_response.steps, 1):
+                print(f"    {i}. {step}")
+
+        if llm_response.remediation_commands:
+            print("\n  Commands that will run after the fix:")
+            for cmd in llm_response.remediation_commands:
+                print(f"    $ {cmd.get('command', '')}")
+
+        print("═" * 68)
+
+        def _prompt() -> bool:
+            while True:
+                try:
+                    ans = input("\n  Accept this fix? [y/N] > ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n  [Interrupted — rejecting fix]")
+                    return False
+                if ans in ("y", "yes"):
+                    return True
+                if ans in ("n", "no", ""):
+                    return False
+                print("  Please enter y or n.")
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _prompt)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
