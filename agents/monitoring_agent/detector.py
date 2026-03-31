@@ -159,7 +159,7 @@ class Detector:
     ) -> List[Anomaly]:
         """
         Check the traceback_count metric produced by FileCollector.
-        Any CI run with ≥ threshold tracebacks is an incident.
+        Any CI run with >= threshold tracebacks is an incident.
 
         Even 1 traceback is enough to fire at MEDIUM severity — this is a
         real code bug, not a noisy log line.
@@ -256,30 +256,22 @@ class Detector:
         self, service: str, logs: List[Log]
     ) -> List[Anomaly]:
         """
-        Dedicated check for syntax/indentation/tab errors in CI/CD logs.
+        Scan logs for Python syntax/indentation errors that were parsed by
+        LogParser._match_gha_syntax_error() and tagged with issue_type="syntax"
+        and fix_here=<file>:<line> in their metadata.
 
-        These are compile-time failures — the service will NEVER start
-        until they are fixed, so we always raise at least MEDIUM severity
-        and include the exact file + line in the anomaly message.
-
-        Fires independently of _check_log_errors so the incident payload
-        always distinguishes "syntax bug" from "runtime error".
+        One Anomaly per unique broken file.
         """
-        syntax_logs = [
-            l for l in logs
-            if l.level == "ERROR"
-            and (l.metadata or {}).get("issue_type") == "syntax"
-        ]
-        if not syntax_logs:
-            return []
-
         anomalies: List[Anomaly] = []
         seen_files: set = set()
 
-        for log in syntax_logs:
-            meta      = log.metadata or {}
+        for log in logs:
+            meta = log.metadata or {}
+            if meta.get("issue_type") != "syntax":
+                continue
+
+            exc_type = meta.get("exception", "SyntaxError")
             fix_here  = meta.get("fix_here", "")
-            exc_type  = meta.get("exception", "SyntaxError")
             file_name = meta.get("file", "")
             line_no   = meta.get("line", "?")
 
@@ -467,6 +459,23 @@ class Detector:
                 refined_issue_type = "import"
                 break
 
+        # ── FIX: extract flawed_file from failure log metadata ────────────────
+        # Previously this was always left blank, causing the anomaly to have
+        # issue_type="syntax" but flawed_file="" — so SYNTAX_ERROR_DETECTED
+        # fired with an empty file field and the self-healing agent skipped it.
+        refined_flawed_file = ""
+        for log in failure_logs:
+            meta = log.metadata or {}
+            fh = meta.get("fix_here", "")
+            if fh:
+                refined_flawed_file = fh
+                break
+            # Fallback: reconstruct from file + line keys if fix_here absent
+            if meta.get("file"):
+                line = meta.get("line", "?")
+                refined_flawed_file = f"{meta['file']}:{line}"
+                break
+
         return [Anomaly(
             service       = service,
             metric_name   = "cicd_conclusion",
@@ -476,6 +485,7 @@ class Detector:
             message       = message,
             evidence_logs = (failure_logs + skipped_logs)[:10],
             issue_type    = refined_issue_type,
+            flawed_file   = refined_flawed_file,   # ← was always "" before this fix
         )]
 
     # --------------------------------------------------------

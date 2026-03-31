@@ -420,6 +420,35 @@ class MonitoringAgent(BaseAgent):
             analysis.severity.value, analysis.confidence * 100,
             len(analysis.files_to_fix), analysis.fallback,
         )
+
+        # ── Promote issue_type + flawed_file directly from Anomaly objects ─────
+        # IncidentFactory.anomaly_details only serialises metric/value/severity/message —
+        # it does NOT include issue_type or flawed_file, so we read from the live
+        # anomaly list we already have in scope instead.
+        # Priority order: syntax > import > runtime > cicd_failure > unknown
+        _PRIORITY = {"syntax": 4, "import": 3, "runtime": 2, "cicd_failure": 1, "unknown": 0}
+        best_issue_type  = "unknown"
+        best_flawed_file = ""
+        for a in anomalies:
+            it = getattr(a, "issue_type", "unknown") or "unknown"
+            ff = getattr(a, "flawed_file", "") or ""
+            if _PRIORITY.get(it, 0) > _PRIORITY.get(best_issue_type, 0):
+                best_issue_type  = it
+                best_flawed_file = ff
+            elif it == best_issue_type and ff and not best_flawed_file:
+                best_flawed_file = ff
+
+        incident.metadata["issue_type"]  = best_issue_type
+        incident.metadata["flawed_file"] = best_flawed_file
+        incident.metadata["all_issue_types"]  = list({
+            getattr(a, "issue_type", "unknown") for a in anomalies
+        })
+        incident.metadata["all_flawed_files"] = list({
+            getattr(a, "flawed_file", "")
+            for a in anomalies
+            if getattr(a, "flawed_file", "")
+        })
+
         return incident
 
     @staticmethod
@@ -427,40 +456,70 @@ class MonitoringAgent(BaseAgent):
         """
         Convert raw CI/CD log strings to Log objects the Detector can process.
 
-        Handles three formats:
+        Handles:
           1. Free-text logs — keyword match for ERROR/FAIL/TRACEBACK etc.
           2. Structured CI/CD step summaries — conclusion=failure/skipped
-          3. Inline syntax errors (GitHub Actions / pytest / python -c):
-               *** Sorry: IndentationError: expected an indented block ... (main.py, line 11)
+          3. Inline syntax errors with file+line on the same line:
+               *** Sorry: IndentationError: ... (main.py, line 11)
                SyntaxError: invalid syntax (deploy.py, line 5)
-               E   IndentationError: unexpected indent (utils/helper.py, line 23)
+          4. Multi-line compiler blocks where file+line are on a PRECEDING line:
+               ***   File "./main.py", line 15
+                   uvicorn.run(app, host="0.0.0.0", port=8000)?
+                                                              ^
+               SyntaxError: invalid syntax
+             → regex lookback first, then LLM fallback if regex misses.
         """
         import re as _re
+        import json as _json
 
-        # Matches all single-line syntax error formats from CI/CD runners:
-        #   *** Sorry: IndentationError: ... (main.py, line 11)
-        #   ##[error]IndentationError: ... (main.py, line 11)   ← GitHub Actions
-        #   E   IndentationError: ...  (pytest)
-        #   SyntaxError: ... (deploy.py, line 5)
         _INLINE_SYN = _re.compile(
-            r'(?:^\*+\s*Sorry:\s*|##\[error\]\s*|^\s*E\s+)?'
-            r'(?P<exc>SyntaxError|IndentationError|TabError):\s*'
-            r'(?P<msg>[^(]+?)\s*'
+            r'(?:^\*+\s*Sorry:\s*|##\[error\]\s*|^\s*E\s+)?' +
+            r'(?P<exc>SyntaxError|IndentationError|TabError):\s*' +
+            r'(?P<msg>[^(]+?)\s*' +
             r'\((?P<file>[^,)]+),\s*line\s+(?P<line>\d+)\)',
             _re.IGNORECASE,
         )
 
+        # Matches "***   File \"./main.py\", line 15" — with or without *** prefix
+        _FILE_HDR = _re.compile(
+            r'^(?:\*+\s*)?\s*File\s+\"(?P<file>[^\"]+)\",\s+line\s+(?P<line>\d+)\s*$'
+        )
+
+        def _llm_extract_location(context_lines, exc_msg):
+            """Ask the LLM for file+line when regex can\'t find them."""
+            try:
+                from agents.monitoring_agent.groq_analyzer import _chat
+                context_block = "\n".join(l.strip() for l in context_lines[-10:])
+                prompt = (
+                    "You are a CI/CD log parser. "
+                    "Extract the Python source file name and line number from this syntax error block. "
+                    "Respond with ONLY valid JSON, no explanation: "
+                    '{"file": "main.py", "line": 15}\n\n' +
+                    f"Error: {exc_msg}\n\nContext lines:\n{context_block}"
+                )
+                raw = _chat(prompt)
+                b_start = raw.find("{")
+                b_end   = raw.rfind("}")
+                if b_start == -1 or b_end == -1:
+                    return {}
+                parsed = _json.loads(raw[b_start : b_end + 1])
+                file_ = str(parsed.get("file", "")).strip().lstrip("./")
+                line_ = int(parsed.get("line", 0))
+                if file_ and line_:
+                    logger.debug(
+                        "[MonitoringAgent] LLM extracted location: %s:%s", file_, line_
+                    )
+                    return {"file": file_, "line": line_}
+            except Exception as _e:
+                logger.debug("[MonitoringAgent] LLM location extraction failed: %s", _e)
+            return {}
+
         logs = []
-        for line in raw_lines:
+        for i, line in enumerate(raw_lines):
             msg   = line.strip()
             lower = msg.lower()
             upper = msg.upper()
 
-            # ── GitHub Actions native log formats ────────────────────────
-            # ##[error]   → step failed
-            # ##[warning] → step warning
-            # Process completed with exit code N (N≠0) → failure
-            # conclusion=failure / conclusion=skipped → CI/CD step summary
             is_gh_error   = msg.startswith("##[error]") or "##[error]" in lower
             is_gh_warning = msg.startswith("##[warning]") or "##[warning]" in lower
             is_exit_fail  = (
@@ -484,8 +543,7 @@ class MonitoringAgent(BaseAgent):
 
             meta: dict = {}
 
-            # ── Priority 1: inline syntax error with filename + line ─────────
-            # Catches: *** Sorry: IndentationError: ... (main.py, line 11)
+            # ── Priority 1: inline syntax error — file+line on same line ────
             inline_m = _INLINE_SYN.search(msg)
             if inline_m:
                 level              = "ERROR"
@@ -499,15 +557,59 @@ class MonitoringAgent(BaseAgent):
                 meta["fix_here"]   = f"{file_name}:{line_no}"
                 meta["full_traceback"] = msg
 
-            # ── Priority 2: keyword-only syntax match (no filename yet) ─────
+            # ── Priority 2: bare syntax keyword — no file+line on this line ─
+            # Strategy: regex lookback → LLM fallback → bare incident (no location)
             elif any(e in lower for e in ("syntaxerror", "indentationerror", "taberror")):
                 level              = "ERROR"
                 meta["issue_type"] = "syntax"
-                _fn = _re.search(r'file\s+"?([^\s",]+\.py)"?,\s*line\s+(\d+)', lower)
-                if _fn:
-                    meta["file"]     = _fn.group(1)
-                    meta["line"]     = int(_fn.group(2))
-                    meta["fix_here"] = f"{_fn.group(1)}:{_fn.group(2)}"
+                exc_name           = next(
+                    (e for e in ("SyntaxError", "IndentationError", "TabError")
+                     if e.lower() in lower),
+                    "SyntaxError",
+                )
+                meta["exception"] = exc_name
+
+                preceding = raw_lines[max(0, i - 10): i]
+
+                # a) regex: scan preceding lines for File "x.py", line N header
+                found_file = found_line = None
+                for prev in reversed(preceding):
+                    prev_s = prev.strip()
+                    if not prev_s or set(prev_s) <= {"^", " ", "\t"}:
+                        continue          # skip blank / caret lines
+                    fm = _FILE_HDR.match(prev)
+                    if fm:
+                        found_file = fm.group("file").strip().lstrip("./")
+                        found_line = int(fm.group("line"))
+                        break
+                    # keep scanning past source-code snippet lines
+
+                if found_file and found_line:
+                    meta["file"]     = found_file
+                    meta["line"]     = found_line
+                    meta["fix_here"] = f"{found_file}:{found_line}"
+                    meta["full_traceback"] = (
+                        "\n".join(l.strip() for l in preceding[-5:]) + f"\n{msg}"
+                    )
+                else:
+                    # b) LLM fallback — give it the context window
+                    loc = _llm_extract_location(preceding, exc_msg=msg)
+                    if loc:
+                        meta["file"]     = loc["file"]
+                        meta["line"]     = loc["line"]
+                        meta["fix_here"] = f"{loc['file']}:{loc['line']}"
+                        meta["full_traceback"] = (
+                            "\n".join(l.strip() for l in preceding[-5:]) + f"\n{msg}"
+                        )
+                    # c) last resort: inline file ref anywhere in the line
+                    if "fix_here" not in meta:
+                        _fn = _re.search(
+                            r'file\s+"?([^\s",]+\.py)"?,\s*line\s+(\d+)', lower
+                        )
+                        if _fn:
+                            meta["file"]     = _fn.group(1)
+                            meta["line"]     = int(_fn.group(2))
+                            meta["fix_here"] = f"{_fn.group(1)}:{_fn.group(2)}"
 
             elif any(e in lower for e in ("modulenotfounderror", "importerror")):
                 meta["issue_type"] = "import"
@@ -525,12 +627,16 @@ class MonitoringAgent(BaseAgent):
         llm  = incident.metadata.get("llm_analysis", {})
         meta = incident.metadata
 
-        # Build a clean syntax_errors list from anomaly_details for easy consumption
+        # Build a clean syntax_errors list from anomaly_details for easy consumption.
+        # Includes error_type + raw_message so _on_syntax_error() in SelfHealingAgent
+        # can build a correct FileToFix without needing to re-parse the message.
         syntax_errors = [
             {
-                "file"   : d.get("flawed_file", "").split(":")[0],
-                "line"   : d.get("flawed_file", "").split(":")[1] if ":" in d.get("flawed_file", "") else "?",
-                "message": d.get("message", ""),
+                "file"       : d.get("flawed_file", "").split(":")[0],
+                "line"       : d.get("flawed_file", "").split(":")[1] if ":" in d.get("flawed_file", "") else "?",
+                "error_type" : d.get("metric", "syntax_error"),
+                "message"    : d.get("message", ""),
+                "raw_message": d.get("message", ""),
             }
             for d in meta.get("anomaly_details", [])
             if d.get("issue_type") == "syntax" and d.get("flawed_file")
