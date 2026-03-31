@@ -34,6 +34,13 @@ try:
 except ImportError:
     _LLM_SELECTOR_AVAILABLE = False
 
+# ── Email client ───────────────────────────────────────────────────────────────
+try:
+    from core.email_client import EmailClient
+    _EMAIL_MODULE_AVAILABLE = True
+except ImportError:
+    _EMAIL_MODULE_AVAILABLE = False
+
 # ── Optional agents ────────────────────────────────────────────────────────────
 try:
     from agents.cicd_agent.cicd_agent import CICDAgent
@@ -120,6 +127,53 @@ _LOGO = [
 def _print_logo():
     for line in _LOGO:
         print(line)
+
+
+
+# ── Email client builder ───────────────────────────────────────────────────────
+
+def _build_email_client():
+    """
+    Build EmailClient from ALERT_* env vars.
+
+    ALERT_ENGINEER_EMAIL  — primary developer; receives all approvals and alerts.
+    ALERT_TEAM_EMAILS     — comma-separated; receives alerts when HIGH / CRITICAL.
+
+    Returns None silently if required vars are missing.
+    """
+    if not _EMAIL_MODULE_AVAILABLE:
+        return None
+
+    host     = os.getenv("ALERT_SMTP_HOST",     "").strip()
+    port_s   = os.getenv("ALERT_SMTP_PORT",     "587").strip()
+    username = os.getenv("ALERT_SMTP_USERNAME", "").strip()
+    password = os.getenv("ALERT_SMTP_PASSWORD", "").strip()
+    from_    = os.getenv("ALERT_FROM_ADDRESS",  username).strip()
+    engineer = os.getenv("ALERT_ENGINEER_EMAIL","").strip()
+
+    team_raw = os.getenv("ALERT_TEAM_EMAILS", "").strip()
+    team     = [a.strip() for a in team_raw.split(",") if a.strip()] if team_raw else []
+
+    if not (host and username and password and engineer):
+        return None
+
+    try:
+        client = EmailClient(
+            smtp_host         = host,
+            smtp_port         = int(port_s),
+            username          = username,
+            password          = password,
+            from_address      = from_,
+            engineer_email    = engineer,
+            team_emails       = team,
+            approval_base_url = os.getenv("ALERT_APPROVAL_BASE_URL", "").strip(),
+        )
+        team_info = f"  |  emergency team → {len(team)} address(es)" if team else ""
+        print(f"  [Email] approvals/alerts → {engineer}{team_info}")
+        return client
+    except Exception as exc:
+        print(f"  [Email] failed to init: {exc}")
+        return None
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
@@ -407,8 +461,16 @@ _RESUME_AFTER = {
 async def _run_scaffold():
     project_path    = str(Path.cwd())
     scaffold_config = load_scaffold_config()
-    orchestrator    = Orchestrator()
-    dashboard       = Dashboard(orchestrator)
+
+    # ── Build email client from ALERT_* env vars ──────────────────────────
+    print("\n  Checking notification channels...")
+    email = _build_email_client()
+    if not email:
+        print("  [Channels] CLI only — add ALERT_SMTP_* to .env to enable email approvals/alerts")
+    print()
+
+    orchestrator = Orchestrator(email=email)
+    dashboard    = Dashboard(orchestrator)
 
     _patch_approval(orchestrator.approval, dashboard)
 
@@ -518,6 +580,7 @@ async def _run_scaffold():
         dashboard.event(f"knowledge unavailable — {err}")
 
     await orchestrator.start()
+    await orchestrator.start_approval_server()
 
     # ── Event tracker ──────────────────────────────────────────────────────
     orig_pub = orchestrator.event_bus.publish
@@ -570,6 +633,7 @@ async def _run_scaffold():
         dashboard._draw()
         await asyncio.sleep(1)
         dashboard.stop()
+        await orchestrator.stop_approval_server()
         return
 
     await orchestrator.run_scaffold(
@@ -583,6 +647,13 @@ async def _run_scaffold():
     dashboard._draw()
     await asyncio.sleep(1)
     dashboard.stop()
+    await orchestrator.stop_approval_server()
+    # Cancel any lingering approval tasks so their input() calls don't
+    # bleed into the post-pipeline menu prompt.
+    for task in asyncio.all_tasks():
+        if task.get_name().startswith("approval-"):
+            task.cancel()
+    await asyncio.sleep(0.1)  # let cancelled tasks finish cleanup
 
 
 def main():

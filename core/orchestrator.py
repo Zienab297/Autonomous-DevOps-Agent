@@ -47,6 +47,12 @@ from core.state_manager import StateManager
 from core.context_manager import ContextManager
 from core.agent_registery import AgentRegistry
 from core.approval_manager import ApprovalManager
+from core.approval_server  import ApprovalServer
+
+try:
+    from core.email_client import EmailClient as _EmailClient
+except ImportError:
+    _EmailClient = None
 
 # FileToFix lives in self_healing/models.py — imported here to convert
 # monitoring dicts → typed objects before passing to self-healing agent
@@ -85,13 +91,27 @@ def step(label: str, value: str) -> None:
 
 class Orchestrator:
 
-    def __init__(self):
+    def __init__(self, email=None):
         self.event_bus       = EventBus()
         self.state_manager   = StateManager()
         self.context_manager = ContextManager()
         self.registry        = AgentRegistry()
-        self.approval        = ApprovalManager()
-        self._running        = False
+        self._email          = email
+
+        self.approval = ApprovalManager(
+            email           = email,
+            timeout_seconds = int(__import__('os').getenv("APPROVAL_TIMEOUT_SECONDS", "300")),
+            registry        = self.registry,
+        )
+
+        # HTTP server for email approve/deny link callbacks.
+        # Started/stopped by devops.py around the pipeline run.
+        self._approval_server: Optional[ApprovalServer] = (
+            ApprovalServer(approval_manager=self.approval, email_client=email)
+            if email else None
+        )
+
+        self._running = False
 
         self._subscribe_to_events()
         self._register_monitoring_agent()
@@ -1486,6 +1506,8 @@ class Orchestrator:
         self.print_dashboard(
             f"RESOLVED — {len(files_fixed)} file(s) fixed, verification={verification}"
         )
+        inc_rec  = next((r for r in self._dashboard["incidents"] if r["id"] == event.incident_id), {})
+        severity = inc_rec.get("severity", "")
         await self._send_alert(
             incident_id=event.incident_id,
             title="Incident Resolved",
@@ -1494,6 +1516,7 @@ class Orchestrator:
                 f"Fixed {len(files_fixed)} file(s). "
                 f"Verification: {verification}."
             ),
+            severity=severity,
         )
         self.context_manager.drop_context(event.incident_id)
 
@@ -1515,6 +1538,8 @@ class Orchestrator:
         self.print_dashboard(
             f"REMEDIATION FAILED — {errors[0] if errors else 'unknown error'}"
         )
+        inc_rec  = next((r for r in self._dashboard["incidents"] if r["id"] == event.incident_id), {})
+        severity = inc_rec.get("severity", "high")
         await self._send_alert(
             incident_id=event.incident_id,
             title="Remediation Failed",
@@ -1522,17 +1547,35 @@ class Orchestrator:
                 f"Incident {event.incident_id} could not be resolved automatically. "
                 f"Errors: {errors}. Manual intervention required."
             ),
+            severity=severity,
         )
 
-    async def _send_alert(self, incident_id: str, title: str, message: str) -> None:
+    async def _send_alert(
+        self, incident_id: str, title: str, message: str, severity: str = ""
+    ) -> None:
+        """
+        Send a one-way alert via email.
+        HIGH / CRITICAL severity activates the emergency lane (full team).
+        Also calls the legacy alerting_agent if registered.
+        """
+        severity_upper = severity.upper()
+        urgent = (
+            severity_upper in ("HIGH", "CRITICAL")
+            or any(kw in title.lower() for kw in ("failed", "critical", "manual action"))
+        )
+
+        if self._email:
+            try:
+                await self._email.send_alert(title=title, message=message, urgent=urgent)
+            except Exception as exc:
+                logger.error("[Orchestrator] Email alert failed: %s", exc)
+
         alerting_agent = self.registry.get_agent("alerting_agent")
-        if not alerting_agent:
-            logger.warning("[Orchestrator] Alerting Agent not registered — skipping alert")
-            return
-        try:
-            await alerting_agent.send(incident_id=incident_id, title=title, message=message)
-        except Exception as e:
-            logger.error(f"[Orchestrator] Alerting Agent failed: {e}")
+        if alerting_agent:
+            try:
+                await alerting_agent.send(incident_id=incident_id, title=title, message=message)
+            except Exception as e:
+                logger.error(f"[Orchestrator] Alerting Agent failed: {e}")
 
     def summary(self) -> dict:
         return {
