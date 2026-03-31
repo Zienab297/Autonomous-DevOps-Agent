@@ -255,7 +255,7 @@ class Orchestrator:
             event_bus    = self.event_bus,
             registry     = self.registry,
             apply_changes= True,
-            project_root = ".",
+            project_root = str(pathlib.Path.cwd().resolve()),  # real project root, not SDK dir
         )
         self.registry.register("self_healing_agent", agent)
         self.state_manager.set_agent_status("self_healing_agent", AgentStatus.IDLE)
