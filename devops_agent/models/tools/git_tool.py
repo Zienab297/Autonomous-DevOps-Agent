@@ -1,5 +1,5 @@
 import subprocess
-from models.tools.base_tool import BaseTool
+from devops_agent.models.tools.base_tool import BaseTool
 
 
 def _run_git(command: str) -> str:

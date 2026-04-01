@@ -1,5 +1,5 @@
 from groq import Groq
-from models.conversation import ConversationModel
+from devops_agent.models.conversation import ConversationModel
 import config
 
 
