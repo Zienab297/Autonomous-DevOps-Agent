@@ -427,7 +427,17 @@ class Orchestrator:
 
     async def stop(self) -> None:
         self._running = False
+        monitoring = self.registry.get_agent("monitoring_agent")
+        monitoring_active = (
+            monitoring is not None
+            and getattr(monitoring, "_poll_task", None) is not None
+            and not monitoring._poll_task.done()
+        )
         for record in self.registry.get_all():
+            # Keep monitoring agent RUNNING if its post-deploy watch is still active
+            if record.name == "monitoring_agent" and monitoring_active:
+                logger.info("[Orchestrator] MonitoringAgent kept RUNNING — post-deploy watch active")
+                continue
             self.state_manager.set_agent_status(record.name, AgentStatus.STOPPED)
         logger.info("[Orchestrator] Stopped")
 
@@ -589,6 +599,12 @@ class Orchestrator:
                 source="orchestrator",
                 data={"project_path": project_path, "logs": [], "repo_url": repo_url},
             ))
+            # Ensure MonitoringAgent poll loop is running post-deploy
+            await self.start_monitoring_agent()
+            self._dashboard["agents"]["monitoring_agent"] = "RUNNING"
+            self.state_manager.set_agent_status("monitoring_agent", AgentStatus.RUNNING)
+            self._dash("stage", "monitoring")
+            self.print_dashboard(f"MonitoringAgent watching '{project_path}' post-deploy")
             return
 
         self._dash("stage", "cicd")
@@ -649,12 +665,28 @@ class Orchestrator:
                     "logs"        : logs,
                 },
             ))
+            # Ensure MonitoringAgent poll loop is running post-deploy
+            await self.start_monitoring_agent()
+            self._dashboard["agents"]["monitoring_agent"] = "RUNNING"
+            self.print_dashboard(f"MonitoringAgent watching '{project_path}' post-deploy")
         except Exception as e:
             logger.error(f"[Orchestrator] CI/CD Agent error: {e}", exc_info=True)
             self.print_dashboard(f"CI/CD error: {e}")
         finally:
             self._dashboard["agents"]["cicd_agent"] = "IDLE"
             self.state_manager.set_agent_status("cicd_agent", AgentStatus.IDLE)
+            # Re-assert monitoring as RUNNING if its poll task is alive,
+            # and flip the stage so the outer runner doesn't overwrite it with "done"
+            monitoring = self.registry.get_agent("monitoring_agent")
+            if (
+                monitoring is not None
+                and getattr(monitoring, "_poll_task", None) is not None
+                and not monitoring._poll_task.done()
+            ):
+                self._dashboard["agents"]["monitoring_agent"] = "RUNNING"
+                self.state_manager.set_agent_status("monitoring_agent", AgentStatus.RUNNING)
+                self._dash("stage", "monitoring")
+                self.print_dashboard("MonitoringAgent watching production — post-deploy watch active")
 
     async def _on_scaffold_failed(self, event: Event) -> None:
         error = event.data.get("error", "unknown")
