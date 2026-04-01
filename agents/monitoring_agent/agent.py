@@ -164,6 +164,9 @@ class MonitoringAgent(BaseAgent):
         self._poll_count : int = 0
         self._agent_start: datetime = datetime.utcnow()
 
+        self._watch_task   : Optional[asyncio.Task] = None   # post-deploy watch timer
+        self._orig_interval: float = self._config.poll_interval  # saved for restore
+
     # --------------------------------------------------------
     # BaseAgent lifecycle hooks
     # --------------------------------------------------------
@@ -211,20 +214,93 @@ class MonitoringAgent(BaseAgent):
     # --------------------------------------------------------
 
     async def _on_deployment_complete(self, event: Event) -> None:
-        logs_raw: List[str] = event.data.get("logs", [])
-        if not logs_raw:
-            return
+        """
+        Called when the CI/CD pipeline publishes DEPLOYMENT_COMPLETE.
+
+        Does two things:
+          1. One-shot analysis of the deployment log lines (existing behaviour).
+          2. Starts a focused post-deploy watch window on the deployed service:
+               - Injects the service into the poll list if not already there.
+               - Tightens poll_interval to POST_DEPLOY_INTERVAL_SECONDS.
+               - After POST_DEPLOY_WATCH_SECONDS the config is restored automatically.
+        """
+        # ── Config knobs ───────────────────────────────────────────────────────
+        POST_DEPLOY_INTERVAL_SECONDS = 10    # poll every 10 s during the window
+        POST_DEPLOY_WATCH_SECONDS    = 600   # watch for 10 minutes, then restore
+
+        logs_raw     = event.data.get("logs", [])
         project_path = event.data.get("project_path", "cicd-pipeline")
-        self._log_event(f"DEPLOYMENT_COMPLETE — {len(logs_raw)} lines from {project_path}")
-        log_objects = self._strings_to_logs(logs_raw, service=project_path)
-        incident = await self._run_analysis_pipeline(service=project_path, logs=log_objects)
-        if incident:
-            await self.publish(Event(
-                type        = EventType.INCIDENT_CREATED,
-                source      = self.name,
-                incident_id = incident.incident_id,
-                data        = self._incident_payload(incident),
-            ))
+
+        self._log_event(f"DEPLOYMENT_COMPLETE — {len(logs_raw)} log lines from '{project_path}'")
+
+        # ── 1. One-shot CI/CD log analysis (existing behaviour, preserved) ─────
+        if logs_raw:
+            log_objects = self._strings_to_logs(logs_raw, service=project_path)
+            incident    = await self._run_analysis_pipeline(
+                service=project_path, logs=log_objects
+            )
+            if incident:
+                await self.publish(Event(
+                    type        = EventType.INCIDENT_CREATED,
+                    source      = self.name,
+                    incident_id = incident.incident_id,
+                    data        = self._incident_payload(incident),
+                ))
+
+        # ── 2. Start sustained post-deploy production watch ────────────────────
+        # Derive a clean service name from the project path
+        # (e.g. "/home/user/my-service" → "my-service")
+        import os as _os
+        service_name = _os.path.basename(project_path.rstrip("/\\")) or project_path
+
+        # Inject service into poll list and service_state if not already present
+        if service_name not in self._config.services:
+            self._config.services.append(service_name)
+            self._service_state[service_name] = {
+                "status"      : "pending",
+                "metrics"     : {},
+                "last_poll"   : None,
+                "anomaly_count": 0,
+            }
+            self.logger.info(
+                "[MonitoringAgent] Post-deploy: added '%s' to poll list", service_name
+            )
+
+        # Tighten poll interval for the watch window
+        self._orig_interval        = self._config.poll_interval
+        self._config.poll_interval = POST_DEPLOY_INTERVAL_SECONDS
+        self.logger.info(
+            "[MonitoringAgent] Post-deploy watch started — service='%s'  "
+            "interval=%ds  window=%ds",
+            service_name, POST_DEPLOY_INTERVAL_SECONDS, POST_DEPLOY_WATCH_SECONDS,
+        )
+        self._log_event(
+            f"WATCH  '{service_name}' — {POST_DEPLOY_WATCH_SECONDS}s window, "
+            f"polling every {POST_DEPLOY_INTERVAL_SECONDS}s"
+        )
+
+        # Cancel any previous watch timer (handles rapid re-deployments cleanly)
+        if self._watch_task and not self._watch_task.done():
+            self._watch_task.cancel()
+
+        # Schedule config restore after the watch window expires
+        async def _restore_after_window():
+            try:
+                await asyncio.sleep(POST_DEPLOY_WATCH_SECONDS)
+                self._config.poll_interval = self._orig_interval
+                self.logger.info(
+                    "[MonitoringAgent] Post-deploy watch window ended for '%s' — "
+                    "poll interval restored to %.0fs",
+                    service_name, self._orig_interval,
+                )
+                self._log_event(f"WATCH  '{service_name}' — window closed, interval restored")
+            except asyncio.CancelledError:
+                pass  # cancelled by a newer deployment — new timer already running
+
+        self._watch_task = asyncio.create_task(
+            _restore_after_window(),
+            name=f"post_deploy_watch_{service_name}",
+        )
 
     # --------------------------------------------------------
     # CI/CD agent wiring
