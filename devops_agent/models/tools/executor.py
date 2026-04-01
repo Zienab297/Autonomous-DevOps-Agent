@@ -1,9 +1,9 @@
 import json
 from typing import Dict
-from models.tools.base_tool import BaseTool
-from models.tools.bash_tool import BashTool
-from models.tools.file_tool import ReadFileTool, WriteFileTool, ListDirectoryTool
-from models.tools.git_tool import GitStatusTool, GitDiffTool, GitCommitTool
+from devops_agent.models.tools.base_tool import BaseTool
+from devops_agent.models.tools.bash_tool import BashTool
+from devops_agent.models.tools.file_tool import ReadFileTool, WriteFileTool, ListDirectoryTool
+from devops_agent.models.tools.git_tool import GitStatusTool, GitDiffTool, GitCommitTool
 
 
 class ToolExecutor:

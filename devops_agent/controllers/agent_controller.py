@@ -1,8 +1,21 @@
 import json
-from models.ai_model import AIModel
-from models.conversation import ConversationModel
-from models.tools.executor import ToolExecutor
-from views.cli_view import CLIView
+import sys
+from pathlib import Path
+
+# ── Path fix ──────────────────────────────────────────────────────────────────
+# agent_controller.py lives in  devops_agent/controllers/
+# models/, views/, and config.py live in  devops_agent/
+# We need devops_agent/ on sys.path so bare imports work regardless of the
+# working directory the user runs `devops` from.
+_DEVOPS_AGENT_DIR = Path(__file__).resolve().parent.parent  # …/devops_agent/
+if str(_DEVOPS_AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_DEVOPS_AGENT_DIR))
+# ─────────────────────────────────────────────────────────────────────────────
+
+from devops_agent.models.ai_model import AIModel
+from devops_agent.models.conversation import ConversationModel
+from devops_agent.models.tools.executor import ToolExecutor
+from devops_agent.views.cli_view import CLIView
 import config
 
 

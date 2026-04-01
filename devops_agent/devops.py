@@ -17,6 +17,7 @@ from agents.scaffold_agent.shared.config import load_config as load_scaffold_con
 from agents.scaffold_agent.core_scaffold.scaffold_agent import ScaffoldAgent
 from core.orchestrator import Orchestrator
 from core.event_bus import EventType
+from core.project_db import ProjectDB
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -458,25 +459,38 @@ _RESUME_AFTER = {
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-async def _run_scaffold():
+async def _run_scaffold(rerun: bool = False):
     project_path    = str(Path.cwd())
     scaffold_config = load_scaffold_config()
 
     # ── Build email client from ALERT_* env vars ──────────────────────────
-    print("\n  Checking notification channels...")
-    email = _build_email_client()
-    if not email:
-        print("  [Channels] CLI only — add ALERT_SMTP_* to .env to enable email approvals/alerts")
-    print()
+    # Only show channels banner on first run — skip on reruns to reduce noise
+    if not rerun:
+        print("\n  Checking notification channels...")
+        email = _build_email_client()
+        if not email:
+            print("  [Channels] CLI only — add ALERT_SMTP_* to .env to enable email approvals/alerts")
+        print()
+    else:
+        email = _build_email_client()
 
     orchestrator = Orchestrator(email=email)
     dashboard    = Dashboard(orchestrator)
+
+    # ── ProjectDB: open (or create) the project's history database ────────
+    # SQLite by default: <project_path>/.devops/history.db
+    # PostgreSQL: set DATABASE_URL env var
+    _db = ProjectDB.for_project(project_path)
+    orchestrator.set_project_db(_db)
 
     _patch_approval(orchestrator.approval, dashboard)
 
     state_file = Path(project_path) / ".devops_state"
     first_run  = not state_file.exists()
-    _print_logo()
+
+    # Only print logo on first run
+    if not rerun:
+        _print_logo()
 
     _SCAFFOLD_FILES = [
         "Dockerfile", "docker-compose.yml", ".dockerignore",
@@ -527,8 +541,35 @@ async def _run_scaffold():
             _run_flow = False
             print("  Skipping pipeline — launching chat agent.\n")
 
-    # ── Select LLM providers upfront ─────────────────────────────────────
-    llm_providers = _select_llm_providers_upfront(dashboard)
+    # ── Select LLM providers upfront ─────────────────────────────────────────────────
+    # On rerun: reuse saved LLM configs silently without asking again
+    if rerun and _LLM_SELECTOR_AVAILABLE:
+        saved = get_all_agent_configs()
+        if saved:
+            llm_providers = {}
+            for agent_key in ("scaffold", "knowledge", "healing"):
+                try:
+                    llm_providers[agent_key] = get_llm_provider(
+                        agent=agent_key, use_saved=True
+                    )
+                except TypeError:
+                    # older version of get_llm_provider — no use_saved param
+                    try:
+                        llm_providers[agent_key] = get_llm_provider(agent=agent_key)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            if llm_providers:
+                _names = ", ".join(
+                    f"{k}: {getattr(v, 'model', '?')}"
+                    for k, v in llm_providers.items()
+                )
+                print(f"  {_D}Reusing saved LLM providers — {_names}{_R}\n")
+        else:
+            llm_providers = _select_llm_providers_upfront(dashboard)
+    else:
+        llm_providers = _select_llm_providers_upfront(dashboard)
     _attach_llm_providers_to_orchestrator(orchestrator, dashboard, llm_providers)
 
     # ── Register agents ───────────────────────────────────────────────────
@@ -605,14 +646,25 @@ async def _run_scaffold():
             dashboard.set_stage(stage)
             dashboard.event(msg(event) if callable(msg) else msg)
             if event.type == EventType.DEPLOYMENT_COMPLETE:
-                status = event.data.get("status", "")
+                conclusion = event.data.get("conclusion", event.data.get("status", ""))
                 dashboard._cicd_status = (
-                    "success" if status == "success"
-                    else "failed" if status in ("failed", "failure")
-                    else status
+                    "success" if conclusion == "success"
+                    else "failed" if conclusion in ("failed", "failure")
+                    else conclusion
                 )
                 if event.data.get("repo_url"):
                     dashboard._repo = event.data["repo_url"]
+                # ── DB: persist deployment ────────────────────────────────
+                import uuid as _uuid
+                _db.save_deployment({
+                    "id"         : str(event.data.get("run_id", _uuid.uuid4()))[:18],
+                    "service"    : Path(project_path).name,
+                    "repo_url"   : event.data.get("repo_url", ""),
+                    "status"     : conclusion or "unknown",
+                    "framework"  : "",
+                    "language"   : "",
+                    "files_count": 0,
+                })
 
         await orig_pub(event)
 
@@ -634,7 +686,7 @@ async def _run_scaffold():
         await asyncio.sleep(1)
         dashboard.stop()
         await orchestrator.stop_approval_server()
-        return
+        return _db
 
     await orchestrator.run_scaffold(
         project_path  = project_path,
@@ -654,6 +706,8 @@ async def _run_scaffold():
         if task.get_name().startswith("approval-"):
             task.cancel()
     await asyncio.sleep(0.1)  # let cancelled tasks finish cleanup
+    # ── Return db so main() can use it for the history menu ───────────────
+    return _db
 
 
 def main():
@@ -663,36 +717,76 @@ def main():
     project_path = str(Path.cwd())
     state_file   = Path(project_path) / ".devops_state"
 
-    try:
-        asyncio.run(_run_scaffold())
-    except KeyboardInterrupt:
-        pass
+    # ── Main loop — no recursion, no nested asyncio.run() ─────────────
+    _rerun = False
+    while True:
+        _db = None
+        try:
+            _db = asyncio.run(_run_scaffold(rerun=_rerun))
+        except KeyboardInterrupt:
+            print("\n  Interrupted.")
 
-    try:
-        state_file.write_text(
-            f"deployed_at={datetime.utcnow().isoformat()}\n"
-            f"project={project_path}\n"
-        )
-    except Exception:
-        pass
+        try:
+            state_file.write_text(
+                f"deployed_at={datetime.utcnow().isoformat()}\n"
+                f"project={project_path}\n"
+            )
+        except Exception:
+            pass
 
-    print(f"\n{'─'*55}")
-    print(f"  Pipeline complete. What would you like to do?")
-    print(f"{'─'*55}")
-    print(f"  [1] Run pipeline again")
-    print(f"  [2] Open chat agent (manual tasks)")
-    print(f"  [3] Exit")
-    print(f"{'─'*55}")
-    try:
-        _choice = input("  Choose [1/2/3]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        _choice = "3"
+        print(f"\n{'─'*55}")
+        print(f"  Pipeline complete. What would you like to do?")
+        print(f"{'─'*55}")
+        print(f"  [1] Run pipeline again")
+        print(f"  [2] Open chat agent (manual tasks)")
+        print(f"  [3] Query history  (incidents · events · solutions)")
+        print(f"  [4] Exit")
+        print(f"{'─'*55}")
+        try:
+            _choice = input("  Choose [1-4]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _choice = "4"
 
-    if _choice == "1":
-        main()
+        if _choice == "1":
+            if _db:
+                _db.close()
+            _rerun = True          # next iteration skips logo + LLM prompt
+            continue               # restart the while loop cleanly
+
+        elif _choice == "2":
+            AgentController().run()
+            continue               # return to menu after chat agent exits
+
+        elif _choice == "3":
+            _open_history(_db, project_path)
+            continue               # return to menu after history exits
+
+        # [4] or anything else → exit
+        if _db:
+            _db.close()
+        break                      # exit the while loop
+
+def _open_history(db, project_path: str) -> None:
+    """
+    Open the InteractiveCLI against the project's history.db.
+    If db is None (pipeline was skipped), we try to reopen it from disk.
+    """
+    try:
+        from core.interactive_cli import InteractiveCLI
+    except ImportError:
+        print("  [History] interactive_cli not available — skipping.")
         return
-    elif _choice == "2":
-        AgentController().run()
+
+    if db is None:
+        # Pipeline was skipped or crashed — reopen from disk
+        try:
+            db = ProjectDB.for_project(project_path)
+        except Exception as exc:
+            print(f"  [History] Could not open database: {exc}")
+            return
+
+    project_id = getattr(db, "project_id", Path(project_path).name)
+    InteractiveCLI(db=db, project_id=project_id).run()
 
 
 if __name__ == "__main__":

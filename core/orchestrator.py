@@ -111,7 +111,8 @@ class Orchestrator:
             if email else None
         )
 
-        self._running = False
+        self._running    = False
+        self.project_db  = None   # set via set_project_db() from devops.py
 
         self._subscribe_to_events()
         self._register_monitoring_agent()
@@ -131,6 +132,42 @@ class Orchestrator:
         }
 
         logger.info("Orchestrator initialized")
+
+    def set_project_db(self, project_db) -> None:
+        """
+        Wire a ProjectDB (SQLite) instance into the Orchestrator.
+        Called from devops.py after creating the Orchestrator:
+
+            db = ProjectDB.for_project(project_path)
+            orchestrator.set_project_db(db)
+
+        After this call every EventBus publish is auto-logged to SQLite,
+        and incidents/solutions/status updates are persisted.
+        """
+        self.project_db = project_db
+        logger.info(f"[Orchestrator] ProjectDB connected: {project_db}")
+
+        _orig = self.event_bus.publish
+
+        async def _db_logged(event):
+            await _orig(event)
+            try:
+                project_db.log_event(event)
+            except Exception as _e:
+                logger.debug("[ProjectDB] log_event failed: %s", _e)
+
+        self.event_bus.publish = _db_logged
+        logger.info("[Orchestrator] EventBus auto-logging to ProjectDB enabled")
+
+    def _pg_save(self, method: str, *args, **kwargs) -> None:
+        """Safe wrapper — calls project_db.method() and swallows any exception."""
+        db = getattr(self, "project_db", None)
+        if not db:
+            return
+        try:
+            getattr(db, method)(*args, **kwargs)
+        except Exception as _e:
+            logger.debug("[ProjectDB] %s failed: %s", method, _e)
 
     def _subscribe_to_events(self) -> None:
         self.event_bus.subscribe(EventType.SCAFFOLD_STARTED,       self._on_scaffold_started)
@@ -775,6 +812,8 @@ class Orchestrator:
                 "all_flawed_files" : meta.get("all_flawed_files", []),
             }
         ))
+        # ── DB: persist incident ──────────────────────────────────────────
+        self._pg_save("save_incident", incident)
 
     # ── Core incident handler ─────────────────────────────────────────────────
 
@@ -806,6 +845,17 @@ class Orchestrator:
             description = description,
             status      = "OPEN",
         )
+
+        # ── DB: persist incident immediately when event is received ──────────
+        # (handle_incident only fires in the CI/CD code path; here we always save)
+        self._pg_save("save_incident", {
+            "incident_id": event.incident_id,
+            "id"         : event.incident_id,
+            "service"    : service,
+            "severity"   : severity,
+            "status"     : "open",
+            "description": description,
+        })
 
         # ── Branch: SYNTAX ERROR → auto-fix directly ──────────────────────────
         if issue_type == "syntax":
@@ -911,6 +961,8 @@ class Orchestrator:
             source             = "syntax_auto_fix",
             files_to_modify    = files_to_modify,
         )
+        # ── DB: persist syntax-fix solution ──────────────────────────────────
+        self._pg_save("save_solution", solution)
 
         self._dashboard["agents"]["self_healing_agent"] = "RUNNING"
         self.state_manager.set_agent_status("self_healing_agent", AgentStatus.RUNNING)
@@ -1078,6 +1130,8 @@ class Orchestrator:
                     f"confidence={solution.confidence:.0%} files={len(solution.files_to_modify)}"
                 )
                 self.state_manager.add_solution(solution)
+                # ── DB: persist solution ──────────────────────────────────
+                self._pg_save("save_solution", solution)
 
                 # Publish INVESTIGATION_COMPLETE for any other listeners
                 await self.event_bus.publish(Event(
@@ -1507,6 +1561,8 @@ class Orchestrator:
             event.incident_id, files_fixed, verification,
         )
         self.state_manager.update_incident_status(event.incident_id, IncidentStatus.RESOLVED)
+        # ── DB: update incident status ────────────────────────────────────
+        self._pg_save("update_incident_status", event.incident_id, "resolved")
         self._track_incident(
             incident_id = event.incident_id,
             service     = "",
@@ -1539,6 +1595,8 @@ class Orchestrator:
             event.incident_id, errors,
         )
         self.state_manager.update_incident_status(event.incident_id, IncidentStatus.FAILED)
+        # ── DB: update incident status ────────────────────────────────────
+        self._pg_save("update_incident_status", event.incident_id, "failed")
         self._track_incident(
             incident_id = event.incident_id,
             service     = "",
